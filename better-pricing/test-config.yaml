@@ -1,0 +1,25 @@
+# better-pricing 测试配置（模拟真实环境：custom:dashscope-token-plan 免费额度体系）
+native_report: USD
+price_list:
+  custom:dashscope-token-plan:
+    calculates: token
+    currency: CNY
+    multiply: 7.2
+    models:
+      qwen3.8-flash: { input: 1.2, output: 7.2, cache: 0.24 }
+      qwen3.7-max: { input: 2.5, output: 7.5, cache: 0.5 }
+      deepseek-v4-flash-0731: { input: 0.2, output: 0.4, cache: 0.04 }
+  dashscope-common:
+    calculates: free
+  custom:ms-api-infer:
+    calculates: token
+    currency: mag粒
+    multiply: 0
+    models:
+      "Qwen/Qwen3.8-Flash-Next": { input: 1000, output: 2000, cache: 200 }
+  kimi-k3:
+    calculates: calls
+    currency: credits
+    multiply: 0
+    models:
+      model-1: 1

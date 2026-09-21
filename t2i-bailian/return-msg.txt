@@ -1,0 +1,31 @@
+{
+  "status_code": 200,
+  "request_id": "d2d1a8c0-325f-9b9d-8b90-xxxxxx",
+  "code": "",
+  "message": "",
+  "output": {
+    "text": null,
+    "finish_reason": null,
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "image": "https://dashscope-result.oss-cn-shanghai.aliyuncs.com/xxx.png?Expires=xxx"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "usage": {
+    "output_height": 2048,
+    "output_width": 2048,
+    "input_image_count": 0,
+    "input_image_type": "qima_input_2k",
+    "output_image_count": 1,
+    "output_image_type": "qima_output_2k"
+  }
+}

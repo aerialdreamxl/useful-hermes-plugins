@@ -1,0 +1,13 @@
+{
+  "name": "agent-trace-viewer",
+  "label": "Agent Traces",
+  "description": "DeepSeek-Harness-style trace restoration: read-only viewer over state.db with one-click OpenAI messages[] export.",
+  "icon": "ListTree",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/agent-traces",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

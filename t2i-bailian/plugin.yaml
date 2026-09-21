@@ -1,0 +1,5 @@
+name: t2i-bailian
+version: 1.0.0
+description: Bailian multimodal-generation text-to-image backend
+author: AerialdreamXL
+kind: backend

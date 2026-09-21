@@ -1,0 +1,6 @@
+name: session-hold
+version: 2.0.0
+description: "Invisible hold/resume. /hold parks the session at the next API call (the model sees one slow call, never a pause); /unhold releases — in-process replay of the frozen request, or byte-exact snapshot replay after a restart."
+author: "Feather (翎羽) for @AerialdreamXL"
+kind: standalone
+provides_hooks: [pre_tool_call, pre_llm_call, post_api_request]

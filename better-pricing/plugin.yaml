@@ -1,0 +1,5 @@
+name: better-pricing
+version: "0.1.0"
+description: "Independent pricing desk: real-time cost report over Hermes usage (better-pricing.yaml price lists), CLI `hermes pricing-plus` + slash `/pricing-plus`. Read-only, persists nothing."
+author: "AerialdreamXL (built by Feather)"
+kind: standalone

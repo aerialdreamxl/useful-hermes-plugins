@@ -1,0 +1,9 @@
+name: agent-trace-viewer
+version: 1.0.0
+description: "Restore DeepSeek-Harness-style agent traces: read-only viewer over state.db with one-click OpenAI messages[] export. Desktop page + dashboard backend."
+author: Feather
+kind: backend
+tags:
+  - traces
+  - sessions
+  - export
