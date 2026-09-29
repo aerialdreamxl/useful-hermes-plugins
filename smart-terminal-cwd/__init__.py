@@ -141,17 +141,58 @@ def _expand(raw: str) -> Optional[Path]:
     return p if p.is_dir() else None
 
 
+def _read_settings(ctx: Any) -> Optional[dict]:
+    """取本插件的 settings 子树，**不依赖插件被放在哪个目录**。
+
+    背景（2026-09-29 取证）：PluginContext.get_config 按注册键
+    ``plugins.entries.<manifest_key>`` 查配置，而 manifest_key 是路径派生的
+    （plugins_manifest.py:505 ``f"{prefix}/{dir.name}"``）——插件一旦搬进子目录
+    （如 custom-plugins/），注册键带上前缀，写在裸名条目下的 settings 就查不到了；
+    加载门（gate_manifest）却因裸名兜底照常放行，于是出现"插件活着但读不到配置"
+    的静默 fail-open。
+
+    阶梯：官方通道 ctx.get_config（注册键）→ 命中即返回；落空则用
+    ctx.manifest.name（裸名，目录搬迁不变）从只读配置里自行补查
+    plugins.entries.<裸名>.settings。两路都空 = 用户真没写配置 → None 不干预。
+    """
+    try:
+        osv = ctx.get_config("os", default=None)
+        per = ctx.get_config("default_dirs", default=None)
+    except Exception as exc:  # noqa: BLE001 - fail-open 是本插件的生存底线
+        logger.debug("%s: settings unreadable (%s); no-op", PLUGIN_ID, exc)
+        osv = per = None
+    if osv is not None or per is not None:
+        return {"os": osv or {}, "default_dirs": per or {}}
+
+    # 官方通道整体落空：按裸名兜底（注册键与配置键分家时的自救路径）
+    try:
+        bare = str(getattr(getattr(ctx, "manifest", None), "name", "") or "").strip()
+        if not bare or bare == str(getattr(ctx, "plugin_id", "") or ""):
+            return None  # 无裸名可用，或注册键本来就是裸名（真没配置）
+        from hermes_cli.config import load_config_readonly
+        entries = ((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}
+        entry = entries.get(bare)
+        if isinstance(entry, dict):
+            settings = entry.get("settings")
+            if isinstance(settings, dict):
+                logger.info("%s: settings resolved via bare-name fallback (registry key %r != config key %r)",
+                            PLUGIN_ID, getattr(ctx, "plugin_id", "?"), bare)
+                return {"os": settings.get("os") or {}, "default_dirs": settings.get("default_dirs") or {}}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s: bare-name settings fallback failed (%s)", PLUGIN_ID, exc)
+    return None
+
+
 def _surface_default_dir(ctx: Any, surface: str) -> Optional[Path]:
     """解析某表面应钉到的目录。优先级：os.<sys.platform>.<surface> > default_dirs.<surface>。
 
     读取失败（配置未写/托管安装等）一律 None = 不干预，插件静默让位给 Hermes 原生行为。
     """
-    try:
-        osv = ctx.get_config("os", default=None) or {}
-        per = ctx.get_config("default_dirs", default=None) or {}
-    except Exception as exc:  # noqa: BLE001 - fail-open 是本插件的生存底线
-        logger.debug("%s: settings unreadable (%s); no-op", PLUGIN_ID, exc)
+    settings = _read_settings(ctx)
+    if settings is None:
         return None
+    osv = settings.get("os") or {}
+    per = settings.get("default_dirs") or {}
     raw = ""
     if isinstance(osv, dict):
         sect = osv.get(sys.platform)

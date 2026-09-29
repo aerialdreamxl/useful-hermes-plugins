@@ -96,6 +96,18 @@ terminal 工具消费端有两把键（`_plan_execution` 用 `task_id`、`_resol
 去重签名 `(钉值, 轮次计数, 历史长度)`：钉值变/历史被压缩卷掉 → 立即重发，
 否则每 10 轮补发一次。核心解析器与本钩子同线程同 context 调用，读数零猜测。
 
+### 目录位置无关的配置解析（v1.2.0，bare-name fallback）
+
+Hermes 的插件注册键是**路径派生**的（`plugins_manifest.py:505`：子目录下的插件
+key = `<prefix>/<dir名>`，如 `custom-plugins/smart-terminal-cwd`）。`ctx.get_config`
+只按注册键查 `plugins.entries.<key>`，而加载门 `gate_manifest` 却同时接受裸名——
+于是插件搬进子目录后出现"本体加载成功、settings 查无此人"的静默 fail-open
+（2026-09-29 实测：钉值丢失，终端回退到家目录）。`_read_settings()` 的阶梯修复：
+官方通道落空 → 用 `ctx.manifest.name`（裸名，位置无关）从 `load_config_readonly()`
+补查 entries；两路都空才是真没配置。config.yaml 无需任何改动，插件放哪都行。
+`tests/test_bare_name_fallback.py` 用真实 config 验证 4 场景（前缀键兜底 /
+扁平键直通 / 未配置 fail-open / 完整钩子钉值）。
+
 ## 测试
 
 `tests/test_drift_note.py`（同 venv 直接跑）：8 项断言覆盖漂移检测、节奏去重、

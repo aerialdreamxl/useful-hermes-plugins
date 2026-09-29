@@ -1,5 +1,5 @@
 name: smart-terminal-cwd
-version: 1.1.0
+version: 1.2.0
 description: "Per-surface terminal default directory (cli/tui/gateway/desktop, per-OS), plus /terminal-cwd command and terminal_cwd tool; auto-corrects system-prompt cwd drift via pre_llm_call note."
 author: "Feather (翎羽) for @AerialdreamXL"
 kind: standalone
