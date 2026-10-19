@@ -63,7 +63,12 @@ def load_config(force: bool = False) -> Optional[dict]:
             and _cfg_cache["path"] == str(path):
         return _cfg_cache["data"]
     try:
-        import yaml
+        try:
+            import yaml
+        except ModuleNotFoundError:
+            # 运行时（PM 工具链）不带 PyYAML，只有 ruamel；hermes_yaml 是核心自带的
+            # safe_load/safe_dump 兼容层，回退到它，行为不变。
+            import hermes_yaml as yaml
         with open(path, encoding="utf-8-sig") as f:
             data = yaml.safe_load(f) or {}
         if not isinstance(data, dict):

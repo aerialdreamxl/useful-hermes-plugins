@@ -1,0 +1,17 @@
+name: bili-tools
+version: "0.2.0"
+description: "Bilibili tools: 6 read tools (search/info/comments/danmaku/subtitle/download) with explicit implementation=curl|bilibili_api switch (curl default, anonymous, zero-dep); write/login tools gated behind HERMES_BILIBILI_ENABLE_DANGER_FEATURE=1."
+author: Feather
+kind: standalone
+provides_tools:
+  - bili_search
+  - bili_video_info
+  - bili_comments
+  - bili_danmaku
+  - bili_subtitle
+  - bili_download
+  - bili_login
+  - bili_login_check
+  - bili_comment_post
+  - bili_danmaku_post
+provides_hooks: []

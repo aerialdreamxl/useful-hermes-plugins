@@ -1,0 +1,7 @@
+name: hermes-dsh-simulator
+version: "0.4.0"
+description: "DSH simulator for Hermes (minimal first). /dshsim minimal mirrors DeepSeek Harness minimal mode for one message-less session — the model sees exactly DSH's fixed system prompt plus the bash / str_replace_editor schemas (copied 1:1 from DSH source) across all four host protocols (chat_completions / codex_responses / anthropic_messages / bedrock_converse), silently forwarded onto Hermes' terminal and file tools. Take-overs persist across restarts ($HERMES_HOME/dshsim-sessions.json is re-armed at registration), taken-over session titles carry a [DSHSIM] label, and /dshsim optout restores native behavior any time. The pair is registered invisibly (private toolset + exposure-gating check_fn, so no tool_search catalog / bridge / payload leakage in normal sessions) and injected per-session so direct calls pass the host's tool-call intake validation. The default state never interferes."
+author: "AerialdreamXL (built by Feather)"
+kind: standalone
+provides_hooks: [pre_tool_call]
+provides_tools: [bash, str_replace_editor]
