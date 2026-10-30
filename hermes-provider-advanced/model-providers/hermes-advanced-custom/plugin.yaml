@@ -1,0 +1,5 @@
+name: hermes-advanced-custom
+kind: model-provider
+version: 0.1.0
+description: "Overlay of the bundled `custom` provider profile — adds advanced.proxy per-provider routing (hermes-provider-advanced P1)"
+author: "Feather (翎羽)"
