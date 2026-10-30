@@ -300,6 +300,13 @@ def make_park_middleware(state: Dict[str, dict], lock: threading.RLock,
 
     def llm_execution(request: Dict[str, Any] = None, next_call: Callable = None,
                       **ctx: Any) -> Any:
+        _park_next_called = [False]
+        if next_call is not None:
+            _park_downstream = next_call
+            def _park_marked_next(_req: Any = None) -> Any:
+                _park_next_called[0] = True
+                return _park_downstream(_req)
+            next_call = _park_marked_next
         if request is None or next_call is None or not isinstance(request, dict):
             return next_call(request) if next_call else None
         try:
@@ -379,6 +386,13 @@ def make_park_middleware(state: Dict[str, dict], lock: threading.RLock,
             return next_call(request)
         except Exception as exc:  # noqa: BLE001 - never break a turn from here
             logger.warning("session-hold park failed open: %s", exc)
+            if _park_next_called[0]:
+                # next_call already ran: this is the provider's own failure,
+                # wrapped by the chain's _DownstreamExecutionError. The chain's
+                # next_call is single-use — a retry below would mask the true
+                # error with a contract RuntimeError (antigravity:// 2026-10-29).
+                # Re-raise; the frame unwraps it back to the original exception.
+                raise
             try:
                 return next_call(request)
             except Exception:  # noqa: BLE001
