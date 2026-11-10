@@ -1,5 +1,5 @@
 name: hermes-provider-advanced
-version: 0.1.0
-description: "Per-provider advanced transport/auth for custom providers: advanced.proxy routes one provider's traffic through an HTTP proxy; advanced.auth_mode=oauth binds an account from the plugin's own store (P3). Overrides the bundled `custom` model-provider profile via the user plugin layer — zero core patches."
+version: 0.3.0
+description: "Standalone model-provider and advanced transport/auth for providers-advanced: section. Registers under advanced:<identifier> with zero core patches and leaves native custom untouched. Supports per-provider proxy and OAuth subscription accounts (P3)."
 author: "Feather (翎羽)"
 kind: standalone

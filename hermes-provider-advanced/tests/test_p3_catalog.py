@@ -88,7 +88,7 @@ class CatalogTestBase(unittest.TestCase):
 
     def _inject_route(self, advanced, provider_key="ag-oauth",
                       ref="antigravity://me@x.com"):
-        cfg = {"providers": {provider_key: {
+        cfg = {"providers-advanced": {provider_key: {
             "provider": "custom", "model": "gemini-3-pro", "base_url": ref,
             "api_mode": "advanced_oauth", "advanced": advanced}}}
         table = RouteTable.from_config(config=cfg)
@@ -108,7 +108,7 @@ class TestRouteKey(CatalogTestBase):
 
     def test_disabled_oauth_entry_absent_from_key(self):
         # api-mode entries must NOT land in by_oauth_key
-        cfg = {"providers": {"plain": {"provider": "custom",
+        cfg = {"providers-advanced": {"plain": {"provider": "custom",
                                        "base_url": "https://x/v1",
                                        "advanced": {"proxy": "http://127.0.0.1:1"}}}}
         table = RouteTable.from_config(config=cfg)
@@ -289,7 +289,7 @@ class TestCodexCatalog(unittest.TestCase):
         self.store.put("codex", "me@x.com",
                        {"access_token": _jwt(2 ** 31 - 1), "refresh_token": "RT",
                         "account_id": "acc1", "base_url": self.url, "type": "codex"})
-        cfg = {"providers": {"cx-oauth": {
+        cfg = {"providers-advanced": {"cx-oauth": {
             "provider": "custom", "model": "gpt-6.1-sol",
             "base_url": "codex://me@x.com", "api_mode": "advanced_oauth",
             "advanced": {"oauth_fingerprint": "hermes"}}}}

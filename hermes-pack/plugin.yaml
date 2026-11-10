@@ -1,0 +1,5 @@
+name: hermes-pack
+version: "1.0.0"
+description: "One-command migration packaging: `hermes package <out.zip>` zips $HERMES_HOME minus a file blacklist (regenerables/runtime junk/stale snapshots). Blacklist semantics so future plugins/dirs are included by default."
+author: "Feather (翎羽) for @AerialdreamXL"
+kind: standalone

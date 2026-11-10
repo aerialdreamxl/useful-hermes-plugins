@@ -1,0 +1,108 @@
+name: aerialdreams-toolsets
+version: "0.1.0"
+description: "AerialdreamXL personal toolset: bilibili (anonymous reads) + bilibili_unsafe (login/write) + multimedia-utils (ffmpeg / DashScope ASR / Qwen-Omni) + desktop-utils (clipboard/screenshot) + android-utils (adb/fastboot)."
+author: "AerialdreamXL & Feather"
+kind: standalone
+provides_tools:
+  - bili_search
+  - bili_video_info
+  - bili_comments
+  - bili_comment_replies
+  - bili_danmaku
+  - bili_subtitle
+  - bili_download
+  - bili_user_info
+  - bili_user_videos
+  - bili_hot
+  - bili_related
+  - bili_collection
+  - bili_dynamic
+  - bili_login
+  - bili_login_check
+  - bili_download_hd
+  - bili_interact
+  - bili_dm
+  - bili_comment_write
+  - bili_danmaku_post
+  - bili_fav
+  - bili_watch_later
+  - bili_history
+  - bili_subtitle_ai
+  - bili_follow
+  - ffmpeg
+  - dashscope_asr
+  - dashscope_qwenomni_analysis
+  - clipboard
+  - screenshot
+  - androidadb
+  - androidfb
+provides_hooks: []
+config_schema:
+  group_bilibili_enabled:
+    type: bool
+    label: 注册 bilibili 组
+    description: 匿名 B 站读取（搜索/详情/评论/弹幕/字幕/下载/UP/热榜/相关/合集）
+    default: true
+  group_bilibili_unsafe_enabled:
+    type: bool
+    label: 注册 bilibili_unsafe 组
+    description: 需要登录的 B 站工具（扫码登录/高清/赞币藏/私信/评论弹幕写入/收藏夹/历史/AI字幕/关注）
+    default: true
+  group_multimedia_enabled:
+    type: bool
+    label: 注册 multimedia-utils 组
+    description: ffmpeg / DashScope ASR / Qwen-Omni 分析
+    default: true
+  group_desktop_enabled:
+    type: bool
+    label: 注册 desktop-utils 组
+    description: 剪贴板读写 / 截屏
+    default: true
+  group_android_enabled:
+    type: bool
+    label: 注册 android-utils 组
+    description: adb / fastboot
+    default: true
+  multimedia_api_key_env:
+    type: str
+    label: DashScope API Key 环境变量名
+    description: 默认读 DASHSCOPE_API_KEY
+    default: DASHSCOPE_API_KEY
+  multimedia_base_url:
+    type: str
+    label: DashScope 端点
+    description: 默认 https://dashscope.aliyuncs.com；如使用业务空间域名可改
+    default: https://dashscope.aliyuncs.com
+  asr_sync_model:
+    type: str
+    label: ASR 同步模型
+    description: 短音频同步转写（不返回时间戳）
+    default: qwen3-asr-flash
+  asr_async_model:
+    type: str
+    label: ASR 异步模型
+    description: 长音频/时间戳，走 filetrans 异步任务
+    default: qwen-audio-3.1-asr-flash-filetrans
+  asr_wait_seconds:
+    type: int
+    label: ASR 异步等待秒数
+    description: 提交后最多等多久，超时返回 task_id 并后台继续
+    default: 300
+  asr_poll_interval:
+    type: int
+    label: ASR 轮询间隔秒数
+    default: 5
+  asr_watch_max_seconds:
+    type: int
+    label: ASR 后台最长等待秒数
+    description: 后台线程最多等多久（默认 7200）
+    default: 7200
+  omni_model:
+    type: str
+    label: Qwen-Omni 模型
+    default: qwen3.8-omni-flash
+  omni_max_file_mb:
+    type: float
+    label: Omni 本地文件目标上限（MB）
+    description: Base64 后需 <10MB，所以原始文件目标约 7.4MB
+    default: 7.4

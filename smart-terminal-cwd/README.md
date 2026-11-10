@@ -8,7 +8,7 @@
 |---|---|---|
 | CLI | 无视 `terminal.cwd`，永远用启动目录（`cli.py:336`） | 配置 `cli: "."` 时行为不变（启动目录） |
 | TUI (`hermes --tui`) | 服从配置文件 `terminal.cwd`（`server.py:596`，优先级在 env 之前） | 钉到 `tui` 配置值（`.`=启动目录 → 获得 Claude Code 体验） |
-| Gateway | 显式值直通；占位符解析到家目录 | 钉到 `gateway` 配置值（如 Nest） |
+| Gateway | 显式值直通；占位符解析到家目录 | 钉到 `gateway` 配置值（如 `~/hermes-nest`） |
 | Desktop | 同 TUI 兜底链，但显式挑选的工作区优先 | 钉到 `desktop` 配置值；**显式工作区绝不覆盖** |
 
 ## 配置位置（Hermes 官方的插件配置字段）
@@ -23,15 +23,15 @@ plugins:
         default_dirs:            # 跨系统通用值
           cli: "."               # "." / auto / cwd / launch = 进程启动目录
           tui: "."
-          gateway: "D:/01-AI/Hermes-Agent/Nest"
-          desktop: "D:/01-AI/Hermes-Agent/Nest"
+          gateway: "~/hermes-nest"
+          desktop: "~/hermes-nest"
         os:                      # 按当前系统覆盖（sys.platform 取值）
           win32:
-            gateway: "D:/01-AI/Hermes-Agent/Nest"
+            gateway: "~/hermes-nest"
           linux:
             gateway: "~/hermes-nest"
           darwin:
-            gateway: "~/Hermes/Nest"
+            gateway: "~/hermes-nest"
 ```
 
 值语义：
@@ -71,8 +71,8 @@ hermes plugins enable smart-terminal-cwd      # 覆盖工具询问选 no（本�
 hermes plugins disable smart-terminal-cwd && rm -rf "$HERMES_HOME/plugins/smart-terminal-cwd"
 ```
 
-本机（HERMES_HOME=`D:\01-AI\Hermes-Agent\Data`）：把本目录复制到
-`D:\01-AI\Hermes-Agent\Data\plugins\smart-terminal-cwd`。
+把本目录复制到 `$HERMES_HOME/plugins/smart-terminal-cwd`（或本仓库整体
+clone 进 `plugins/` 后按子目录写法启用）。
 
 ## 机制注记（v0.21.3 取证）
 

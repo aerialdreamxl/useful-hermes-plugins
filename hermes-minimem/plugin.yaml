@@ -1,0 +1,89 @@
+name: hermes-minimem
+version: 0.8.0
+description: "Minimal hybrid memory provider — SQLite, int8 dense vectors, local BM25, optional DashScope model-sparse, and optional local ONNX embeddings."
+author: AerialdreamXL
+
+# numpy is a hard requirement for the dense matrix. DashScope SDK and fastembed are
+# intentionally absent: v0.8 installs them on demand in a Hermes PM isolated environment.
+pip_dependencies:
+  - "numpy>=2.0"
+
+config_schema:
+  embedding_backend:
+    type: str
+    label: Embedding 后端
+    description: "openai=兼容 /v1/embeddings（默认）；dashscope=官方 SDK，可输出模型稀疏；local=fastembed ONNX，零 API"
+    choices: ["openai", "dashscope", "local"]
+    default: openai
+    required: true
+  embedding_base_url:
+    type: str
+    label: 端点地址
+    description: "openai 填到 /v1；dashscope 优先填下方工作空间ID+地域（本项留空即可），仅自建网关才填 https://{WorkspaceId}.{region}.maas.aliyuncs.com/api/v1；local 忽略此项"
+    default: https://dashscope.aliyuncs.com/compatible-mode/v1
+  embedding_model:
+    type: str
+    label: 模型名
+    description: "留空使用后端默认：openai=qwen3.7-text-embedding-flash；dashscope=qwen3.7-text-embedding；local=BAAI/bge-small-en-v1.5。换模型会触发重嵌入"
+    default: ""
+  embedding_dim:
+    type: int
+    label: 稠密向量维度
+    description: "API 模型只填该模型支持的一个维度；local 由所选模型决定，此字段被忽略"
+    default: 1024
+    required: true
+  embedding_api_key:
+    type: str
+    label: API Key（明文，可选）
+    description: "明文 Key 会落进 config.yaml 并被同机进程可读，介意安全请留空改走下方环境变量；非空时优先于一切环境变量。local 后端忽略此项"
+    default: ""
+  embedding_api_key_env:
+    type: str
+    label: API Key 环境变量名
+    description: "明文留空时优先读此变量，再回退 MNEMOSYNE_EMBEDDING_API_KEY / DASHSCOPE_API_KEY；local 忽略"
+    default: MINIMEM_EMBEDDING_API_KEY
+  dashscope_workspace:
+    type: str
+    label: DashScope 业务空间 ID（WorkspaceId）
+    description: "仅 dashscope 后端：SDK 首选接法，自动拼 https://{id}.{region}.maas.aliyuncs.com；留空回退 legacy 域名（此时可用 embedding_base_url 覆盖）。百炼控制台-业务空间管理页复制 API Host 中的 llm-xxx 段即此 ID"
+    default: ""
+  dashscope_region:
+    type: str
+    label: DashScope 地域
+    description: "仅 dashscope 后端：cn-beijing/ap-southeast-1/cn-hongkong/us-east-1/eu-central-1/ap-northeast-1；各地域 Key 与模型不通用"
+    choices: ["cn-beijing", "ap-southeast-1", "cn-hongkong", "us-east-1", "eu-central-1", "ap-northeast-1"]
+    default: cn-beijing
+  embedding_output_type:
+    type: str
+    label: 向量输出类型
+    description: "dense=稠密；sparse=仅模型稀疏；dense&sparse=两者同时输出。openai 只支持 dense"
+    choices: ["dense", "sparse", "dense&sparse"]
+    default: dense
+    required: true
+  sparse_mode:
+    type: str
+    label: 稀疏检索方式
+    description: "bm25=本地词法；model=后端模型稀疏（须选择 sparse/dense&sparse）；off=关闭稀疏"
+    choices: ["bm25", "model", "off"]
+    default: bm25
+    required: true
+  local_sparse_model:
+    type: str
+    label: 本地模型稀疏名称
+    description: "仅 local 且输出含 sparse 时使用，例如 prithivida/Splade_PP_en_v1；留空不会下载"
+    default: ""
+  local_cache_dir:
+    type: str
+    label: 本地模型缓存目录
+    description: "留空使用 $HERMES_HOME/hermes-minimem/models；首次下载模型需要用户确认"
+    default: ""
+  allow_pm_install:
+    type: bool
+    label: 允许按需安装后端依赖
+    description: "默认关闭。开启后，所选 dashscope/local 后端缺依赖时由 Hermes PM 安装到隔离环境，不影响共享 venv"
+    default: false
+  package_index_url:
+    type: str
+    label: PM 软件包镜像
+    description: "可选，例如 https://pypi.tuna.tsinghua.edu.cn/simple；仅传给安装子进程，不修改全局环境"
+    default: ""

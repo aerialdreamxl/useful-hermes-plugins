@@ -181,6 +181,22 @@ def _wrap_discover_endpoint_models(original: Callable) -> Callable:
     return _discover_endpoint_models
 
 
+def _wrap_get_provider_profile(original: Callable) -> Callable:
+    """Fallback 'advanced:<id>' to 'advanced' profile (identical to core 'custom:<id>')."""
+    def _get_provider_profile(name: str):
+        if isinstance(name, str) and name.lower().startswith("advanced:"):
+            prof = original(name)
+            if prof is not None:
+                return prof
+            return original("advanced")
+        return original(name)
+
+    _get_provider_profile.__name__ = original.__name__
+    _get_provider_profile.__qualname__ = getattr(original, "__qualname__", original.__name__)
+    setattr(_get_provider_profile, _MARKER, True)
+    return _get_provider_profile
+
+
 # ---------------------------------------------------------------- install
 
 def install() -> dict[str, str]:
@@ -204,6 +220,21 @@ def install() -> dict[str, str]:
         results["catalog_picker"] = _install_one(
             "hermes_cli.model_switch_providers", "_discover_endpoint_models",
             _wrap_discover_endpoint_models, expect_name="_discover_endpoint_models")
+        # advanced: prefix routing fallback: mirrors core custom: fallback
+        results["advanced_routing"] = _install_one(
+            "providers", "get_provider_profile", _wrap_get_provider_profile,
+            expect_name="get_provider_profile")
+
+        # OpenRouter 隐式兜底闸门（block-custom-openrouter-fallback）：包装的是
+        # runtime_provider 的模块级名字——阶梯末级用该全局名调用，一处替换即覆盖
+        # resolve_runtime_provider / resolve_runtime_with_fallback 全部调用点。
+        try:
+            from . import fallback_guard
+
+            results["openrouter_fallback"] = fallback_guard.install()
+        except Exception:
+            logger.debug("advanced-providers: fallback guard install failed", exc_info=True)
+            results["openrouter_fallback"] = "missing"
     for site, status in results.items():
         if status in ("missing", "shape-changed"):
             logger.warning(
@@ -251,13 +282,22 @@ def probe() -> dict[str, str]:
         ("auxiliary", "agent.auxiliary_client", "_openai_http_client_kwargs"),
         ("catalog_profile", "hermes_cli.models", "_profile_live_catalog"),
         ("catalog_picker", "hermes_cli.model_switch_providers", "_discover_endpoint_models"),
+        ("advanced_routing", "providers", "get_provider_profile"),
+        ("openrouter_fallback", "hermes_cli.runtime_provider", "_resolve_openrouter_runtime"),
     ):
         try:
+            if label == "openrouter_fallback":
+                # 闸门用的是自己的 marker（与 transport 包装不同的属性名）。
+                from . import fallback_guard
+
+                marker = fallback_guard._MARKER
+            else:
+                marker = _MARKER
             module = importlib.import_module(module_name)
             fn = getattr(module, attr, None)
             if fn is None:
                 out[label] = "missing"
-            elif getattr(fn, _MARKER, False):
+            elif getattr(fn, marker, False):
                 out[label] = "wrapped"
             else:
                 out[label] = "original"

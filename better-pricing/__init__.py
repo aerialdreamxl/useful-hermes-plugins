@@ -1,6 +1,6 @@
 """better-pricing — 独立计费查询台 + 可选向 Hermes 计费管线回报价格。
 
-设计契约（主人 2026-09-21 定，示例配置 plugins/better-pricing.yaml）：
+设计契约（2026-09-21 定，示例配置 plugins/better-pricing.yaml）：
 * 价目表来自 better-pricing.yaml（$HERMES_HOME/ 优先，插件目录兜底），不落任何
   衍生状态；查询时直读 state.db（mode=ro + query_only）现算。
 * 注册 `hermes pricing-plus`（CLI 子命令）与 `/pricing-plus`（会话内 slash）。

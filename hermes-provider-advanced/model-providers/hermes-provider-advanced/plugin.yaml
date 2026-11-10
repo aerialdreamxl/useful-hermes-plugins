@@ -1,0 +1,5 @@
+name: hermes-provider-advanced
+kind: model-provider
+version: 0.3.0
+description: Standalone advanced custom model provider discovery bridge
+author: Feather (翎羽)

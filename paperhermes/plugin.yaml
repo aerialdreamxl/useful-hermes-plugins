@@ -1,0 +1,47 @@
+name: paperhermes
+version: 0.4.0
+description: "外发载荷瘦身：llm_request 中间件折叠 eager 工具 description 与 Skills 索引描述（名字全在场），净益门 + 会话×模型冻结 + 模型侧告知行。PROMPT.md v0.4 D8：首启播种默认值，其余零 config 写。"
+kind: standalone
+author: Feather
+license: MIT
+provides_hooks:
+  - post_tool_call
+  - on_session_end
+provides_middleware:
+  - llm_request
+config_schema:
+  observe:
+    type: bool
+    label: "观测（只记日志，不改载荷）"
+    description: "true=每请求记 pre/post 字节与折叠量到 $HERMES_HOME/paperhermes/observe.log。只读项，播种默认 true（D11）。"
+    default: true
+  fold_tool_desc:
+    type: bool
+    label: "折叠工具描述 (M1)"
+    description: "true=外发 tools 数组里各工具 description 折为首句摘要（≤fold_first_sentence_max_chars）。参数 schema 与可调用性不动。"
+    default: false
+  fold_skills_index:
+    type: bool
+    label: "折叠技能索引描述 (M2)"
+    description: "true=system 的 ## Skills 区块中低频类目降为名字行；技能名全部保留。"
+    default: false
+  fold_skills_dynamic:
+    type: bool
+    label: "跨会话技能升档"
+    description: "true=会话内被 skill_view 加载过的技能，下一会话保持全量描述（依赖 fold_skills_index=true）。"
+    default: false
+  keep_eager:
+    type: list
+    label: "永不折叠的工具名"
+    description: "点名豁免的工具（clarify 恒在内置白名单里，无需重复）。"
+    default: []
+  fold_first_sentence_max_chars:
+    type: int
+    label: "折叠首句长度上限"
+    description: "首句不超过该长度则原样保留，超长截断加省略号。"
+    default: 120
+  min_savings_chars:
+    type: int
+    label: "净益门 (chars)"
+    description: "本轮预估回收减去告知行字节后低于此值→整轮不介入（量少开了也没用）。会话×模型首测定型。"
+    default: 2048

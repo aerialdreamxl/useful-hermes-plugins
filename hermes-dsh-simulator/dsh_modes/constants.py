@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """DSH minimal-mode model-facing surface, copied 1:1 from the DSH reference source.
 
-Sources (all read from ``D:/02-DIY/hermes-plugin-maker/dsh-reference-src``):
+Sources (all read from a local DSH reference-source snapshot kept outside
+this repository):
 
 * ``packages/bundle/web-app/presets/minimal.patch.yml``             -> web bash description + persona prefix
 * ``snapshots/web/minimal-preset/tool-schemas.expected.json``       -> web minimal bash schema

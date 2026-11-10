@@ -1,3 +1,5 @@
+# 该插件已废弃，请移步aerialdreams-toolsets
+---
 # bili-tools — Bilibili Agent 工具集插件
 
 为 Hermes Agent 打造的哔哩哔哩（Bilibili）全功能工具集插件。默认采用**纯 Python 标准库 + 公开匿名接口**实现，**零三方依赖、免 Cookie、免登录**即可开箱即用；同时支持通过第三方库扩展高清画质、AI 字幕与用户账号互动操作。

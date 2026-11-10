@@ -33,71 +33,76 @@ except Exception:
 
 # ---------------------------------------------------------------- stubs
 
+_ORIG_SYS_MODULES = {}
+
 def _install_core_stubs() -> dict:
-    """Inject minimal core-module stubs the plugin lazy-imports."""
+    """Inject minimal core-module stubs the plugin lazy-imports only if missing."""
+    global _ORIG_SYS_MODULES
     stubs: dict[str, types.ModuleType] = {}
 
-    route = types.ModuleType("hermes_cli.route_identity")
+    for mod_name in ["hermes_cli.route_identity", "agent.proxy_bypass", "agent.ssl_verify", "utils"]:
+        try:
+            m = __import__(mod_name, fromlist=["*"])
+            stubs[mod_name] = m
+        except Exception:
+            pass
 
-    def normalize_route_base_url(base_url):
-        raw = str(base_url or "").strip()
-        if not raw:
-            return ""
-        low = raw.lower().rstrip("/")
-        return low
+    if "hermes_cli.route_identity" not in stubs:
+        route = types.ModuleType("hermes_cli.route_identity")
+        def normalize_route_base_url(base_url):
+            raw = str(base_url or "").strip()
+            return raw.lower().rstrip("/") if raw else ""
+        route.normalize_route_base_url = normalize_route_base_url
+        stubs["hermes_cli.route_identity"] = route
 
-    route.normalize_route_base_url = normalize_route_base_url
-    stubs["hermes_cli.route_identity"] = route
+    try:
+        import agent.proxy_bypass as real_bypass
+        if "_orig_sbp" not in _ORIG_SYS_MODULES:
+            _ORIG_SYS_MODULES["_orig_sbp"] = getattr(real_bypass, "should_bypass_proxy", None)
+        real_bypass.should_bypass_proxy = lambda target_hosts, **kw: "lan" in str(target_hosts or "") or "192.168." in str(target_hosts or "")
+    except Exception:
+        bypass = types.ModuleType("agent.proxy_bypass")
+        def should_bypass_proxy(target_hosts, *, no_proxy_value=None):
+            host = str(target_hosts or "")
+            return "lan" in host or "192.168." in host
+        bypass.should_bypass_proxy = should_bypass_proxy
+        stubs["agent.proxy_bypass"] = bypass
 
-    bypass = types.ModuleType("agent.proxy_bypass")
+    if "agent.ssl_verify" not in stubs:
+        sslv = types.ModuleType("agent.ssl_verify")
+        def resolve_httpx_verify(*, ca_bundle=None, ssl_verify=None, base_url=""):
+            return False if ssl_verify is False else (str(ca_bundle) if ca_bundle else True)
+        sslv.resolve_httpx_verify = resolve_httpx_verify
+        stubs["agent.ssl_verify"] = sslv
 
-    def should_bypass_proxy(target_hosts, *, no_proxy_value=None):
-        host = str(target_hosts or "")
-        return "lan" in host or "192.168." in host
-
-    bypass.should_bypass_proxy = should_bypass_proxy
-    stubs["agent.proxy_bypass"] = bypass
-
-    sslv = types.ModuleType("agent.ssl_verify")
-
-    def resolve_httpx_verify(*, ca_bundle=None, ssl_verify=None, base_url=""):
-        if ssl_verify is False:
-            return False
-        if ca_bundle:
-            return str(ca_bundle)
-        return True
-
-    sslv.resolve_httpx_verify = resolve_httpx_verify
-    stubs["agent.ssl_verify"] = sslv
-
-    utils = types.ModuleType("utils")
-
-    def normalize_proxy_url(value):
-        raw = str(value or "").strip()
-        if not raw:
-            return None
-        return raw if "://" in raw else f"http://{raw}"
-
-    utils.normalize_proxy_url = normalize_proxy_url
-    stubs["utils"] = utils
-
-    hc = types.ModuleType("hermes_cli")
-    hc.__path__ = []  # type: ignore[attr-defined]
-    stubs["hermes_cli"] = hc
-    hcfg = types.ModuleType("hermes_cli.config")
-
-    def load_config_readonly():
-        raise RuntimeError("tests must not read the live config")
-
-    hcfg.load_config_readonly = load_config_readonly
-    stubs["hermes_cli.config"] = hcfg
-    ag = types.ModuleType("agent")
-    ag.__path__ = []  # type: ignore[attr-defined]
-    stubs["agent"] = ag
+    if "utils" not in stubs:
+        utils = types.ModuleType("utils")
+        def normalize_proxy_url(value):
+            raw = str(value or "").strip()
+            return (raw if "://" in raw else f"http://{raw}") if raw else None
+        utils.normalize_proxy_url = normalize_proxy_url
+        stubs["utils"] = utils
 
     for name, mod in stubs.items():
-        sys.modules.setdefault(name, mod)
+        if name not in _ORIG_SYS_MODULES:
+            _ORIG_SYS_MODULES[name] = sys.modules.get(name)
+        sys.modules[name] = mod
     return stubs
+
+def tearDownModule():
+    """Restore sys.modules to prevent cross-test pollution in discover mode."""
+    if "_orig_sbp" in _ORIG_SYS_MODULES:
+        orig = _ORIG_SYS_MODULES.pop("_orig_sbp")
+        try:
+            import agent.proxy_bypass as real_bypass
+            real_bypass.should_bypass_proxy = orig
+        except Exception:
+            pass
+    for name, orig in _ORIG_SYS_MODULES.items():
+        if orig is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = orig
 
 
 _install_core_stubs()
@@ -109,8 +114,9 @@ import advlib  # noqa: E402
 # ---------------------------------------------------------------- fixtures
 
 CFG = {
-    "providers": {
+    "providers-advanced": {
         "my-proxy-api": {
+            "name": "My Proxy API",
             "base_url": "https://api.example.com/v1",
             "advanced": {"proxy": "http://127.0.0.1:7890", "auth_mode": "api"},
         },
@@ -119,7 +125,7 @@ CFG = {
             "advanced": {"proxy": "http://127.0.0.1:7890"},
         },
         "codex-oauth": {
-            # v3 primary: dialect + scheme reference, no advanced.auth_mode
+            "name": "[OAUTH] ChatGPT Codex",
             "base_url": "codex://me@example.com",
             "api_mode": "advanced_oauth",
             "advanced": {
@@ -128,7 +134,6 @@ CFG = {
             },
         },
         "codex-oauth-legacy-alias": {
-            # v1/v2 alias shape still parsed
             "base_url": "whatever",
             "advanced": {
                 "auth_mode": "oauth",
@@ -137,27 +142,32 @@ CFG = {
             },
         },
         "oauth-bare-dialect": {
-            # scheme reference alone marks oauth (no advanced: block at all)
             "base_url": "claude://b%40x.com",
             "api_mode": "advanced_oauth",
         },
-        "no-advanced": {"base_url": "https://plain.example.com/v1"},
         "dupe-route": {
             "base_url": "https://api.example.com/v1/",  # same route as my-proxy-api
             "advanced": {"proxy": "http://other.proxy:1080"},
         },
-    },
-    "custom_providers": [
-        {
-            "name": "legacy-tls",
+        "legacy-tls": {
             "base_url": "https://legacy.example.com/v1",
             "ssl_verify": False,
             "advanced": {"proxy": "http://127.0.0.1:7890"},
         },
-    ],
-    "provider": {  # singular trap: dict under the active-provider key
-        "typo-entry": {"base_url": "https://x.example/v1", "advanced": {"proxy": "http://p:1"}},
     },
+    "providers": {
+        "native-untouched": {
+            "base_url": "https://plain.example.com/v1",
+            "advanced": {"proxy": "http://127.0.0.1:9999"},  # 遗留寄生配置：必须被忽略！
+        },
+    },
+    "custom_providers": [
+        {
+            "name": "legacy-native",
+            "base_url": "https://legacy-native.example.com/v1",
+            "advanced": {"proxy": "http://127.0.0.1:9999"},
+        }
+    ],
 }
 
 
@@ -172,6 +182,26 @@ class RouteTableTest(unittest.TestCase):
         self.assertEqual(e.provider_key, "my-proxy-api")
         self.assertEqual(e.proxy, "http://127.0.0.1:7890")
         self.assertEqual(e.auth_mode, "api")
+
+    def test_naming_and_slug_spec(self):
+        # 1. 显式 name 字段 -> "[ADVANCED] " + name
+        codex_entry = self.table.lookup_slug("advanced:codex-oauth")
+        self.assertIsNotNone(codex_entry)
+        self.assertEqual(codex_entry.display_name, "[ADVANCED] [OAUTH] ChatGPT Codex")
+        self.assertEqual(codex_entry.slug, "advanced:codex-oauth")
+
+        # 2. 缺省 name 字段 -> "[ADVANCED] " + provider_key
+        lan_entry = self.table.lookup_slug("advanced:lan-local")
+        self.assertIsNotNone(lan_entry)
+        self.assertEqual(lan_entry.display_name, "[ADVANCED] lan-local")
+        self.assertEqual(lan_entry.slug, "advanced:lan-local")
+
+    def test_native_providers_strictly_untouched(self):
+        # 原生 providers 下的条目绝对不进入路由表，即使配置了 advanced:
+        self.assertIsNone(self.table.lookup("https://plain.example.com/v1"))
+        self.assertIsNone(self.table.lookup("https://legacy-native.example.com/v1"))
+        # 产生弃用警告
+        self.assertTrue(any("providers.native-untouched.advanced is deprecated and ignored" in w for w in self.table.warnings))
 
     def test_trailing_slash_route_equivalence(self):
         self.assertIsNotNone(self.table.lookup("https://api.example.com/v1/"))
@@ -194,24 +224,18 @@ class RouteTableTest(unittest.TestCase):
         self.assertIsNotNone(e)
         self.assertEqual(e.auth_mode, "api")
 
-    def test_unadvanced_entry_absent(self):
-        self.assertIsNone(self.table.lookup("https://plain.example.com/v1"))
-
     def test_duplicate_route_first_wins_with_warning(self):
         e = self.table.lookup("https://api.example.com/v1")
         self.assertEqual(e.proxy, "http://127.0.0.1:7890")  # first declarer
         self.assertTrue(any("duplicate route" in w for w in self.table.warnings))
 
-    def test_legacy_list_shape_consumed(self):
+    def test_tls_verify_configuration(self):
         e = self.table.lookup("https://legacy.example.com/v1")
         self.assertIsNotNone(e)
         self.assertIs(e.ssl_verify, False)
 
-    def test_singular_provider_trap_warned(self):
-        self.assertTrue(any("providers:" in w and "singular" in w for w in self.table.warnings))
-
     def test_from_config_explicit_bypasses_live_config(self):
-        t = config_scan.RouteTable.from_config(config={"providers": {}})
+        t = config_scan.RouteTable.from_config(config={"providers-advanced": {}})
         self.assertEqual(len(t.all_entries), 0)
 
 

@@ -1,26 +1,21 @@
-"""Config scan + route table for ``advanced:`` blocks (v2 spec §2/§5.1).
+"""Config scan + route table for ``providers-advanced:`` (Decoupled spec).
 
-Reads the RAW config (``hermes_cli.config.load_config_readonly()``) because
-the core's ``_normalize_custom_provider_entry`` whitelist-rebuild drops the
-``advanced`` key from the runtime view (``get_compatible_custom_providers()``).
+Reads the RAW config (``hermes_cli.config.load_config_readonly()``) to scan the
+dedicated top-level section:
+- ``providers-advanced:`` mapping of provider_key -> dict
 
-Both config shapes are consumed (N4):
-- legacy ``custom_providers:`` list of dicts
-- v12+ ``providers:`` mapping of name -> dict
-
-Routing (v3 R2'''/R4''):
-- oauth track, three accepted spellings (first match wins):
-    * ``api_mode: advanced_oauth``          (v3 primary — plugin's registered dialect)
-    * ``base_url: <platform>://<account>``  (v3 reference; non-http scheme)
-    * ``advanced.auth_mode: oauth`` + ``oauth_platform``/``oauth_account``
-      (v1/v2 alias, translated once with an INFO)
-  oauth entries NEVER join the base_url route table and are keyed by the
-  verbatim reference string ``platform://account``.
-- everything else is the api track: joins the base_url route table keyed by
-  ``normalize_route_base_url`` (core rules).
-- First declarer wins on duplicate routes, WARN once per duplicate (R4).
-- ``advanced.oauth_fingerprint: hermes|sub2api|cpa`` (default hermes) rides
-  on the oauth entry (v3 R6).
+Core insulation contract:
+- The core's native ``providers:`` and legacy ``custom_providers:`` sections are
+  COMPLETELY HANDS-OFF. Native providers remain under native Hermes governance;
+  advanced plugin code never intercepts, wraps, or proxies them.
+- Any leftover ``advanced:`` blocks in ``providers:`` are ignored and flagged as
+  warnings.
+- All entries under ``providers-advanced:`` are registered under the dedicated
+  namespace ``advanced:<identifier>`` (e.g. ``advanced:codex``, ``advanced:deepseek-proxy``).
+- The registered display name advertised to Hermes Agent is strictly formatted as
+  ``[ADVANCED] <name>`` (or ``[ADVANCED] <provider_key>`` if ``name`` is omitted).
+- OAuth dialect (``api_mode: advanced_oauth`` and ``platform://account``) is ONLY
+  honored within ``providers-advanced``.
 """
 
 from __future__ import annotations
@@ -44,28 +39,20 @@ _CACHE_SIG: tuple = ()
 
 
 def _config_signature() -> tuple:
-    """(mtime_ns, size) of config.yaml, or () when unresolvable."""
+    """(home_str, mtime_ns, size) of config.yaml, or () when unresolvable."""
     try:
         from hermes_constants import get_hermes_home
 
-        cfg = get_hermes_home() / "config.yaml"
+        home = get_hermes_home()
+        cfg = home / "config.yaml"
         st = os.stat(cfg)
-        return (st.st_mtime_ns, st.st_size)
+        return (str(home), st.st_mtime_ns, st.st_size)
     except Exception:
         return ()
 
 
 def parse_oauth_ref(entry: "AdvancedEntry") -> tuple[str, str]:
-    """(platform, account) for an oauth entry — v3 scheme form first, v1 alias fallback.
-
-    v3: ``base_url: <scheme>://<account-name>`` — scheme is the platform key,
-        the netloc (everything before any '/') is the account name; '%' is
-        URL-decoded once so ``me%40x.com`` and a literal ``me@x.com`` address
-        the same slot.
-    v1: ``advanced.oauth_platform`` + ``advanced.oauth_account`` ("platform:name"
-        or bare name); the entry's base_url is an inert placeholder.
-    Returns ("", "") when neither shape resolves.
-    """
+    """(platform, account) for an oauth entry — v3 scheme form first, v1 alias fallback."""
     raw = str(entry.base_url or "").strip()
     if "://" in raw and not raw.lower().startswith(("http://", "https://")):
         scheme, rest = raw.split("://", 1)
@@ -94,9 +81,7 @@ def _decode_account(value: str) -> str:
 
 
 def parse_oauth_ref_from_url(base_url: str) -> tuple[str, str]:
-    """``<scheme>://<account>`` -> (platform, decoded account) — URL-level
-    mirror of parse_oauth_ref's v3 branch (no AdvancedEntry needed).
-    Returns ("", "") for http(s) or malformed refs."""
+    """``<scheme>://<account>`` -> (platform, decoded account)."""
     raw = str(base_url or "").strip()
     if "://" in raw and not raw.lower().startswith(("http://", "https://")):
         scheme, rest = raw.split("://", 1)
@@ -108,20 +93,24 @@ def parse_oauth_ref_from_url(base_url: str) -> tuple[str, str]:
 
 @dataclass
 class AdvancedEntry:
-    """One provider entry that declared an ``advanced:`` block."""
+    """One custom provider entry managed under ``providers-advanced:``."""
 
-    provider_key: str          # providers.<name> key or list entry name
+    provider_key: str          # providers-advanced.<key>
     base_url: str              # raw as configured (http(s) URL, or scheme://account for oauth)
     route_url: str             # normalized (api mode) — "" for oauth entries
-    auth_mode: str             # "api" | "oauth"  (R2': absent -> "api")
+    auth_mode: str             # "api" | "oauth"
     proxy: str                 # normalized proxy URL or ""
-    model: str = ""            # entry's model slug (cache key / diagnostics only)
-    oauth_platform: str = ""   # v1 alias (v2: derived from base_url scheme)
-    oauth_account: str = ""    # v1 alias / v2 account portion
-    api_mode_cfg: str = ""     # entry's declared api_mode (for the oauth cross-check)
-    fingerprint: str = "hermes"  # v3 R6: hermes|sub2api|cpa (oauth entries)
+    model: str = ""            # entry's model slug
+    oauth_platform: str = ""   # platform key (e.g. codex, claude, antigravity, qwen)
+    oauth_account: str = ""    # account portion
+    api_mode_cfg: str = ""     # declared api_mode (e.g. advanced_oauth)
+    fingerprint: str = "hermes"  # hermes|sub2api|cpa (oauth entries)
     ssl_verify: Any = None     # entry-level, for proxy client verify
     ssl_ca_cert: Optional[str] = None
+    slug: str = ""            # internal slug: advanced:<provider_key_norm>
+    declared_name: str = ""   # original name field in config
+    display_name: str = ""    # formatted name: "[ADVANCED] " + (declared_name or provider_key)
+    raw_config: dict = field(default_factory=dict)
     _warned_bypass: set = field(default_factory=set)
     _warned_proxy: set = field(default_factory=set)
 
@@ -145,34 +134,34 @@ class AdvancedEntry:
 
 @dataclass
 class RouteTable:
-    """Parsed ``advanced:`` declarations, split by auth_mode (R4')."""
+    """Parsed declarations from ``providers-advanced:``, split by auth_mode."""
 
     by_route: dict[str, AdvancedEntry] = field(default_factory=dict)      # api-mode: route_url -> entry
+    by_slug: dict[str, AdvancedEntry] = field(default_factory=dict)       # slug (e.g. advanced:codex) -> entry
     by_oauth: dict[tuple[str, str], AdvancedEntry] = field(default_factory=dict)  # (platform, account) -> entry
-    by_oauth_ref: dict[str, AdvancedEntry] = field(default_factory=dict)  # v2 "scheme://account" -> entry
-    by_oauth_key: dict[str, AdvancedEntry] = field(default_factory=dict)  # provider_key -> oauth entry (named-route catalog seam)
+    by_oauth_ref: dict[str, AdvancedEntry] = field(default_factory=dict)  # "scheme://account" -> entry
+    by_oauth_key: dict[str, AdvancedEntry] = field(default_factory=dict)  # provider_key -> oauth entry
     all_entries: list[AdvancedEntry] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def lookup_oauth_ref(self, base_url: str) -> Optional[AdvancedEntry]:
-        """OAuth entry whose base_url IS *base_url* (v2 scheme://account form).
+    def lookup_slug(self, slug_or_name: str) -> Optional[AdvancedEntry]:
+        """Find entry by its slug (e.g. 'advanced:my-model') or bare key."""
+        key = str(slug_or_name or "").strip().lower()
+        if not key:
+            return None
+        if key in self.by_slug:
+            return self.by_slug[key]
+        if not key.startswith("advanced:"):
+            return self.by_slug.get(f"advanced:{key}")
+        return None
 
-        Identity is exact-string (lowercased, trailing '/' trimmed): the
-        placeholder is inert config text, never rewritten by core URL helpers
-        (verified: _to_openai_base_url leaves scheme:// untouched except
-        rstrip('/')).
-        """
+    def lookup_oauth_ref(self, base_url: str) -> Optional[AdvancedEntry]:
+        """OAuth entry whose base_url IS *base_url* (scheme://account form)."""
         key = str(base_url or "").strip().rstrip("/").lower()
         return self.by_oauth_ref.get(key) if key else None
 
     def lookup(self, base_url: str) -> Optional[AdvancedEntry]:
-        """API-mode entry whose route identity equals *base_url*, or None.
-
-        ``base_url`` here arrives ALREADY rewritten by the core's
-        ``_to_openai_base_url`` (dual-surface anthropic -> openai sibling) —
-        so we normalize both sides and also fall back to a raw-string match
-        against entries' as-configured URL for hosts the rewrite changed.
-        """
+        """API-mode entry whose route identity equals *base_url*, or None."""
         try:
             from hermes_cli.route_identity import normalize_route_base_url
 
@@ -184,7 +173,6 @@ class RouteTable:
         entry = self.by_route.get(target)
         if entry is not None:
             return entry
-        # Second pass: rewrite-tolerant raw comparison (cheap, table is tiny).
         stripped = str(base_url or "").strip().rstrip("/").lower()
         for cand in self.by_route.values():
             if cand.base_url.strip().rstrip("/").lower() == stripped:
@@ -222,17 +210,27 @@ class RouteTable:
             api_mode_cfg = str(raw.get("api_mode") or raw.get("transport") or "").strip().lower()
             alias_oauth = str(adv.get("auth_mode") or "").strip().lower() == "oauth"
             base = str(raw.get("base_url") or raw.get("url") or raw.get("api") or "").strip()
-            # v3 R2''': three spellings of "this entry is advanced_oauth"
+
+            # In providers-advanced, oauth is recognized via api_mode, base_url scheme, or alias
             scheme_oauth = bool(base) and "://" in base and not base.lower().startswith(
                 ("http://", "https://"))
             is_oauth = api_mode_cfg == "advanced_oauth" or alias_oauth or scheme_oauth
-            if not is_oauth and not adv:
-                return  # plain entry, no advanced: block — zero behaviour change (R5)
+
             if is_oauth and alias_oauth and api_mode_cfg != "advanced_oauth":
                 table.warnings.append(
                     f"{provider_key}: advanced.auth_mode=oauth is the v1/v2 alias — prefer "
                     f"api_mode: advanced_oauth (translated automatically)")
+
             fingerprint = str(adv.get("oauth_fingerprint") or "hermes").strip().lower()
+            norm_key = provider_key.strip().lower().replace(" ", "-")
+            slug = f"advanced:{norm_key}"
+
+            declared_name = str(raw.get("name") or "").strip()
+            if declared_name:
+                display_name = f"[ADVANCED] {declared_name}"
+            else:
+                display_name = f"[ADVANCED] {provider_key.strip()}"
+
             entry = AdvancedEntry(
                 provider_key=provider_key,
                 base_url=base,
@@ -246,10 +244,16 @@ class RouteTable:
                 fingerprint=fingerprint,
                 ssl_verify=raw.get("ssl_verify"),
                 ssl_ca_cert=raw.get("ssl_ca_cert") if isinstance(raw.get("ssl_ca_cert"), str) else None,
+                slug=slug,
+                declared_name=declared_name,
+                display_name=display_name,
+                raw_config=raw,
             )
+
             if entry.proxy and adv.get("proxy") and not isinstance(adv.get("proxy"), str):
                 table.warnings.append(f"{provider_key}: advanced.proxy must be a string — ignored")
                 entry.proxy = ""
+
             if is_oauth:
                 platform, account = parse_oauth_ref(entry)
                 if not platform:
@@ -268,7 +272,7 @@ class RouteTable:
                 table.by_oauth_key[entry.provider_key.strip().lower()] = entry
             else:
                 if not entry.base_url:
-                    table.warnings.append(f"{provider_key}: auth_mode=api with no base_url — proxy cannot route")
+                    table.warnings.append(f"{provider_key}: auth_mode=api with no base_url — entry cannot route")
                     return
                 route = normalize_route_base_url(entry.base_url)
                 if not route:
@@ -277,43 +281,52 @@ class RouteTable:
                 if route in table.by_route:
                     table.warnings.append(
                         f"{provider_key}: duplicate route {route} — first declaration wins (R4)")
-                    return
-                entry.route_url = route
-                table.by_route[route] = entry
+                else:
+                    entry.route_url = route
+                    table.by_route[route] = entry
+
+            # Register slugs
+            table.by_slug[slug] = entry
+            table.by_slug[norm_key] = entry
             table.all_entries.append(entry)
 
-        # v12+ providers: mapping
-        providers = config.get("providers")
-        if isinstance(providers, dict):
-            for name, raw in providers.items():
+        # ── ONLY scan providers-advanced: ──────────────────────────────
+        adv_providers = config.get("providers-advanced")
+        if isinstance(adv_providers, dict):
+            for name, raw in adv_providers.items():
                 if isinstance(raw, dict):
                     add_entry(str(name), raw)
-        elif providers is not None:
-            table.warnings.append(f"providers: expected a mapping, got {type(providers).__name__} — skipped")
+                else:
+                    table.warnings.append(
+                        f"providers-advanced.{name}: expected a dict, got {type(raw).__name__} — skipped")
+        elif adv_providers is not None:
+            table.warnings.append(
+                f"providers-advanced: expected a mapping, got {type(adv_providers).__name__} — skipped")
 
-        # legacy custom_providers: list
+        # ── Zero-touch check for native providers: (deprecation warnings only) ──
+        native_providers = config.get("providers")
+        if isinstance(native_providers, dict):
+            for name, raw in native_providers.items():
+                if isinstance(raw, dict):
+                    if raw.get("advanced") is not None:
+                        table.warnings.append(
+                            f"providers.{name}.advanced is deprecated and ignored — move to providers-advanced.{name}.advanced"
+                        )
+                    if str(raw.get("api_mode") or "").strip().lower() == "advanced_oauth":
+                        table.warnings.append(
+                            f"providers.{name}.api_mode=advanced_oauth is ignored in native providers — move to providers-advanced.{name}"
+                        )
+
+        # Legacy custom_providers check (deprecation warning only)
         legacy = config.get("custom_providers")
         if isinstance(legacy, list):
             for raw in legacy:
-                if isinstance(raw, dict):
-                    key = str(raw.get("name") or raw.get("provider") or "").strip() or "<unnamed>"
-                    add_entry(key, raw)
-        elif legacy is not None:
-            table.warnings.append(
-                f"custom_providers: expected a list, got {type(legacy).__name__} — skipped")
+                if isinstance(raw, dict) and raw.get("advanced") is not None:
+                    k = str(raw.get("name") or raw.get("provider") or "<unnamed>").strip()
+                    table.warnings.append(
+                        f"custom_providers[{k}].advanced is deprecated and ignored — move to providers-advanced"
+                    )
 
-        # Friendly hint for the sample-config trap: top-level `provider:`
-        # (singular) is the ACTIVE-provider string in core semantics; a dict
-        # under it means the user meant `providers:`.
-        singular = config.get("provider")
-        if isinstance(singular, dict):
-            has_adv = any(isinstance(v, dict) and isinstance(v.get("advanced"), dict)
-                          for v in singular.values())
-            if has_adv:
-                table.warnings.append(
-                    "top-level `provider:` (singular) holds advanced: blocks, but the core reads "
-                    "`providers:` (plural) / `custom_providers:` — rename the section or the "
-                    "entries will never route")
         for w in table.warnings:
             logger.warning("advanced-providers: %s", w)
         return table
@@ -335,6 +348,18 @@ def _normalize_proxy(value: Any) -> str:
 def _load_raw_config() -> dict:
     """Raw config dict (never mutate!). Empty dict on any failure (fail-open)."""
     try:
+        from hermes_constants import get_hermes_home
+        import yaml
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if cfg_path.is_file():
+            with open(cfg_path, encoding="utf-8-sig") as f:
+                res = yaml.safe_load(f)
+                if isinstance(res, dict):
+                    return res
+    except Exception:
+        pass
+    try:
         from hermes_cli.config import load_config_readonly
 
         cfg = load_config_readonly()
@@ -348,12 +373,7 @@ _SETTINGS_KEY = "hermes-provider-advanced"
 
 
 def load_plugin_settings() -> dict:
-    """``plugins.entries.hermes-provider-advanced.settings`` (dict, {}).
-
-    Bare-name fallback per house rule (a subdir-deployed plugin resolves
-    entries under a path-derived key only; the settings reader must not
-    depend on where the plugin was installed).
-    """
+    """``plugins.entries.hermes-provider-advanced.settings`` (dict, {})."""
     cfg = _load_raw_config()
     entries = ((cfg.get("plugins") or {}).get("entries") or {})
     for key in (_SETTINGS_KEY, "hermes_provider_advanced"):
@@ -370,3 +390,12 @@ def invalidate_cache() -> None:
     global _CACHE, _CACHE_SIG
     with _CACHE_LOCK:
         _CACHE, _CACHE_SIG = None, ()
+    try:
+        import sys
+        for mod_name in ("advlib.config_scan", "hermes_advlib.config_scan"):
+            m = sys.modules.get(mod_name)
+            if m is not None:
+                m._CACHE = None
+                m._CACHE_SIG = ()
+    except Exception:
+        pass

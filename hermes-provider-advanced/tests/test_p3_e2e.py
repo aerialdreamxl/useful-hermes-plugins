@@ -99,9 +99,8 @@ class P3E2ETest(unittest.TestCase):
     def _config(self, fingerprint="hermes", api_mode="advanced_oauth"):
         return {
             "model": {"provider": "custom", "base_url": "https://unused.invalid/v1"},
-            "providers": {
+            "providers-advanced": {
                 "codex-oauth": {
-                    "provider": "custom",
                     "model": "gpt-5-codex",
                     "base_url": "codex://me@x.com",
                     "api_mode": api_mode,

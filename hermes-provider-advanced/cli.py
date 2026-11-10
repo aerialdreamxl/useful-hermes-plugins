@@ -45,8 +45,8 @@ def _adv(mod: str):
 def build_parser(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="adv_verb")
 
-    sub.add_parser("status", help="List every advanced: entry, its route match and proxy probe.")
-    sub.add_parser("selfcheck", help="N1 probes: overlay liveness, http_client gate, key adoption.")
+    sub.add_parser("status", help="List every providers-advanced entry, its route match and proxy probe.")
+    sub.add_parser("selfcheck", help="N1 probes: standalone profile registration, http_client gate, key adoption.")
     sub.add_parser("help", help="Show this help.")
 
     # P3: account-store verbs.
@@ -100,15 +100,21 @@ def run_command(args: argparse.Namespace) -> int:
 
 def _print_help() -> None:
     print(f"hermes {CLI_NAME} — per-provider advanced: settings\n")
-    print("  status     parsed advanced: entries, route match, proxy probe, overlay liveness")
+    print("  status     parsed providers-advanced: entries, route match, proxy probe, profile status")
     print("  selfcheck  N1 upgrade-resilience probes")
     print("  oauth      account store: login / import / list / signout\n")
-    print("Config shape (under a providers.<name> / custom_providers entry):")
-    print("  advanced:")
-    print('    proxy: "http://127.0.0.1:7890"   # per-provider HTTP proxy (P1)')
+    print("Config shape (under top-level `providers-advanced:`):")
+    print("providers-advanced:")
+    print("  my-proxy-model:")
+    print('    name: "My DeepSeek Proxy"   # registered display name: [ADVANCED] My DeepSeek Proxy')
+    print('    base_url: "https://api.deepseek.com/v1"')
+    print('    advanced:')
+    print('      proxy: "http://127.0.0.1:7890"')
     print("  # OAuth dialect (P3):")
-    print('    api_mode: advanced_oauth')
+    print("  my-codex-account:")
+    print('    name: "[OAUTH] ChatGPT Codex"')
     print('    base_url: "codex://me@example.com"   # <platform>://<account>')
+    print('    api_mode: advanced_oauth')
     print("    advanced:")
     print("      oauth_fingerprint: hermes|sub2api|cpa   # request identity (default hermes)")
 
@@ -145,18 +151,18 @@ def _cmd_status() -> int:
 
     table = RouteTable.from_config()
 
-    overlay_ok, overlay_detail = _probe_overlay()
-    print(f"overlay:   {'OK' if overlay_ok else 'NOT ACTIVE'} — {overlay_detail}")
-    print(f"entries:   {len(table.all_entries)} advanced: block(s) parsed")
+    profile_ok, profile_detail = _probe_provider_profile()
+    print(f"profile:   {'OK' if profile_ok else 'NOT ACTIVE'} — {profile_detail}")
+    print(f"entries:   {len(table.all_entries)} providers-advanced entry(ies) parsed")
 
     if not table.all_entries and not table.warnings:
-        print("\nNo advanced: blocks in config. Nothing routes through this plugin (R5 zero-change).")
+        print("\nNo entries in providers-advanced:. Native providers remain completely untouched.")
         return 0
 
     print()
     for entry in table.all_entries:
         mode = entry.auth_mode
-        print(f"- {entry.provider_key} [{mode}]")
+        print(f"- {entry.display_name} ({entry.slug}) [{mode}]")
         if mode == "api":
             print(f"    route:   {entry.route_url}")
             if entry.proxy:
@@ -186,10 +192,10 @@ def _cmd_selfcheck() -> int:
     print(f"[{'OK' if advlib else 'FAIL'}] advlib loads under fixed module name")
     failures += 0 if advlib else 1
 
-    # 2. overlay is the registered 'custom' profile
-    overlay_ok, detail = _probe_overlay()
-    print(f"[{'OK' if overlay_ok else 'FAIL'}] overlay registered as 'custom' — {detail}")
-    failures += 0 if overlay_ok else 1
+    # 2. standalone 'advanced' profile is registered independently
+    profile_ok, detail = _probe_provider_profile()
+    print(f"[{'OK' if profile_ok else 'FAIL'}] standalone 'advanced' profile — {detail}")
+    failures += 0 if profile_ok else 1
 
     # 3. http_client gate still in core (semantic anchor, text probe)
     gate_ok, gate_detail = _probe_gate()
@@ -473,18 +479,37 @@ def _oauth_import(args) -> int:
 
 # ---------------------------------------------------------------- probes
 
-def _probe_overlay() -> tuple[bool, str]:
-    """The profile registered as ``custom`` is our AdvancedCustomProfile."""
+def _probe_provider_profile() -> tuple[bool, str]:
+    """Check that 'advanced' is registered independently and native 'custom' is untouched."""
     try:
+        advlib = _advlib()
+        if advlib is not None:
+            try:
+                from .advlib.provider_profile import build_and_register_advanced_profile, ensure_model_provider_bridge
+                ensure_model_provider_bridge()
+                build_and_register_advanced_profile()
+            except Exception:
+                try:
+                    from advlib.provider_profile import build_and_register_advanced_profile, ensure_model_provider_bridge
+                    ensure_model_provider_bridge()
+                    build_and_register_advanced_profile()
+                except Exception:
+                    pass
+
         from providers import get_provider_profile
 
-        profile = get_provider_profile("custom")
-        if profile is None:
-            return False, "no profile registered under 'custom'"
-        cls = type(profile).__name__
-        if cls == "AdvancedCustomProfile":
-            return True, f"'custom' -> {cls}"
-        return False, f"'custom' -> {cls} (bundled won — overlay dir missing/not scanned?)"
+        adv_profile = get_provider_profile("advanced")
+        if adv_profile is None:
+            return False, "standalone 'advanced' profile not registered"
+        adv_cls = type(adv_profile).__name__
+        if adv_cls != "AdvancedProviderProfile":
+            return False, f"'advanced' profile is {adv_cls}, expected AdvancedProviderProfile"
+
+        custom_profile = get_provider_profile("custom")
+        if custom_profile is not None and type(custom_profile).__name__ != "CustomProfile":
+            return False, f"native 'custom' profile was unexpectedly modified ({type(custom_profile).__name__})"
+
+        return True, f"standalone 'advanced' -> {adv_cls}; native 'custom' untouched"
     except Exception as exc:
         return False, f"probe error: {type(exc).__name__}: {exc}"
 

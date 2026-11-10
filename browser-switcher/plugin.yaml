@@ -1,0 +1,6 @@
+name: browser-switcher
+version: "1.0.0"
+description: "Session-scoped browser backend converter plug: default (packaged headless Chromium) / shardx (ShardX fingerprint browser via local API) / cdp (any Chromium CDP endpoint). Switch with /browserswitch or the browser_switch tool; applies to the current session only."
+author: Feather
+kind: standalone
+provides_tools: [browser_switch]

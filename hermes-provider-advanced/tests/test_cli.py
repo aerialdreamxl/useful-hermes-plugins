@@ -77,16 +77,35 @@ class SelfcheckProbeTest(unittest.TestCase):
         self.assertFalse(ok2)
         self.assertIn("BEFORE", detail)
 
-    def test_overlay_probe_detects_bundled_win(self):
-        class Bundled:  # not our overlay
+    def test_provider_profile_probe(self):
+        class AdvancedProviderProfile:
             pass
-        with mock.patch("providers.get_provider_profile", create=True, return_value=Bundled()):
-            fake_mod = mock.Mock()
-            fake_mod.get_provider_profile = lambda name: Bundled()
-            with mock.patch.dict(sys.modules, {"providers": fake_mod}):
-                ok, detail = cli._probe_overlay()
-        self.assertFalse(ok)
-        self.assertIn("Bundled", detail)
+        class CustomProfile:
+            pass
+        class WrongClass:
+            pass
+
+        fake_mod = mock.Mock()
+        # Case 1: advanced not registered
+        fake_mod.get_provider_profile = lambda name: None
+        with mock.patch.dict(sys.modules, {"providers": fake_mod}):
+            ok, detail = cli._probe_provider_profile()
+            self.assertFalse(ok)
+            self.assertIn("not registered", detail)
+
+        # Case 2: advanced ok and custom untouched
+        fake_mod.get_provider_profile = lambda name: AdvancedProviderProfile() if name == "advanced" else CustomProfile()
+        with mock.patch.dict(sys.modules, {"providers": fake_mod}):
+            ok, detail = cli._probe_provider_profile()
+            self.assertTrue(ok)
+            self.assertIn("untouched", detail)
+
+        # Case 3: native custom was modified
+        fake_mod.get_provider_profile = lambda name: AdvancedProviderProfile() if name == "advanced" else WrongClass()
+        with mock.patch.dict(sys.modules, {"providers": fake_mod}):
+            ok, detail = cli._probe_provider_profile()
+            self.assertFalse(ok)
+            self.assertIn("unexpectedly modified", detail)
 
     def test_redact_hides_credentials(self):
         self.assertEqual(cli._redact("http://user:pass@proxy.lan:7890"), "http://proxy.lan:7890")

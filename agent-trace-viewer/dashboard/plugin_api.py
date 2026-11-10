@@ -52,8 +52,6 @@ def _state_db_path() -> Path:
         candidates.append(get_process_hermes_home())
     except Exception:  # noqa: BLE001 — resolver optional in some contexts
         pass
-    # Known install on this host (fallback of last resort).
-    candidates.append(Path(r"D:/01-AI/Hermes-Agent/Data"))
 
     for base in candidates:
         try:

@@ -27,13 +27,13 @@
     default_dirs:              # 顶层 = 跨系统通用值
       cli: "."                 # "." / auto / cwd = 进程启动目录
       tui: "."
-      gateway: "D:/01-AI/Hermes-Agent/Nest"
-      desktop: "D:/01-AI/Hermes-Agent/Nest"
+      gateway: "~/hermes-nest"
+      desktop: "~/hermes-nest"
     os:                        # 按当前系统覆盖（win32 / darwin / linux）
       win32:
-        gateway: "D:/01-AI/Hermes-Agent/Nest"
+        gateway: "~/hermes-nest"
       darwin:
-        gateway: "~/Hermes/Nest"
+        gateway: "~/hermes-nest"
 
 值语义：""/缺失 = 不干预（保持 Hermes 原生行为）；"."=启动目录；
 "~" 展开；相对路径按启动目录解析；必须是已存在的目录，否则忽略并告警。
