@@ -1,0 +1,5 @@
+name: dashscope-native
+version: 0.2.0
+description: "DashScope native-wire provider (api_mode: qwen_dashscope) via the official dashscope SDK, plus voice lanes: metered Qwen-TTS/ASR (provider 'dashscope') and Token Plan voice REST per official docs (provider 'dashscope-tp'). Zero core patches."
+author: "Feather (翎羽)"
+kind: standalone

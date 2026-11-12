@@ -1,24 +1,36 @@
 name: paperhermes
-version: 0.4.0
-description: "外发载荷瘦身：llm_request 中间件折叠 eager 工具 description 与 Skills 索引描述（名字全在场），净益门 + 会话×模型冻结 + 模型侧告知行。PROMPT.md v0.4 D8：首启播种默认值，其余零 config 写。"
+version: 0.5.5
+description: "外发载荷瘦身：折叠 eager 工具/参数 description 与 Skills 索引描述（名字全在场），可选工具结果清理/外置。v0.5：首调后 session_id 级绝对冻结 + /paperhermes meltdown 用户急停 + 逐键补齐；v0.5.1：模型切换视为新会话；v0.5.2：M8 摘要库（现场构建清单、缺失即退回首句折叠）；v0.5.3：折叠保留规则句、参数折叠保留枚举字面量、技能告知行按净益取舍、结果处理跟随折叠门控；v0.5.4：技能主动发现提示（独立开关，默认关，介入时注入）；v0.5.5：spill 24h 惰性清理、observe.log 10MB 轮转、stats CLI 子命令、依赖键 WARN 一次、error_streak 成功重置。"
 kind: standalone
 author: Feather
 license: MIT
 provides_hooks:
   - post_tool_call
   - on_session_end
+  - post_api_request
+  - transform_tool_result
 provides_middleware:
   - llm_request
 config_schema:
   observe:
     type: bool
     label: "观测（只记日志，不改载荷）"
-    description: "true=每请求记 pre/post 字节与折叠量到 $HERMES_HOME/paperhermes/observe.log。只读项，播种默认 true（D11）。"
+    description: "true=每请求记 pre/post 字节与折叠量到 $HERMES_HOME/paperhermes/observe.log。只读项，默认 true（D11）。"
     default: true
+  observe_composition:
+    type: bool
+    label: "请求构成账 (M0.5)"
+    description: "true=每请求追加 system/tools/参数描述/历史/工具结果的分区字节数，并按 api_request_id 关联真实 usage 回执。只读，量更大，默认 false。"
+    default: false
   fold_tool_desc:
     type: bool
     label: "折叠工具描述 (M1)"
-    description: "true=外发 tools 数组里各工具 description 折为首句摘要（≤fold_first_sentence_max_chars）。参数 schema 与可调用性不动。"
+    description: "true=外发 tools 数组里各工具 description 折为首句摘要（≤fold_first_sentence_max_chars）。可调用性不动。"
+    default: false
+  fold_tool_param_desc:
+    type: bool
+    label: "折叠参数说明 (M3)"
+    description: "true=折 parameters/input_schema 内的 description 字符串；type/properties/required/enum/default/$ref 等结构键永不动。keep_param_desc 可逐参数豁免。"
     default: false
   fold_skills_index:
     type: bool
@@ -28,12 +40,27 @@ config_schema:
   fold_skills_dynamic:
     type: bool
     label: "跨会话技能升档"
-    description: "true=会话内被 skill_view 加载过的技能，下一会话保持全量描述（依赖 fold_skills_index=true）。"
+    description: "true=被 skill_view 加载过的技能，下一会话保持全量描述（依赖 fold_skills_index=true）。"
+    default: false
+  fold_skills_trigger_only:
+    type: bool
+    label: "技能保留触发句 (M7)"
+    description: "true=技能行保留名字+首句触发语而非仅名字（依赖 fold_skills_index=true）。召回 A/B 未过门前建议保持 false。"
+    default: false
+  inject_skill_search_hint:
+    type: bool
+    label: "技能主动发现提示 (v0.5.4)"
+    description: "true=本会话折叠实际介入时，额外向 system 注入一句主动搜索技能的指令（中/英按模型名选）；不额外折任何内容，技能索引没被折时同样提醒。默认 false；净益门按实际注入的这条文本计字节。"
     default: false
   keep_eager:
     type: list
     label: "永不折叠的工具名"
     description: "点名豁免的工具（clarify 恒在内置白名单里，无需重复）。"
+    default: []
+  keep_param_desc:
+    type: list
+    label: "永不折叠的参数说明"
+    description: "条目格式 tool_name.param_name；同名嵌套参数全部保留。keep_eager 仍豁免整个工具。"
     default: []
   fold_first_sentence_max_chars:
     type: int
@@ -43,5 +70,50 @@ config_schema:
   min_savings_chars:
     type: int
     label: "净益门 (chars)"
-    description: "本轮预估回收减去告知行字节后低于此值→整轮不介入（量少开了也没用）。会话×模型首测定型。"
+    description: "本轮预估回收减去告知行字节后低于此值→整轮不介入。首请求定型后冻结。"
     default: 2048
+  use_compact_store:
+    type: bool
+    label: "忠实摘要库 (M8)"
+    description: "true=工具描述改用 hermes paperhermes compact-tools 生成的摘要（逐字段 sha256 校验）；缺失/过期/被安全闸门拒绝的工具退回首句折叠并保留规则句。库文件 tool_compact.json 不存在时本条自动失效。"
+    default: false
+  audit_defer:
+    type: bool
+    label: "defer 只读审计 (M4)"
+    description: "true=/paperhermes 面板显示疑似失效 defer 项与重工具 defer 候选。只读，不改载荷不改官方配置。"
+    default: false
+  minify_json_tool_results:
+    type: bool
+    label: "JSON 结果去格式化 (M5a)"
+    description: "true=可完整解析的 JSON 工具结果去缩进空白。terminal 工具永不处理。"
+    default: false
+  strip_terminal_progress_noise:
+    type: bool
+    label: "终端噪音清理 (M5b)"
+    description: "true=工具结果去 ANSI、进度条中间帧与连续重复行。terminal 工具永不处理。"
+    default: false
+  spill_large_tool_results:
+    type: bool
+    label: "大结果外置 (M6)"
+    description: "true=超过 spill_min_chars 的非 terminal 结果写入本地 spill/ 目录，载荷里只留头尾+读取路径。省略段可从文件逐字节取回。"
+    default: false
+  spill_min_chars:
+    type: int
+    label: "外置触发阈值 (chars)"
+    description: "结果超过该字符数才外置。默认 20000 低于宿主 terminal 输出上限 50000（tool_output.max_bytes），否则永不触发。冻结后不可改。"
+    default: 20000
+  spill_head_chars:
+    type: int
+    label: "外置保留头部 (chars)"
+    description: "外置后载荷里保留的开头字符数。"
+    default: 4000
+  spill_tail_chars:
+    type: int
+    label: "外置保留尾部 (chars)"
+    description: "外置后载荷里保留的结尾字符数。"
+    default: 4000
+  spill_exclude_tools:
+    type: list
+    label: "外置排除工具"
+    description: "点名的工具结果永不外置；terminal 永远内建排除。"
+    default: []

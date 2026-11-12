@@ -1,0 +1,26 @@
+# web-bingsearch 的 Python 依赖声明 —— Hermes PM 新格式（uv workspace 成员）。
+#
+# PM 读取顺序（pm/plugin_declarations.py::read_python_declaration）：
+# 作者手写的 pyproject.toml [project].dependencies 优先，其次才是 plugin.yaml 的
+# python_dependencies / pip_dependencies（旧式兜底）。带 [project] 表的插件会被
+# PM 当作 uv workspace 成员，`hermes pm install` / enable 时把依赖装进 Hermes 环境。
+#
+# 参照 hermes-lcm 的同款声明：
+# - uv 拒绝没有 version 的 [project] 表，整个 uv lock 会失败、插件被踢出环境，
+#   所以 name + version 必填（version 是占位，不必跟 plugin.yaml 同步）。
+# - 不写 [build-system]：成员是 metadata-only（virtual），PM 只装 dependencies，
+#   不会把插件本身打包安装（插件代码仍从 plugins/ 目录直接加载）。
+# - 文件里不能出现 pm 生成物的标记短语（GENERATED 开头那句），否则 PM 当成生成物跳过。
+#
+# 为什么钉 primp>=2.0.1：
+# 2.0.1 实测（2026-11-12）裸别名 impersonate="chrome" 会随机解析到 iPhone 移动版，
+# 本插件已改用桌面版本指纹池（chrome_152/chrome_146/safari）规避；这些目标名在
+# 2.0.1 可用。curl_cffi 未纳入依赖——本网络冷连接 19-25s 实测太慢，只作调研备选。
+
+[project]
+name = "web-bingsearch"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "primp>=2.0.1",
+]
