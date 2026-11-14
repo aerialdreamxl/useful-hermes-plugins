@@ -1,0 +1,43 @@
+name: gateway-dashboard
+version: "0.1.0"
+description: >
+  Gateway 内联 Dashboard 胶水（PROMPT v3）：enabled 时经 gateway:startup hook 以
+  pythonw 子进程踢起官方 `hermes dashboard`（端口/参数全量映射自本 settings），
+  并提供 dashboard 面只读活动 API（/api/plugins/gateway-dashboard/*）与页签。
+  生产端：Data/hooks/gateway-dashboard/（胶水，随 hooks 机制加载）。
+
+author: "AerialdreamXL & Feather Agent"
+kind: standalone
+
+# settings 面板（plugins.entries.gateway-dashboard.settings）——§2A CLI 全参数映射。
+config_schema:
+  dashboard_port:
+    type: int
+    label: Dashboard 端口
+    description: 过渡期 9120；主人挪走 webapp 后定桩 9119。0=OS 随机（官方支持）。
+    default: 9120
+  host:
+    type: str
+    label: 绑定地址
+    description: 只允许 loopback；非 127.0.0.1/localhost/::1 值 → 胶水拒启并 log。
+    default: "127.0.0.1"
+  skip_build:
+    type: bool
+    label: 跳过前端构建
+    description: 子进程里触发 pnpm 构建=弹窗/挂死风险，插件场景必须 true（§2A）。
+    default: true
+  isolated:
+    type: bool
+    label: 独立实例
+    description: 防 multiplex attach 后 exit0 / 撞口 exit78，语义=必起独立进程，保持 true。
+    default: true
+  open_profile:
+    type: str
+    label: 预选 profile
+    description: CLI 隐藏参数透传，首版不测，留空即可。
+    default: ""
+  auto_restart:
+    type: bool
+    label: 子进程退出后补踢
+    description: 介入类默认 false（§4.5）：true 时意外退出补踢一次，一次即止防振荡。
+    default: false

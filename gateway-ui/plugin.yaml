@@ -1,0 +1,59 @@
+name: gateway-ui
+version: 1.0.0
+description: "适用于 Hermes Gateway 的 Qt GUI 组件：托盘状态灯 + 事件总线 + petdex 桌宠浮窗（side-env Qt worker，崩溃隔离）。整体重写，前身 gateway-fluent-gui 废弃。"
+author: "@AerialdreamXL + AI collaborator"
+manifest_version: 1
+provides_hooks:
+  - pre_gateway_dispatch
+  - pre_api_request
+  - post_api_request
+  - post_llm_call
+  - pre_tool_call
+  - api_request_error
+  - agent_loop_stopped
+config_schema:
+  tray_enabled:
+    type: boolean
+    default: true
+    description: "托盘图标本体。false=无图标（worker 被停，supervisor 继续等开回），总线照常。"
+  bus_enabled:
+    type: boolean
+    default: true
+    description: "state.json/events.jsonl 写入（cache/gateway-ui，姊妹 gateway-dashboard 契约 §5）。关掉=dashboard 断粮。"
+  degrade_window_s:
+    type: integer
+    default: 300
+    description: "红灯观察窗秒数：窗内发生过 LLM 降级（base_url 端点判定）或错误连发≥2 → 红灯。"
+  verbose_log:
+    type: boolean
+    default: false
+    description: "详细日志：GW/WK/PET 三前缀写 cache/gateway-ui/debug.log（桌宠物理 pet_debug.log），400KB 滚动。false=零写入。"
+  package_index_url:
+    type: string
+    default: "https://pypi.tuna.tsinghua.edu.cn/simple"
+    description: "Qt side-env（gateway-ui-qt）首装 pip 源。已装机器不触发安装。"
+  pet:
+    type: object
+    default: {}
+    description: "桌宠独立配置块（与 Hermes display.pet 完全隔开）。enable-pet 总开关默认 false 且三态处理（缺键≠false、默认值不回写）；slug 空=第一只已安装 petdex；scale 0.7；roam true；topmost true。"
+  balance:
+    type: object
+    default: {}
+    description: "余额气泡配置块（余额气泡 BalanceBubble，CONTRACT §10）。全部修改类语义：缺键按默认读、绝不自动落盘。enabled 总开关默认 false（显式打开才起宿主 watcher 周期拉余额，额度纪律）；refresh_s 刷新周期秒（默认 300，钳 60-3600，改小=拉得更勤更费额度）；providers_dir 投放目录（空=用 <home>/balance-providers，非空必须绝对路径且不含 ..，改它=换余额源目录）。"
+    properties:
+      enabled:
+        type: boolean
+        default: false
+        description: "余额气泡总开关。false=宿主 watcher 空转、不拉取不写 balance_view.json、worker 气泡入口禁用；true=周期拉取全部余额源。默认 false，显式打开才花钱。"
+      refresh_s:
+        type: integer
+        default: 300
+        description: "余额刷新周期秒数（钳 60-3600）。宿主 watcher 每隔这么久拉一次全部 provider；手动刷新另有 10s 节流。改小=数据更新但更费 API 额度。"
+      providers_dir:
+        type: string
+        default: ""
+        description: "余额源投放目录（每个 *.py 一个 binding）。空=用 <home>/balance-providers（出厂三适配器 deploy 时拷入，目录空才拷不覆盖用户文件）；非空必须绝对路径且不含 ..。改它=换自定义余额源目录。"
+      token_plan_edition:
+        type: string
+        default: "individual"
+        description: "百炼 Token Plan 查询版本：individual=个人版月额度（默认），team=团队版席位额度。改它=下次刷新按所选版本取数；所选版本无生效订阅时气泡报错不回落另一版。"

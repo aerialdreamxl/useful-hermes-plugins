@@ -35,6 +35,7 @@ Windows 与 Linux 实测过；macOS 理论上没有平台相关问题，但没�
 - **[hermes-provider-advanced](hermes-provider-advanced/README.md)**: 自定义提供商高级设置，零核心补丁实现两件事：`advanced.proxy` 单提供商代理分流；`api_mode: advanced_oauth` 把 Codex / Claude / Antigravity 订阅账号接成模型通道（导入或交互式登录，自动带单刷轮换安全刷新），请求身份可用 `hermes|cpa|sub2api` 指纹档。OAuth 半边可用 `ADVANCED_DISABLE_OAUTH=1` 整体关闭。注意：订阅通道与指纹功能可能受各提供商服务条款限制，使用前自行评估。model-provider 桥需落在 `$HERMES_HOME/plugins/model-providers/hermes-provider-advanced/`（插件自动生成或手动复制均可），步骤见其 README。
 - **[paperhermes](paperhermes/README.md)**: 一个高度可配置的省token插件，名字取材自PaperMC。把每次请求重发的工具 description 折成首句、技能索引低频类目降名字行（名字全在场，可按需回读），单请求实测回收 2.6–3.4 万字符；会话×模型字节冻结保前缀缓存，所有修改类开关默认关、观测先行。
 - **[browser-switcher](browser-switcher/README.md)**: 可由你或Agent切换的浏览器后端，和ShardX指纹浏览器有联动。default / shardx / cdp 三档收敛到 Chromium CDP，`/browserswitch` 或 `browser_switch` 工具切换，仅当前会话生效，零配置零落盘。
+- **[gateway-ui](gateway-ui/README.md)**: 给 Hermes Gateway 配一套 Qt 图形界面——系统托盘状态灯（绿/橙/红/灰实时反映忙闲与降级）+ petdex 桌宠浮窗（透明底、会在窗口边沿爬走、忙时演对应动作、完成/失败/等输入时挥手闪托盘）+ Fluent 设置窗口 + 可插拔余额气泡（左键点桌宠或托盘弹出，DeepSeek/百炼按量/Token Plan 出厂三适配器，峰谷倒计时，查询归宿主、点击零网络）。托盘+桌宠跑在隔离的 side-env worker 进程，崩溃不连坐 Gateway；配置全走官方 writer，修改类开关默认关。仅 Windows 实测（桌宠爬窗用 Win32 枚举），需先 `hermes pets install` 装宠物素材。
 
 ## 工具类
 - **[agent-trace-viewer](agent-trace-viewer/README.md)**: DeepSeek Harness风格的Agent Trace查看器。只读浏览 state.db 里的历史会话轨迹，一键导出标准 OpenAI `messages[]` JSON，不向模型注册任何工具，对 agent 行为零影响。
@@ -67,6 +68,7 @@ Windows 与 Linux 实测过；macOS 理论上没有平台相关问题，但没�
 ## 使用过的LLM名单
 - Qwen3.8-Flash
 - Qwen3.8-Max
+- Qwen4-Max-Preview
 - DeepSeek-V4-Flash-0731
 - DeepSeek-V4.1-Flash
 - DeepSeek-V4.1-Flash-1017

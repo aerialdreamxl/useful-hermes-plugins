@@ -1,0 +1,8 @@
+{
+  "name": "gateway-dashboard",
+  "label": "Gateway Activity",
+  "description": "Gateway realtime activity feed and pet-bus state (read-only)",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}
