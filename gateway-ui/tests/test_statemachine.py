@@ -115,6 +115,56 @@ sm.baseline_base_url = "https://main.example/v1"
 ev("turn_start", t, session_key="S1", base_url="https://main.example/v1", provider="other-name")
 ck("provider rename not degrade", sm.last_degrade is None)
 
+# --- 降级判定：权威源可达时读内部降级链路标志（手动切换不误判）---
+class FallbackAgent:
+    def __init__(self, desc="waiting for provider response", fb=False,
+                 base_url="https://main.example/v1", primary_url=None, provider="custom:main"):
+        self._last_activity_desc = desc
+        self._provider_fallback_active = fb
+        self.base_url = base_url
+        self.provider = provider
+        if primary_url:
+            self._primary_runtime = {"base_url": primary_url}
+
+reset()
+sm.baseline_base_url = "https://main.example/v1"
+# 手动切供应商：端点变了，但内部降级标志没置位 → 不算降级
+sm.set_authority([("k1", FallbackAgent(base_url="https://manual.example/v1"))], now=t)
+ev("post_api", t + 1, session_key="S1", base_url="https://manual.example/v1")
+ck("manual switch not degrade (authority)", sm.last_degrade is None)
+ck("manual switch light not red", sm.tier_and_light(t + 2, 300)[1] != "red")
+# 真降级：内部标志置位 → 记降级（from=主端点 to=当前端点）
+sm.set_authority([("k1", FallbackAgent(fb=True, base_url="https://backup.example/v1",
+                                       primary_url="https://main.example/v1"))], now=t + 3)
+ck("real fallback degrade recorded", sm.last_degrade is not None)
+ck("real fallback from/to", sm.last_degrade["from"] == "https://main.example/v1"
+   and sm.last_degrade["to"] == "https://backup.example/v1")
+ck("real fallback red", sm.tier_and_light(t + 4, 300)[1] == "red")
+# 主恢复（标志清零）→ 不再新增降级记录
+deg_ts = sm.last_degrade["ts"]
+sm.set_authority([("k1", FallbackAgent(fb=False, base_url="https://main.example/v1"))], now=t + 10)
+ck("restore no new degrade", sm.last_degrade["ts"] == deg_ts)
+# 权威源可达期间，端点启发式被门控：即使事件端点≠基线也不记
+reset()
+sm.baseline_base_url = "https://main.example/v1"
+sm.set_authority([("k1", FallbackAgent())], now=t)
+ev("turn_start", t + 1, session_key="S1", base_url="https://other.example/v1")
+ev("post_api", t + 2, session_key="S1", base_url="https://other.example/v1")
+ck("heuristic gated while authority up", sm.last_degrade is None)
+# 权威源不可达 → 退回端点启发式（兜底宁可误报）
+sm.authority_unreachable(); sm.authority_unreachable(); sm.authority_unreachable()
+ck("authority down", sm.authority is None)
+ev("post_api", t + 3, session_key="S1", base_url="https://other.example/v1")
+ck("heuristic resumes when authority down", sm.last_degrade is not None)
+# 标志置位但无 _primary_runtime → from 回落基线
+reset()
+sm.baseline_base_url = "https://main.example/v1"
+sm.set_authority([("k1", FallbackAgent(fb=True, base_url="https://backup.example/v1"))], now=t)
+ck("fallback from falls back to baseline", sm.last_degrade["from"] == "https://main.example/v1")
+# url_label 空值不造 "None" 字样
+url_label = gui.statemachine.url_label
+ck("url_label none -> ?", url_label(None) == "?" and url_label("") == "?")
+
 # --- 权威源接入/退避 ---
 reset()
 class FakeAgent:

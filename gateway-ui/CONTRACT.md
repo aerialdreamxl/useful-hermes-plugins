@@ -289,7 +289,8 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
   **config.yaml 只有官方 writer 碰**；宿主绝不自己解析/文本替换 config 文件。
 - statemachine.py：纯函数状态机（十四/十五/写者租约判据原样）：session_id 幂等记账、
   权威源 gateway.run._gateway_runner_ref()._running_agent_items()（连续 3 拍不可达退
-  事件兜底）、阶段直读 agent._last_activity_desc、降级以 base_url 端点判定。
+  事件兜底）、阶段直读 agent._last_activity_desc、降级优先读 agent._provider_fallback_active
+  （真失败切换链才置位，手动 /model 切换不置位）；权威源不可达时退回 base_url 端点启发式。
 - supervisor.py：永不退出循环；tray_enabled=false 只杀 worker 不终止线程；
   心跳判活（§4）；失败指数退避 3→6→12→30s 封顶，成功心跳清零；**绝无永久放弃**。
 - 更新检查：官方 hermes_cli.banner.get_latest_release_tag()（本地 tag，带缓存），

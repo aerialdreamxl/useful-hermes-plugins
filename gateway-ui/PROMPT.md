@@ -36,6 +36,13 @@ Fluent 设置界面 + 可插拔余额气泡，全部落地。
   平台箭头切换、进度条排版、Token Plan 个人/团队版可选；气泡聚焦态钉住桌宠演思考动画。
 - **硬件友好写盘**：租约内容静态化（只留 pid/token），心跳改 `os.utime` mtime；
   state.json 内容签名去重，空闲期零数据页重写。
+- **降级判定精确化（BUG 修复）**：旧版「生效 base_url ≠ 主配置端点即降级」会把用户
+  手动 `/model` 切换供应商误判成降级。改读 Gateway 内部降级链路标志
+  `agent._provider_fallback_active`——只有 `try_activate_fallback` 真走失败切换链才置位
+  （源码实锤：chat_completion_helpers.py 置位、agent_runtime_helpers.py 主恢复清零），
+  手动切换走 `session.mutate` 重建 agent、不碰该标志。权威源（`_running_agent_items()`
+  live agent）可达时以该标志为准，端点比较只补 from/to 展示；连续 3 拍不可达退回端点
+  启发式兜底。test_statemachine +11 断言（手动切换不误判/真降级记录/主恢复/启发式门控与兜底）。
 
 ## 0. 一句话目标
 
@@ -552,7 +559,7 @@ worker_settings/notice_wire/settings_window/balance_bubble/balance_cards/bubble_
 | 侧 | 套件 | 断言数 |
 |---|---|---|
 | 宿主 | test_config | 20 |
-| 宿主 | test_statemachine | 70 |
+| 宿主 | test_statemachine | 81 |
 | 宿主 | test_supervisor | 30 |
 | 宿主 | test_register | 40 |
 | 宿主 | test_notice_host | 24 |

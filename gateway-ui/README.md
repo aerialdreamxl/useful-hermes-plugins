@@ -48,7 +48,7 @@ config.yaml 的人工改动始终归你自己。
 |---|---|---|
 | 绿 | 空闲 | 活跃 session 数 = 0 |
 | 橙 | 忙碌 | ≥1 活跃；1 个时桌宠演该会话阶段（thinking/acting），≥2 一律 busy |
-| 红 | 需要留意 | 观察窗（默认 5min）内 LLM 降级（**base_url 端点**判定，provider 换名不算、轮内换道要算）或错误连发≥2 |
+| 红 | 需要留意 | 观察窗（默认 5min）内 LLM 降级（**读 Gateway 内部降级链路标志**判定：只有真走失败切换链才算，手动 `/model` 切供应商不误判；权威源不可达时退回 base_url 端点启发式）或错误连发≥2 |
 | 灰 | 失联 | state.json 停止更新 >8s（Gateway 已停） |
 
 活跃计数以 session_id 为键幂等记账（tool-loop 不虚增）；权威源 =
@@ -209,7 +209,7 @@ DIY 规范：缺键逐键自动补齐（官方 writer）；**enable-pet 例外�
 
 宿主 python（`<HERMES_HOME>/tools/python-3.14*/python.exe`）：
 - test_config.py — A1 三态/不回写/10 轮重启不翻（20 断言）
-- test_statemachine.py — 忙线判据+降级+权威源+notice 派生/平台门控/幂等（70 断言）
+- test_statemachine.py — 忙线判据+降级（内部链路标志/手动切换不误判/兜底启发式）+权威源+notice 派生/平台门控/幂等（81 断言）
 - test_supervisor.py — A3/A4 心跳判活/永不放弃/退避/venv 蹦床回归（30 断言）
 - test_register.py — 宿主总装冒烟：门控四形态/9 hook 接线/settings watcher 回写/幂等/非法拒写（40 断言）
 - test_settings_bus.py — settings 协议：validate_request 白名单/钳制 + build_view 快照/三态 + watcher 集成 + balance 四键链（93 断言）
@@ -255,7 +255,8 @@ uptime 由消费侧自算 `now - boot_ts`（state 里是常量锚，不再每拍
 - worker 常驻 RSS≈134MB / USS≈62MB（渲染改案作者观感裁定主动接受）。
 - in_process 插件崩溃理论上连坐 Gateway：全量 try/except 缓解，无法根除
   （根除需 isolation: host，v1 不走）。
-- 降级基线=主配置端点；基线解析失败退化 first-seen。
+- 降级判定优先读 Gateway 内部 `_provider_fallback_active` 标志（真失败切换链才置位，
+  手动切供应商不置位）；权威源不可达时退回端点启发式，基线=主配置端点，解析失败退化 first-seen。
 - 更新检查走官方 source_check.check_for_updates(passive=True)（banner 同源，
   尊重 updates.check=false），900s 一次，fail-safe 查不到=不亮。
 - 设置窗口住在 worker 进程里：在设置页关 tray_enabled 会连设置窗口自己一起停掉

@@ -4,7 +4,10 @@
 （thinking/acting），≥2=恒 busy。tool-loop 多 API 请求不虚增；未知键多活跃不瞎销账。
 权威源（十五/写者租约）：runner._running_agent_items() 是全 turn 总登记（含桌面端），
 阶段直读 agent._last_activity_desc；连续 3 拍不可达退事件兜底。
-降级（降级判定）：生效 base_url ≠ 主配置端点即降级，provider 名不参与；轮内换道要算。
+降级（内部降级链路优先）：权威源可达时读 agent._provider_fallback_active——只有
+try_activate_fallback 真走失败切换链才置位（chat_completion_helpers.py），手动 /model
+切换走 session.mutate 重建 agent、不碰该标志，故不误判；端点比较只补 from/to 展示。
+权威源连续 3 拍不可达时退回 base_url 端点启发式（宁漏报不误报的反面：兜底宁可误报）。
 error/happy/listening 只在零活跃窗口作瞬时展示层。
 """
 from __future__ import annotations
@@ -72,7 +75,9 @@ def sess_key(fl: dict) -> str:
     return fl.get("session_key") or fl.get("task_key") or fl.get("turn_key") or ""
 
 
-def url_label(u: str) -> str:
+def url_label(u) -> str:
+    if not u:
+        return "?"
     try:
         return str(u).split("//", 1)[-1].split("/", 1)[0][:40] or str(u)[:40]
     except Exception:
@@ -103,12 +108,19 @@ class StateMachine:
 
     # ---------------------------------------------------------- 事件记账 ----
     def _note_degrade(self, ts: float, fl: dict) -> None:
+        """端点启发式降级记录。仅权威源不可达时生效（见 apply 门控）；
+        权威源可达时降级由 set_authority 读内部 _provider_fallback_active 判定，
+        手动切换供应商不再误判。"""
         bb = self.baseline_base_url
         eff = fl.get("base_url")
         if eff and bb and eff != bb:
-            if self.last_degrade is None or ts - self.last_degrade["ts"] > 2:
-                self.last_degrade = {"from": bb, "to": eff,
-                                     "provider": fl.get("provider") or "", "ts": ts}
+            self._record_degrade(ts, bb, eff, fl.get("provider") or "")
+
+    def _record_degrade(self, ts: float, frm, to, provider: str) -> None:
+        """统一降级记录入口（2s 去重）；from/to 可为 None（权威源只给标志时）。"""
+        if self.last_degrade is None or ts - self.last_degrade["ts"] > 2:
+            self.last_degrade = {"from": frm, "to": to,
+                                 "provider": provider, "ts": ts}
 
     # ---------------------------------------------------------- notice 派生 ----
     def _emit_notice(self, kind: str, ts: float, platform: str) -> None:
@@ -173,7 +185,8 @@ class StateMachine:
             key = sess_key(fl) or str(ts)
             self.active[key] = ts
             self.phase[key] = ("thinking", ts)
-            self._note_degrade(ts, fl)
+            if self.authority is None:
+                self._note_degrade(ts, fl)   # 兜底启发式（权威源不可达才用）
             self._note_session_platform(fl, ts)
         elif kind == "post_api":
             key = sess_key(fl)
@@ -181,7 +194,8 @@ class StateMachine:
                 self.active[key] = ts
             if key:
                 self.phase[key] = ("thinking", ts)
-            self._note_degrade(ts, fl)
+            if self.authority is None:
+                self._note_degrade(ts, fl)   # 兜底启发式（权威源不可达才用）
         elif kind == "tool":
             key = sess_key(fl) or "?"
             self.phase[key] = ("acting", ts)
@@ -211,14 +225,31 @@ class StateMachine:
             self.error_active_until = ts + 30
 
     # ---------------------------------------------------------- 权威源 ----
-    def set_authority(self, items) -> None:
-        """items = runner._running_agent_items() 的 (key, agent) 列表。"""
+    def set_authority(self, items, now: float | None = None) -> None:
+        """items = runner._running_agent_items() 的 (key, agent) 列表。
+
+        降级判定（内部链路优先）：任一活跃 agent 的 _provider_fallback_active
+        为 True = 真走了失败切换链（try_activate_fallback 置位、主恢复清零；
+        手动 /model 切换不碰它）→ 记降级。端点比较只补 from/to 展示字段。
+        权威源可达期间端点启发式被门控掉，手动切供应商不再误判。"""
+        import time as _time
+        now = _time.time() if now is None else now
         auth = {}
+        degraded_agent = None
         for k, agent in items:
             desc = str(getattr(agent, "_last_activity_desc", "") or "")
             auth[k] = phase_from_activity(desc)
+            if degraded_agent is None and \
+                    bool(getattr(agent, "_provider_fallback_active", False)):
+                degraded_agent = agent
         self.authority = auth
         self.authority_streak = 0
+        if degraded_agent is not None:
+            rt = getattr(degraded_agent, "_primary_runtime", None) or {}
+            frm = rt.get("base_url") or self.baseline_base_url
+            to = getattr(degraded_agent, "base_url", None) or None
+            prov = str(getattr(degraded_agent, "provider", "") or "")
+            self._record_degrade(now, frm, to, prov)
 
     def authority_unreachable(self) -> None:
         self.authority_streak += 1

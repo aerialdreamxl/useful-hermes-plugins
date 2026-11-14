@@ -300,7 +300,15 @@ def _consumer(stop=None) -> None:
             _log(f"consumer loop error: {exc}")
         now = time.time()
         _SM.gc(now)
+        deg_before_auth = _SM.last_degrade
         _poll_authority()
+        # 权威源读内部降级标志新记的降级 → 补一条 degrade 事件（与事件启发式同格式）
+        d = _SM.last_degrade
+        if d is not None and d is not deg_before_auth and bool(_s("bus_enabled")):
+            _SEQ += 1
+            _BUS.append_event({"seq": _SEQ, "ts": round(now, 3), "kind": "degrade",
+                               "model": f"{url_label(d['from'])}->{url_label(d['to'])}"})
+            dirty = True
         prev_ps = _SM.pet_state
         _SM.pet_state = _SM.derive(now)
         if _SM.pet_state != prev_ps:
