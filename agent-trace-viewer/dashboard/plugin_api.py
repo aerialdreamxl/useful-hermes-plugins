@@ -12,6 +12,11 @@ session store (``state.db``). Three endpoints:
 Safety contract:
 - Every connection opens ``state.db`` with ``PRAGMA query_only = ON`` —
   this backend can NEVER write to the session store.
+- ``/export`` carries its own auth check: it requires the dashboard session
+  token (header ``X-Hermes-Session-Token`` or ``?token=``), the same value the
+  SPA receives as ``window.__HERMES_SESSION_TOKEN__``. Token-less requests from
+  a non-loopback peer are refused with 403; loopback stays allowed (with a
+  warning) so the local viewer keeps working.
 - Reconstruction is deterministic and lossless: ``content`` + ``tool_calls`` +
   ``tool_call_id`` + ``reasoning`` map 1:1 onto the OpenAI chat schema.
   Hermes' ``api_content`` column is ~all NULL in practice, so we rebuild
@@ -20,6 +25,7 @@ Safety contract:
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -28,11 +34,78 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Export auth (F24)
+# ---------------------------------------------------------------------------
+# 导出 = 全库会话转录（system prompt / reasoning / 工具入参）。核心的
+# auth_middleware 已经在 /api/* 上验 X-Hermes-Session-Token，但本端点不依赖
+# 挂载层：自己再验一遍，同口径（web_server._SESSION_TOKEN，SPA 注入为
+# window.__HERMES_SESSION_TOKEN__）。核心 header 名实查 web_server.py 为
+# X-Hermes-Session-Token；X-Hermes-Token 作为兼容别名一并接受。
+_TOKEN_HEADERS = ("X-Hermes-Session-Token", "X-Hermes-Token")
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _core_session_token() -> str:
+    """核心进程的会话令牌；核心模块不可用时返回 ""（随后只放过 loopback）。"""
+    try:
+        from hermes_cli import web_server
+
+        return str(getattr(web_server, "_SESSION_TOKEN", "") or "")
+    except Exception:  # noqa: BLE001 — 独立加载/单测环境没有核心模块
+        return ""
+
+
+def _has_session_token(request: Request) -> bool:
+    """header / Bearer / ?token= 任一与核心令牌同值。"""
+    expected = _core_session_token()
+    if not expected:
+        return False
+    candidates: list[str] = []
+    for name in _TOKEN_HEADERS:
+        value = request.headers.get(name, "")
+        if value:
+            candidates.append(value)
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        candidates.append(auth[7:].strip())
+    query_token = request.query_params.get("token", "")
+    if query_token:
+        candidates.append(query_token)
+    return any(hmac.compare_digest(c.encode(), expected.encode()) for c in candidates)
+
+
+def _is_loopback(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "").strip().lower()
+    if host.startswith("::ffff:"):  # IPv4-mapped IPv6
+        host = host[len("::ffff:"):]
+    return host in _LOOPBACK_HOSTS
+
+
+def _require_export_token(request: Request) -> None:
+    """导出端点的独立鉴权：令牌/核心已认证主体 → loopback 告警放行 → 其余 403。"""
+    if (getattr(request.state, "token_authenticated", False)
+            or getattr(request.state, "native_http_principal", None)
+            or getattr(request.state, "hosted_http_authenticated", None) is True):
+        return  # 与核心 _require_token 同口径：外层 seam 已认证的主体不再重复验令牌
+    if (getattr(request.app.state, "auth_required", False)
+            and getattr(request.state, "session", None) is not None):
+        return  # OAuth 门开启时 cookie 会话是权威（核心此时不注入静态令牌）
+    if _has_session_token(request):
+        return
+    if _is_loopback(request):
+        peer = getattr(getattr(request, "client", None), "host", "?")
+        log.warning("agent-trace-viewer: /export 无会话令牌，来源 loopback(%s)，兼容放行", peer)
+        return
+    raise HTTPException(status_code=403, detail="export requires the dashboard session token")
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +288,7 @@ async def session_messages(
 # ---------------------------------------------------------------------------
 
 @router.get("/sessions/{session_id}/export")
-async def export_messages(session_id: str) -> dict:
+async def export_messages(session_id: str, request: Request) -> dict:
     """Reconstruct the OpenAI chat-completions ``messages`` list for a session.
 
     Mapping (deterministic, lossless):
@@ -224,7 +297,11 @@ async def export_messages(session_id: str) -> dict:
     - role='assistant' ← {role, content?, tool_calls?, reasoning_content?}
     - role='tool'      ← {role, tool_call_id, name?, content}
     Internal rows (role='session_meta') are skipped.
+
+    Auth: requires the dashboard session token (see ``_require_export_token``);
+    a token-less non-loopback caller gets 403.
     """
+    _require_export_token(request)
     with _connect() as con:
         sess = con.execute(
             "SELECT id, title, display_name, model, started_at, system_prompt "

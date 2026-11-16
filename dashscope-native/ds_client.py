@@ -14,10 +14,14 @@ Contract (PROMPT.md §3.1/1b + S0 v3):
   completion_tokens/total_tokens) while every native counter is preserved
   (input_tokens/output_tokens/details stay readable) — Hermes' normalize_usage
   reads the chat shape for unknown modes, so the mapping must happen here.
+- Upstream error text is untrusted input: every exception message leaves this
+  module through ``sanitize_upstream_error_body`` (status code and error type
+  kept, body truncated to 800 chars, control/ANSI and template markers broken).
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Iterator, Optional
 
 logger = logging.getLogger("hermes.dashscope_native")
@@ -39,6 +43,97 @@ _OPENAI_ONLY_KEYS = frozenset({
     "frequency_penalty", "user", "metadata", "modalities", "audio",
     "logit_bias", "service_tier", "store", "prediction", "web_search_options",
 })
+
+
+# ------------------------------------------------- 上游错误体净化（F21）
+# 上游 HTTP 错误体是第三方输入：逐字拼进异常会顺着 工具输出 → 模型上下文 变成
+# 二次注入面（模板标记/伪指令）。统一先净化再拼，状态码与错误类型一律保留。
+_UPSTREAM_UNTRUSTED_TAG = "[上游错误·不可信]"
+ERROR_BODY_LIMIT = 800
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[()][0-2]"
+)
+# 控制字符：保留 \t 与 \n，其余（含 NUL/ESC 残留/BEL）全剔
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+# 聊天模板/工具协议标记：打断成非标记形态（`[[` → `[ [`），可读性不变
+_TEMPLATE_MARKERS = (
+    ("[[", "[ ["), ("]]", "] ]"),
+    ("{{", "{ {"), ("}}", "} }"),
+    ("<|", "< |"), ("|>", "| >"),
+)
+
+
+def sanitize_upstream_error_body(body: Any, limit: int = ERROR_BODY_LIMIT) -> str:
+    """净化上游错误体：去 ANSI/控制符、打断模板标记、截断到 limit 字符。
+
+    只做"不可信文本"该做的事，不解析、不改写语义——状态码/错误类型由调用方
+    另行拼进文案，不从这里消失。
+    """
+    if body is None:
+        return ""
+    text = body if isinstance(body, str) else str(body)
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _CTRL_CHARS_RE.sub("", text)
+    for marker, broken in _TEMPLATE_MARKERS:
+        text = text.replace(marker, broken)
+    try:
+        limit = max(0, int(limit or 0))
+    except (TypeError, ValueError):
+        limit = ERROR_BODY_LIMIT
+    if limit and len(text) > limit:
+        text = text[:limit].rstrip() + "…(已截断)"
+    return text
+
+
+def upstream_error_message(
+    status: Any = None, body: Any = "", kind: str = ""
+) -> str:
+    """拼上游错误文案：`[上游错误·不可信] HTTP <code> (<type>): <净化后的体>`。"""
+    head = _UPSTREAM_UNTRUSTED_TAG
+    if status not in (None, ""):
+        head = f"{head} HTTP {status}"
+    if kind:
+        head = f"{head} ({kind})"
+    detail = sanitize_upstream_error_body(body)
+    return f"{head}: {detail}" if detail else f"{head}: (空错误体)"
+
+
+def sanitize_exception_text(exc: BaseException) -> str:
+    """把异常文案净化成可安全放进工具输出的文本（保留状态码/异常类型）。"""
+    try:
+        raw = str(exc)
+    except Exception:
+        raw = ""
+    if _UPSTREAM_UNTRUSTED_TAG and _UPSTREAM_UNTRUSTED_TAG in raw[:40]:
+        return raw  # 已净化过：幂等，避免前缀叠两层
+    status = getattr(exc, "status_code", None)
+    if status in (None, ""):
+        status = getattr(exc, "status", None)
+    if status in (None, ""):
+        status = getattr(exc, "code", None)
+    return upstream_error_message(status, raw, type(exc).__name__)
+
+
+def scrub_exception_message(exc: BaseException) -> None:
+    """就地改写异常文案：类型与属性不动，宿主仍能按类型/状态码分类重试。"""
+    try:
+        cleaned = sanitize_exception_text(exc)
+        if not cleaned or cleaned == str(exc):
+            return
+        if isinstance(getattr(exc, "message", None), str):
+            try:
+                exc.message = cleaned  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        try:
+            exc.args = (cleaned,)  # type: ignore[assignment]
+        except Exception:
+            pass
+    except Exception:  # 净化本身绝不许改变原异常
+        logger.debug("dashscope-native: exception scrub failed", exc_info=True)
 
 
 # --------------------------------------------------------------- usage vocab
@@ -261,7 +356,11 @@ class DashScopeNativeClient:
 
     def _create(self, **kwargs: Any) -> Any:
         call = self._translate_kwargs(kwargs)
-        response = self._sdk.chat.completions.create(**call)
+        try:
+            response = self._sdk.chat.completions.create(**call)
+        except Exception as exc:  # 上游错误体逐字进异常 = 二次注入面（F21）
+            scrub_exception_message(exc)  # 类型/状态码不变，只换文案
+            raise
         if call.get("stream"):
             return _ChunkStream(response)
         return _with_normalized_usage(response)

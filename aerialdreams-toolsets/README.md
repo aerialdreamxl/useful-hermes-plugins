@@ -94,8 +94,11 @@ androidfb(action="devices")
 - **Qwen-Omni**：本地文件 ≤ 目标上限直接 base64；超限先 ffmpeg 压缩（降分辨率/码率），仍超限则截到约 9.9MB 边界并在返回里明确写"截断到约 N 秒"。**不切图片帧**（作者裁定：不抽帧）。
 - **截屏**：PowerShell + `System.Drawing` 实现（`common/screenshot.ps1`），DPI-aware，无需 Pillow；Pillow 仅作兜底。
 - **二维码**：内置 Nayuki `qrcodegen`（MIT）+ 纯 stdlib PNG 编码器（`common/qr.py`），所以在 `python -I` 隔离解释器里也能生成二维码，不依赖 `qrcode`/Pillow。
-- **adb/fastboot**：优先 `AERIALDREAMS_ADB` / `AERIALDREAMS_FASTBOOT` 环境变量，其次 PATH。`flash` / `oem` 必须显式 `confirm=true`。
+- **adb/fastboot**：优先 `AERIALDREAMS_ADB` / `AERIALDREAMS_FASTBOOT` 环境变量，其次 PATH。`flash` / `oem`（fastboot）与 `shell` / `am` / `pm` / `install` / `uninstall`（adb）必须显式 `confirm=true`——这些动作要么不可逆、要么等于在设备上执行任意命令，模型被注入文本忽悠时不能一键执行。
+- **不可信文本围栏**：B 站的标题、简介、UP 签名、评论、弹幕、字幕一律包进 ```` ```untrusted ```` 围栏并在首个字段前加一行固定警示（`[外部内容·不可信]`），内容里自带的连续反引号会被打断，防止"用代码块越狱"。字段层级与键名不变，`bvid`/`cid`/`author`/用户名等标识字段不围栏（下游过滤要能直接比较）。风险承认：UP 名/用户名仍是不围栏的窄通道，属刻意取舍。
+- **截屏**：PowerShell + `System.Drawing` 走主路径；Pillow 兜底改在**一次性子进程**里跑并设 Per-Monitor-V2 DPI——以前是父进程直接调 `SetProcessDpiAwareness`，那会把整个 Hermes 进程的 DPI 模式永久改掉，影响同进程里所有 GUI 代码。
 - **ffmpeg**：需要 PATH 上有 `ffmpeg`/`ffprobe`（以本机 PATH 为准）。
+- **ASR 任务表**：内存任务表上限 64 条、TTL 7 天（写时与取值时都剪枝），两处等待轮询都改成指数退避（最高 30s 一次）——原来是无限增长 + 固定间隔轮询。
 
 ## 目录
 

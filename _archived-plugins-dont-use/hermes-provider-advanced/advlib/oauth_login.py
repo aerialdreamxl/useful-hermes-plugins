@@ -264,11 +264,16 @@ def claude_login(proxy: str = "", timeout: float = DEFAULT_TIMEOUT) -> dict:
             "organization_name": str(((tok.get("organization") or {})
                                       if isinstance(tok.get("organization"), dict) else {}
                                       ).get("name") or "").strip(),
-            "expired": str(int(time.time() + int(tok.get("expires_in") or 0))),
             "type": "oauth-token",
             "device_ids": [device_id()],
             "_imported_from": "login:claude",
         }
+        # expires_in is optional (some exchanges omit it). A missing value must
+        # not read as "expires now": omit the key so oauth_tokens falls back to
+        # the JWT exp / conservative refresh (same guard as adapters/claude).
+        exp_in = tok.get("expires_in")
+        if exp_in:
+            acct["expired"] = str(int(time.time()) + int(exp_in))
 
         # Native companion lookups (advisory): profile identity wins over the
         # exchange body where it carries something; roles is a no-op token check.
@@ -448,7 +453,6 @@ def antigravity_login(proxy: str = "", timeout: float = DEFAULT_TIMEOUT) -> dict
         "access_token": at,
         "refresh_token": str(tok.get("refresh_token") or "").strip(),
         "email": email,
-        "expired": str(int(time.time() + int(tok.get("expires_in") or 0))),
         "token_type": str(tok.get("token_type") or "Bearer"),
         "client_id": AG_CLIENT_ID,
         "client_secret": AG_CLIENT_SECRET,
@@ -458,6 +462,12 @@ def antigravity_login(proxy: str = "", timeout: float = DEFAULT_TIMEOUT) -> dict
         "type": "antigravity",
         "_imported_from": "login:antigravity",
     }
+    # Google echoes expires_in on the code exchange, but treat it as optional:
+    # stamping now+0 when it is absent lands the token already expired, and a
+    # refresher-less call then fails on every request (adapters/claude guard).
+    exp_in = tok.get("expires_in")
+    if exp_in:
+        acct["expired"] = str(int(time.time()) + int(exp_in))
     if not project:
         print("[login] note: no project id yet - the inference facade will "
               "resolve it on the first request")

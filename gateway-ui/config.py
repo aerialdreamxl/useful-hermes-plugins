@@ -86,10 +86,24 @@ def read_pet_explicit(ctx) -> dict:
     return {k: v for k, v in cfg.items() if k in PET_DEFAULTS}
 
 
-def fill_pet_display(ctx, explicit: dict) -> dict:
+def read_pet_raw(ctx) -> dict:
+    """config.yaml pet 块的**原样**内容（含白名单外的用户手加键，纯读不写）。
+    N22：合并写回必须基于本函数——按 PET_DEFAULTS 过滤后的块写回会静默丢键。"""
+    try:
+        cfg = ctx.get_config("pet", MISSING)
+    except Exception:
+        cfg = MISSING
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def fill_pet_display(ctx, explicit: dict | None = None) -> dict:
     """显示类 pet 键缺键补齐（官方 writer）；enable-pet 缺失保持缺失。
-    返回补齐后的显式块（供播种/对账用）。"""
-    out = dict(explicit)
+    基于 read_pet_raw 整块补默认（N22）：用户手加的未知键原样保留，绝不丢。
+    返回补齐后的整块（供播种/对账用）。"""
+    raw = read_pet_raw(ctx)
+    if not raw and isinstance(explicit, dict):
+        raw = dict(explicit)     # 兼容旧调用：ctx 读不到时退回传入显式块
+    out = dict(raw)
     changed = False
     for k in PET_DISPLAY_KEYS:
         if k not in out:
@@ -196,6 +210,25 @@ def explicit_balance_keys(ctx) -> list:
     return list(read_balance_explicit(ctx))
 
 
+def hermes_home_root() -> str:
+    """HERMES_HOME 真实绝对路径（realpath）：providers_dir 白名单根（F26）。
+    优先环境变量（与宿主/worker 同源，测试也靠它注入），缺失回落官方
+    get_hermes_home()，再缺失回落 ~/.hermes。取不到返回空串。"""
+    try:
+        v = os.environ.get("HERMES_HOME", "").strip()
+        if not v:
+            try:
+                from hermes_cli.config import get_hermes_home
+                v = str(get_hermes_home() or "")
+            except Exception:
+                v = ""
+        if not v:
+            v = os.path.join(os.path.expanduser("~"), ".hermes")
+        return os.path.realpath(os.path.abspath(v))
+    except Exception:
+        return ""
+
+
 def validate_request(req, installed_slugs=()) -> tuple:
     """settings_req 校验（纯函数）。返回 (ok, key, value, error)。
     白名单 key + 类型/范围钳制；非法返回 ok=False 带 error（宿主据此拒写）。
@@ -224,6 +257,21 @@ def validate_request(req, installed_slugs=()) -> tuple:
                         return (False, key, s, "providers_dir must not contain '..'")
                     if not os.path.isabs(s):
                         return (False, key, s, "providers_dir must be an absolute path")
+                    # F26：投放目录里的 *.py 会被宿主在隔离子进程里执行——目录可由
+                    # settings 总线改写 = 任意 .py 代执行。只许 HERMES_HOME 之下
+                    # （realpath+commonpath 比对，防 .. / 软链接绕出）。
+                    root = hermes_home_root()
+                    try:
+                        real = os.path.realpath(os.path.abspath(s))
+                        if not root or os.path.commonpath([real, root]) != root:
+                            return (False, key, s,
+                                    f"providers_dir must live under HERMES_HOME ({root})")
+                        if real == root:
+                            return (False, key, s,
+                                    "providers_dir must be a subdirectory of HERMES_HOME")
+                    except ValueError:
+                        return (False, key, s,
+                                "providers_dir not comparable with HERMES_HOME (different drive)")
                 return (True, key, s, "")
             if bleaf == "token_plan_edition":
                 s = str(val or "").strip().lower()
@@ -252,8 +300,12 @@ def validate_request(req, installed_slugs=()) -> tuple:
             return (True, key, s, "")
         if leaf == "package_index_url":
             s = str(val or "").strip()
-            if s and not (s.startswith("http://") or s.startswith("https://")):
-                return (False, key, s, "url must be http(s)")
+            # N21：只接受 https。明文 http 的 pip 索引源可被中间人换包（供应链投毒），
+            # 且该值经 UV_INDEX_URL 注入 supervisor 进程全局环境，会影响同进程其它安装。
+            if s and not s.lower().startswith("https://"):
+                return (False, key, s,
+                        "url must start with https:// (plain http pip index rejected: "
+                        "MITM package swap)")
             return (True, key, s, "")
     except (TypeError, ValueError) as exc:
         return (False, key, val, f"bad value: {exc}")

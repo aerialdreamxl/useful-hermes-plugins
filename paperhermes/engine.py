@@ -14,7 +14,7 @@ import hashlib
 import json
 import os
 import re
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 SNAPSHOT_VERSION = 2
 
@@ -737,25 +737,76 @@ def apply_snapshot(request: dict, snap: dict, api_mode: str):
 # ---------------------------------------------------------------- M5/M6 工具结果处理
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[()][0-2]")
 
+# F8：只删"帧"形态的行，不删排版。空行是段落间距/列表分块，属于正文结构；
+# 旧版把所有空行一起删掉，等于静默压平每轮工具结果的版式。
+_BAR_CHARS = frozenset("=#*+-_.·•…|/\\<>~^■□◆◇▣▤▥▦▧▨▩█▓▒░▏▎▍▌▋▊▉")
+_BAR_RUN_RE = re.compile(r"[=#*\-_.]{3,}|[█▓▒░▏▎▍▌▋▊▉]{3,}")
+_PCT_RE = re.compile(r"\d{1,3}(?:\.\d+)?\s?%")
+_TIMER_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?</")
+_RATE_RE = re.compile(r"\d+(?:\.\d+)?\s?[kKmMgG]?[bB]/s")
+_RATIO_RE = re.compile(r"\d+\s?/\s?\d+")
+_SPINNER_RE = re.compile(r"^[\\|/\-]+$")
+_BARE_FRAME_RE = re.compile(r"^[\s\d.,:%/|\[\]()<>\-+]*$")
+
+
+def _is_bare_progress_frame(line: str) -> bool:
+    """重绘帧只剩数字/百分比/标点（"100%"、" 45 % "）→ 进度残留，没有内容。"""
+    s = line.strip()
+    return bool(s) and bool(_PCT_RE.search(s)) and bool(_BARE_FRAME_RE.match(s))
+
+
+def _is_noise_frame(line: str) -> bool:
+    """帧形态判定：纯符号填充 / 百分比进度条 / 旋转帧。空行一律 False（F8）。"""
+    s = line.strip()
+    if not s:
+        return False
+    if len(s) >= 6 and all(ch in _BAR_CHARS or ch.isspace() for ch in s):
+        return True  # ======-------- / ███████ 这类纯填充分隔
+    if len(s) <= 160 and _PCT_RE.search(s):
+        # 百分比得配上进度条/耗时/速率/计数才算进度帧；散文里的百分数不动
+        if (_BAR_RUN_RE.search(s) or _TIMER_RE.search(s)
+                or _RATE_RE.search(s) or _RATIO_RE.search(s)):
+            return True
+    if len(s) <= 4 and _SPINNER_RE.match(s):
+        return True  # | / - \ 旋转帧
+    return False
+
 
 def clean_terminal_noise(text: str) -> Optional[str]:
-    """M5b：去 ANSI、进度条中间帧（\\r 重绘只留最后一帧）、连续重复行。
-    无变化或变更后不更短→None（不值得替换）。"""
+    """M5b：去 ANSI、进度条中间帧（\\r 重绘只留最后一帧）、纯符号填充、连续重复行。
+
+    F8 修订：只有"帧"形态的行（只含 ANSI 控制符、\\r 回车覆写帧、纯符号填充、
+    百分比进度条）才删；正常空行与段落间距原样保留——旧版连空行一起删，
+    每轮工具结果的排版就被静默扭曲了。
+    无变化或变更后不更短→None（不值得替换）。
+    """
     if not isinstance(text, str) or not text:
         return None
-    t = _ANSI_RE.sub("", text)
-    lines = []
-    for ln in t.split("\n"):
+    t = text.replace("\r\n", "\n")  # 先归一 CRLF，别把正常行尾当回车覆写
+    lines: List[str] = []
+    for raw in t.split("\n"):
+        ln = _ANSI_RE.sub("", raw)
+        if ln != raw and not ln.strip():
+            continue  # 只含 ANSI 控制符的行（清行/光标定位帧）
         if "\r" in ln:
-            ln = ln.split("\r")[-1]
-        if ln == "":
-            continue  # 纯进度条重绘行（\r 帧）整行丢弃
+            ln = ln.split("\r")[-1]  # 回车覆写：同一行只留最后一帧
+            # 帧本身是噪声（空帧/进度条/只剩百分比）→ 整行剔除；有实义文字则留最后一帧
+            if not ln.strip() or _is_noise_frame(ln) or _is_bare_progress_frame(ln):
+                continue
+        elif _is_noise_frame(ln):
+            continue
         lines.append(ln)
-    out = []
+    out: List[str] = []
     for ln in lines:
         if out and out[-1] == ln:
-            continue
+            continue  # 连续重复行（连续多个空行也只留一个间隔）
         out.append(ln)
+    start, end = 0, len(out)
+    while start < end and not out[start].strip():
+        start += 1  # 首尾空白行只是包裹，不是段落间距
+    while end > start and not out[end - 1].strip():
+        end -= 1
+    out = out[start:end]
     t2 = "\n".join(out)
     if t2 != text and len(t2) < len(text):
         return t2

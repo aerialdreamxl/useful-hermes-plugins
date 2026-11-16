@@ -8,7 +8,7 @@
 |---|---|---|
 | `default` | 不干预，走 Hermes 打包的 Headless Chromium | 无 |
 | `shardx` | 本机 ShardX 指纹浏览器，经其本地 HTTP API 启动 profile 拿 CDP 端点 | ShardX Launcher 在跑 + 三个环境变量（见下） |
-| `cdp` | 任意 Chromium CDP 端点（`ws://…/devtools/browser/…` 或 `http://host:port`） | 你自己有一个开着 `--remote-debugging-port` 的 Chromium |
+| `cdp` | 任意 Chromium CDP 端点（`ws://…/devtools/browser/…` 或 `http://host:port`） | 你自己有一个开着 `--remote-debugging-port` 的 Chromium；**主机必须在白名单内**（见下） |
 
 ## 安装与启用
 
@@ -47,6 +47,8 @@ Agent 侧对应 `browser_switch` 工具（`provider` + `arg` + `headless` 参数
 | `SHARDX_BROWSER_NAME` | （选填） | 默认 profile 名，命令行省略时使用 |
 
 `cdp` 档与 `default` 档零配置。没有 ShardX 的用户完全不受影响——只是少一档。
+
+`cdp` 档的主机白名单（防模型被网页文本忽悠着把浏览器会话指到外部端点）：只放行 `localhost` / `127.0.0.0/8` / `::1` / `169.254/16` / `fe80::/10` / RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA `fc00::/7`。公网 IP、任何域名（含局域网单标签主机名、Tailscale `100.64/10`）一律拒绝，错误信息里会点名开关 `BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1`——确实要连远端调试端口时由你显式开。校验发生在 `urlopen` 之前，且即使 `_discover_cdp_ws` 被替换，`_apply` 的 cdp 分支也会再拦一次。
 
 ## 机制要点（为什么不用改核心）
 

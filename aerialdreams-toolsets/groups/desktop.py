@@ -7,6 +7,7 @@ import ctypes
 import os
 import struct
 import subprocess
+import sys
 import time
 
 from ..common import config
@@ -49,14 +50,40 @@ def _clipboard(args: dict) -> str:
     return err("action 只能是 read/write")
 
 
-def _dpi_aware() -> None:
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+# Pillow 回退走一次性子进程：DPI awareness 是进程级且不可逆，父进程（gateway）里
+# 设了会污染所有插件；子进程退出即回收。脚本保持纯 ASCII，避免控制台编码问题。
+_PIL_SHOT = (
+    "import sys\n"
+    "try:\n"
+    "    import ctypes\n"
+    "    try:\n"
+    "        ctypes.windll.shcore.SetProcessDpiAwareness(2)\n"
+    "    except Exception:\n"
+    "        ctypes.windll.user32.SetProcessDPIAware()\n"
+    "except Exception:\n"
+    "    pass\n"
+    "from PIL import ImageGrab\n"
+    "bbox = None\n"
+    "if sys.argv[1] != 'none':\n"
+    "    bbox = tuple(int(v) for v in sys.argv[1].split(','))\n"
+    "img = ImageGrab.grab(bbox=bbox, all_screens=True)\n"
+    "img.save(sys.argv[2], 'PNG')\n"
+    "print('%d,%d' % img.size)\n"
+)
+
+
+def _pillow_shot(bbox_arg: str, out: str, timeout: int = 90) -> tuple:
+    """在子进程里用 Pillow 截屏；返回 (宽, 高)，失败抛异常。"""
+    if not sys.executable or getattr(sys, "frozen", False):
+        raise RuntimeError("no standalone python interpreter for the Pillow fallback")
+    r = subprocess.run([sys.executable, "-c", _PIL_SHOT, bbox_arg, out],
+                       capture_output=True, timeout=timeout)
+    if r.returncode != 0 or not os.path.exists(out):
+        tail = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError("child exit %s: %s" % (r.returncode,
+                                                  (tail[-1] if tail else "")[:200]))
+    size = _png_size(out)
+    return (size[0], size[1]) if size else (0, 0)
 
 
 def _foreground_rect() -> tuple:
@@ -89,8 +116,9 @@ def _screenshot(args: dict) -> str:
     target = (args.get("target") or "full").strip().lower()
     if target not in ("full", "region", "window"):
         return err("target 只能是 full/region/window")
+    # 毫秒时间戳：同一秒连拍不再静默覆盖
     out = args.get("path") or os.path.join(
-        config.scratch_dir("shots"), "shot_%s_%d.png" % (target, int(time.time())))
+        config.scratch_dir("shots"), "shot_%s_%d.png" % (target, int(time.time() * 1000)))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     x = int(args.get("x") or 0)
     y = int(args.get("y") or 0)
@@ -113,19 +141,17 @@ def _screenshot(args: dict) -> str:
         ps_err = (r.stderr or b"").decode("utf-8", "replace")[-300:]
     except Exception as e:
         ps_err = "%s: %s" % (type(e).__name__, str(e)[:200])
-    # Fallback: Pillow, present in the desktop gateway interpreter only.
+    # Fallback: Pillow 在一次性子进程里截——父进程绝不设 DPI awareness（进程级且不可逆）。
     try:
-        from PIL import ImageGrab
-        _dpi_aware()
-        bbox = None
         if target == "region":
-            bbox = (x, y, x + w, y + h)
+            bbox_arg = "%d,%d,%d,%d" % (x, y, w, h)
         elif target == "window":
-            bbox = _foreground_rect()
-        img = ImageGrab.grab(bbox=bbox, all_screens=True)
-        img.save(out, "PNG")
+            bbox_arg = "%d,%d,%d,%d" % _foreground_rect()
+        else:
+            bbox_arg = "none"
+        size = list(_pillow_shot(bbox_arg, out))
         return ok({"action": "screenshot", "target": target, "path": out,
-                   "size": list(img.size),
+                   "size": size,
                    "kb": round(os.path.getsize(out) / 1024, 1)})
     except Exception as e:
         return err("screenshot 失败（PowerShell: %s；Pillow: %s: %s）"

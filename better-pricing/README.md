@@ -2,7 +2,7 @@
 
 Hermes 内置计费只认 OpenRouter、内置快照表和端点自报价格三套来源——如果你用的是**阿里云百炼、Token Plan、或任何自定义 OpenAI 兼容端点**，`hermes insights` 和桌面端的费用列会全部显示 `$0.00 / unknown`。本插件让你**手工誊一份价目表**，即按此价格实时算账。
 
-> 设计契约：独立旁路工具，**不修改** Hermes 内部 `usage_pricing.py`；对 `state.db` 只读，不落任何衍生状态；改配置文件即时生效（mtime 热载），无需重启。
+> 设计契约：独立旁路工具，**不改写** Hermes 的 `usage_pricing.py` 源码——只在内存里包装 `estimate_usage_cost`（可通过插件卸载恢复，见「已知边界」）；对 `state.db` 只读，不落任何衍生状态；改配置文件即时生效（mtime 热载），无需重启。
 
 ## 快速开始
 
@@ -42,6 +42,7 @@ price_list:
 | `calculates` | `token` 按 token 计费 / `calls` 按 API 调用次数 / `free` 恒为 0 |
 | `multiply` | 该币种对美元汇率。`0` 表示独立体系（积分/魔粒类），**从美元合计中排除**，避免汇率瞎猜 |
 | provider key | 与 `state.db` 的 `billing_provider` 完全一致（`hermes pricing-plus` 报表第一列就是它，照抄即可）。匹配不上时会按模型名全局唯一兜底 |
+| 缺模型的语义 | **提供商条目存在、但 `models:` 里没有这个模型 → 计为「无价目」，不按 0 元记账，也不借别家同名模型的价**。全局模型名兜底只服务于「提供商 key 完全对不上」的场景（如换过网关名） |
 
 token 计费公式：`(input×输入 + output×输出 + cache×缓存读 + cache_write×缓存写) ÷ 100万`，缓存写单价缺省沿用 `cache`。
 
@@ -67,3 +68,6 @@ hermes pricing-plus [--days 7] [--provider dashscope] [--aux] [--config-check]
 - 桌面端费用列硬编码 `$` 符号（前端 TSX，Python 插件改不动），`native_report: native` 时显示会是 `¥数值+$符号` 的怪相，推荐用 `USD` 模式。
 - 汇率 `multiply` 是手工静态值，请定期自己更新。
 - 按次计费（`calls`）以 `session_model_usage.api_call_count` 为准。
+- **「无价目」不是 0 元**：价目表缺条目时报表给 `无价目` 并按缺口计数，不计入「有价」——这是刻意的，静默按 0 计会把真实开销藏起来。补齐 `better-pricing.yaml` 对应模型条目即可恢复有价（本机首轮实测：66 行里 7 行原本被按 0 元记账，修后显式列为缺价）。
+- 配置查找顺序：`$BETTER_PRICING_CONFIG` → `$HERMES_HOME/better-pricing.yaml` → 插件目录 → 插件父目录（开发态）。**刻意不读当前工作目录**——`Path.cwd()` 兜底等于谁在哪个目录起进程谁就能塞一份价目表。
+- 报账钩子是全局 monkey-patch，但可卸载：注册时挂了 `ctx.on_unload(uninstall_report_hook)`，进程退出另有 `atexit` 兜底，禁用/重载插件会把 `estimate_usage_cost` 换回原函数（幂等，热重载不会套娃）。

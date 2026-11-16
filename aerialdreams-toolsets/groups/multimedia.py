@@ -34,7 +34,7 @@ def _out_path(args: dict, stem: str, ext: str) -> str:
     if fn:
         os.makedirs(os.path.dirname(os.path.abspath(fn)), exist_ok=True)
         return fn
-    return os.path.join(config.scratch_dir("media"), "%s_%s.%s" % (stem, int(time.time()), ext))
+    return os.path.join(config.scratch_dir("media"), "%s_%s.%s" % (stem, int(time.time() * 1000), ext))
 
 
 def _stem(path: str) -> str:
@@ -243,7 +243,41 @@ def _upload_temp(path: str, model: str) -> str:
 # ---------------------------------------------------------------------------
 
 _TASKS: dict = {}
+_TASK_TS: dict = {}
+_TASKS_MAX = 64          # 最多留 64 条结果（每条含转写全文，不能只增不减）
+_TASKS_TTL = 7 * 86400   # 超过 7 天的旧结果顺手清掉
+_TASKS_LOCK = threading.Lock()
 _STEER_LOCK = threading.Lock()
+
+
+def _tasks_prune() -> None:
+    """限容量 + 过期清理（调用方须持 ``_TASKS_LOCK``）。"""
+    now = time.time()
+    for tid in [t for t, ts in _TASK_TS.items() if now - ts > _TASKS_TTL]:
+        _TASK_TS.pop(tid, None)
+        _TASKS.pop(tid, None)
+    if len(_TASKS) <= _TASKS_MAX:
+        return
+    for tid in sorted(_TASK_TS, key=lambda t: _TASK_TS.get(t, 0.0)):
+        if len(_TASKS) <= _TASKS_MAX:
+            break
+        _TASK_TS.pop(tid, None)
+        _TASKS.pop(tid, None)
+
+
+def _tasks_put(task_id: str, res: dict) -> None:
+    """落一条任务结果：带写入时间戳，顺手剪枝（防转写全文把进程内存撑爆）。"""
+    with _TASKS_LOCK:
+        _TASKS[task_id] = res
+        _TASK_TS[task_id] = time.time()
+        _tasks_prune()
+
+
+def _tasks_get(task_id: str):
+    """取一条任务结果（取值时顺手剪枝）。"""
+    with _TASKS_LOCK:
+        _tasks_prune()
+        return _TASKS.get(task_id)
 
 
 def _session_key() -> str:
@@ -394,14 +428,14 @@ def _asr_result(task_id: str) -> dict:
 
 def _watch_task(task_id: str, session_key: str, label: str) -> None:
     deadline = time.time() + float(config.cfg("multimedia.asr.watch_max_seconds", 7200))
-    interval = float(config.cfg("multimedia.asr.poll_interval", 5))
+    interval = max(float(config.cfg("multimedia.asr.poll_interval", 5)), 1.0)
     while time.time() < deadline:
         try:
             res = _asr_result(task_id)
         except Exception:
             res = {"status": "poll_error"}
         if res.get("status") == "done":
-            _TASKS[task_id] = res
+            _tasks_put(task_id, res)
             text = res.get("text") or ""
             out = os.path.join(config.scratch_dir("asr"), "asr_%s.txt" % task_id)
             try:
@@ -416,12 +450,13 @@ def _watch_task(task_id: str, session_key: str, label: str) -> None:
                 _steer(session_key, note)
             return
         if res.get("status") == "failed":
-            _TASKS[task_id] = res
+            _tasks_put(task_id, res)
             with _STEER_LOCK:
                 _steer(session_key, "【ASR 失败】任务 %s：%s" % (task_id, res.get("error")))
             return
         time.sleep(interval)
-    _TASKS[task_id] = {"status": "timeout", "task_id": task_id}
+        interval = min(interval * 2.0, 30.0)  # 指数退避 5→10→20→30s 封顶
+    _tasks_put(task_id, {"status": "timeout", "task_id": task_id})
 
 
 def _asr(args: dict) -> str:
@@ -434,7 +469,7 @@ def _asr(args: dict) -> str:
             res = _asr_result(tid)
         except Exception as e:
             return err("poll: %s" % e)
-        _TASKS[tid] = res
+        _tasks_put(tid, res)
         return ok({"task_id": tid, "status": res.get("status"),
                    "text": res.get("text") if res.get("status") == "done" else "",
                    "error": res.get("error", "")})
@@ -442,7 +477,7 @@ def _asr(args: dict) -> str:
         tid = args.get("task_id") or ""
         if not tid:
             return err("result 需要 'task_id'")
-        res = _TASKS.get(tid) or _asr_result(tid)
+        res = _tasks_get(tid) or _asr_result(tid)
         if res.get("status") != "done":
             return ok({"task_id": tid, "status": res.get("status", "unknown"),
                        "text": "", "error": res.get("error", ""),
@@ -473,20 +508,22 @@ def _asr(args: dict) -> str:
         sub = _asr_submit(src, language, bool(args.get("diarization")))
         session_key = _session_key()
         label = os.path.basename(src) if local else src[:80]
-        _TASKS[sub["task_id"]] = {"status": "pending", "task_id": sub["task_id"]}
+        _tasks_put(sub["task_id"], {"status": "pending", "task_id": sub["task_id"]})
         deadline = time.time() + wait_seconds
+        interval = max(float(config.cfg("multimedia.asr.poll_interval", 5)), 1.0)
         while time.time() < deadline:
             res = _asr_result(sub["task_id"])
             if res.get("status") == "done":
-                _TASKS[sub["task_id"]] = res
+                _tasks_put(sub["task_id"], res)
                 return ok({"action": "transcribe", "mode": "async", "task_id": sub["task_id"],
                            "status": "done", "text": res.get("text"),
                            "sentences": res.get("sentences", [])[:800],
                            "model": sub["model"]})
             if res.get("status") == "failed":
-                _TASKS[sub["task_id"]] = res
+                _tasks_put(sub["task_id"], res)
                 return err("ASR 失败：%s" % res.get("error"))
-            time.sleep(float(config.cfg("multimedia.asr.poll_interval", 5)))
+            time.sleep(interval)
+            interval = min(interval * 2.0, 30.0)  # 指数退避 5→10→20→30s 封顶
         threading.Thread(target=_watch_task, args=(sub["task_id"], session_key, label),
                          daemon=True).start()
         return ok({"action": "transcribe", "mode": "async", "task_id": sub["task_id"],

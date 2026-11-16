@@ -21,6 +21,9 @@ DSH（DeepSeek Harness）模拟器 · **极简模式先行版 v0.4.0**
 - 每接管一个会话，其会话 ID 持久化登记在 `$HERMES_HOME/dshsim-sessions.json`；插件注册时**自动重新武装**清单内的全部会话——桌面后端重启后接管不再丢失（中间件每请求自愈模式与标签）。
 - 被接管的会话，其**会话名**自动带 `[DSHSIM] ` 前缀（写入宿主 `state.db` 标题，桌面侧栏即时刷新；标题尚未生成的全新会话等下轮请求补标）。
 - `optout` 反向清理：模式、清单条目、`[DSHSIM]` 标全部移除。
+- **接管有 TTL（默认 7 天）**：清单条目按 `enabled_at`/`created`/`updated_at` 判定，过期的在加载时丢弃、`hydrate` 逐条跳过——重启不再把一周前的"换脑"状态静默还原。没有可解析时间戳的条目保留（格式故障不该导致接管丢失）。
+- **清单读写是跨进程串行的**：`dshsim-sessions.json` 的读-改-写拿进程内 RLock + OS 字节区间锁（Windows `msvcrt.locking` / POSIX `flock`，2s 死线，进程崩溃由 OS 释放），写临时名带 pid+uuid 后 `os.replace`。并发 `add`/`remove` 不再互相覆盖（实测反证：无锁路径 400 条丢 336）。
+- **编辑器预检不再自己读文件**：`view`/`edit`/`insert` 的字节全部经宿主 `read_file` 分页取回，宿主的读取闸（路径守卫、行截断、脱敏）无法被绕过；宿主返回截断/脱敏页时按"不精确"处理（edit 放弃本地唯一性预检改交给宿主 patch，insert 走单行锚点或明确拒绝），绝不基于残页做判断。非 UTF-8 文件（GBK/ANSI）现在明确报 `file is not valid UTF-8 text (maybe GBK/ANSI); convert it first`，不再误报"不是常规文件"。
 
 不带模式时插件对会话零介入：两枚工具以**不可见方式注册**（私有 toolset + 永假 `check_fn`），不会出现在任何会话的工具定义、`tool_search` 延迟目录、`tool_call` 桥或校验集合中；载荷侧另有一层按名的剥离兜底（四种协议形状都认）。
 

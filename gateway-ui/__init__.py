@@ -17,6 +17,7 @@ import atexit
 import contextlib
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -374,12 +375,36 @@ def _consumer(stop=None) -> None:
 # config.yaml 只有官方 ctx.set_config 碰；本 watcher 只做校验+转发+回执。
 _REQ_DONE = []          # 最近 64 个已处理请求 id（幂等去重）
 _VIEW_LAST = {"sig": None}
+# F5 总线鉴权：register 生成随机 token 写 <bus>/.bus_token，settings_req 必须携带。
+# 无鉴权时任何同机进程都能发 settings_req → 宿主代写 config（providers_dir 代执行）。
+_BUS_TOKEN = {"v": ""}
+TOKEN_NAME = ".bus_token"
 
 
-def _ack(path: Path, req_id: str, ok: bool, key: str, value, error: str = "") -> None:
+def _write_bus_token(bus: Path) -> str:
+    """生成并落盘总线 token（secrets.token_hex(16)，尽力 chmod 0600）。
+    写失败返回空串 → watcher 走"接受但留证"兼容层（旧 worker 不发 token）。"""
+    try:
+        tok = secrets.token_hex(16)
+        bus.mkdir(parents=True, exist_ok=True)
+        p = bus / TOKEN_NAME
+        p.write_text(tok, encoding="utf-8")
+        with contextlib.suppress(Exception):
+            os.chmod(p, 0o600)   # POSIX 生效；NTFS 忽略（同用户 ACL 已隔其他用户）
+        return tok
+    except Exception as exc:
+        _log(f"bus token write failed (settings bus degraded): {exc}")
+        return ""
+
+
+def _ack(path: Path, req_id: str, ok: bool, key: str, value, error: str = "",
+         token_state: str = "ok") -> None:
     with contextlib.suppress(Exception):
         write_json(path, {"id": req_id, "ok": bool(ok), "key": key,
-                          "value": value, "error": error, "ts": round(time.time(), 3)})
+                          "value": value, "error": error, "ts": round(time.time(), 3),
+                          # token 状态标记：ok=已校验；missing=宿主持久化失败/旧 worker
+                          # 兼容层的降级放行（供取证，不是工作流依赖）
+                          "token": token_state})
 
 
 def _apply_setting(key: str, value) -> None:
@@ -387,7 +412,9 @@ def _apply_setting(key: str, value) -> None:
     保留块内其他键）；顶层键直写。config.yaml 只有官方 ctx.set_config 碰。"""
     if key.startswith("pet."):
         leaf = key[4:]
-        block = dict(cfgmod.read_pet_explicit(_CTX))
+        # N22：整块合并必须基于 read_pet_raw（原样块）——用过滤后的显式块写回会
+        # 静默丢掉用户手加的白名单外键（pet 块里作者自己的扩展字段）。
+        block = dict(cfgmod.read_pet_raw(_CTX))
         block[leaf] = value
         _CTX.set_config("pet", block)
     elif key.startswith("balance."):
@@ -413,6 +440,7 @@ def _settings_watcher(stop=None) -> None:
     last = req_p.stat().st_mtime if req_p.exists() else None
     last_sig = req_p.read_text(encoding="utf-8") if req_p.exists() else None
     first = True
+    tok_warned = False
     while not stop.wait(0.01 if first else 0.25):
         first = False
         try:
@@ -431,6 +459,24 @@ def _settings_watcher(stop=None) -> None:
             req_id = str(req.get("id") or "")
             if req_id and req_id in _REQ_DONE:
                 continue  # 幂等：已处理过的 id 不重复落盘
+            # F5：总线鉴权。只认本进程 register 时写下的 token——伪造请求直接在
+            # 这里挡掉，不进幂等表、不碰官方 writer、只留一条拒绝回执。
+            expected = _BUS_TOKEN.get("v") or ""
+            token_state = "ok"
+            if expected:
+                if str(req.get("token") or "") != expected:
+                    _ack(ack_p, req_id, False, str(req.get("key") or ""), None,
+                         "bad bus token (request not from this host's worker)")
+                    _vlog(f"settings REJECTED (bad token) key={req.get('key')!r}")
+                    continue
+            else:
+                # 兼容层：token 文件写失败/旧版 worker 不发 token → 接受但留证
+                # （ack.token="missing"），绝不静默。
+                token_state = "missing"
+                if not tok_warned:
+                    tok_warned = True
+                    _log("settings bus token missing -> accepting unauthenticated "
+                         "requests (compat layer)")
             ok, key, value, error = cfgmod.validate_request(req, _installed_slugs())
             if ok:
                 try:
@@ -441,7 +487,7 @@ def _settings_watcher(stop=None) -> None:
                 _REQ_DONE.append(req_id)
                 if len(_REQ_DONE) > 64:
                     del _REQ_DONE[:len(_REQ_DONE) - 64]
-            _ack(ack_p, req_id, ok, key, value, error)
+            _ack(ack_p, req_id, ok, key, value, error, token_state)
             if ok:
                 _vlog(f"settings -> config.yaml: {key}={value!r}")
             else:
@@ -522,6 +568,8 @@ def register(ctx) -> None:
         _s(k)  # 顶层显示类逐键补齐
     # pet 块：显示类缺键补齐；enable-pet 三态（缺键不落 false，A1 根除）
     cfgmod.fill_pet_display(ctx, cfgmod.read_pet_explicit(ctx))
+    # F5：settings 总线 token（每轮 register 换新；worker 每次发请求前现读现带）
+    _BUS_TOKEN["v"] = _write_bus_token(_home() / BUS_DIR_NAME)
     # 设置界面：pet_cfg.json 播种退役——config.yaml 唯一事实源，settings_view 由
     # 消费线程每拍从官方 get_config 出快照；worker 首启回落 meta.pet（supervisor 写）。
     ctx.register_hook("pre_gateway_dispatch", _on_inbound)

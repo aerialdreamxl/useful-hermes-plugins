@@ -23,7 +23,10 @@ Docs-established facts baked in:
        response output.text (+ output.sentence.*), usage.duration
        model qwen-audio-3.0-asr-flash, non-realtime, audio ≤ 5 min
   Key: sk-sp- Token Plan key; docs script reads TOKEN_PLAN_API_KEY first,
-       then ANTHROPIC_AUTH_TOKEN — mirrored exactly.
+       then ANTHROPIC_AUTH_TOKEN — mirrored EXCEPT for the second step: an
+       Anthropic-side token is not a Token Plan credential, so reusing it is
+       opt-in (DASHSCOPE_VOICE_ALLOW_ANTHROPIC_TOKEN=1) instead of implicit
+       (F20: no silent cross-service credential reuse).
 """
 from __future__ import annotations
 
@@ -46,7 +49,12 @@ DEFAULT_HOST = "https://token-plan.maas.qianwenaiapi.com"
 TTS_PATH = "/api/v1/services/audio/tts/SpeechSynthesizer"
 ASR_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
 TIMEOUT_S = 300  # docs script timeout
-FALLBACK_KEY_ENV = "ANTHROPIC_AUTH_TOKEN"  # docs script fallback order
+FALLBACK_KEY_ENV = "ANTHROPIC_AUTH_TOKEN"  # docs script fallback env name
+# F20：ANTHROPIC_AUTH_TOKEN 是 Anthropic 侧凭证，不是 Token Plan 凭证。
+# 默认**不**拿它给 Token Plan 网关做 Bearer（凭证跨服务复用）；只有显式设
+# DASHSCOPE_VOICE_ALLOW_ANTHROPIC_TOKEN=1 才允许，且日志里会注明来源。
+ALLOW_FALLBACK_KEY_ENV = "DASHSCOPE_VOICE_ALLOW_ANTHROPIC_TOKEN"
+_TRUTHY = ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
 # Settings (DIY 插件规范: per-key auto-fill, explicit values never overwritten)
@@ -114,20 +122,51 @@ def _require_httpx() -> Any:
     return httpx
 
 
-def _resolve_key(get_setting: SettingGetter) -> str:
-    """Docs order: TOKEN_PLAN_API_KEY (configurable) first, then
-    ANTHROPIC_AUTH_TOKEN. Never logged, never written anywhere."""
+def _allow_fallback_key() -> bool:
+    """F20 开关：只有显式 DASHSCOPE_VOICE_ALLOW_ANTHROPIC_TOKEN=1 才复用
+    Anthropic 凭证；缺省（未设/空/其它值）一律视为不允许。"""
+    return str(os.environ.get(ALLOW_FALLBACK_KEY_ENV, "")).strip().lower() in _TRUTHY
+
+
+def _key_envs(get_setting: SettingGetter) -> List[str]:
+    """按既有优先级列出可用的 key 环境变量名（只列名，不读值、不外泄）。
+
+    顺序：voice.token_plan.api_key_env（默认 TOKEN_PLAN_API_KEY）→
+    ANTHROPIC_AUTH_TOKEN（仅在显式开关打开时追加）。把 api_key_env 显式设成
+    ANTHROPIC_AUTH_TOKEN 属于用户自己写明，不算隐式复用，照旧生效。
+    """
     env_name = str(
         get_setting("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
         or ""
-    )
-    for name in (env_name, FALLBACK_KEY_ENV):
-        if name and os.environ.get(name):
-            return os.environ[name]
+    ).strip()
+    names: List[str] = [env_name] if env_name else []
+    if _allow_fallback_key() and FALLBACK_KEY_ENV not in names:
+        names.append(FALLBACK_KEY_ENV)
+    return (names)
+
+
+def _resolve_key(get_setting: SettingGetter) -> tuple:
+    """返回 (key, 来源标签)。来源标签只写环境变量名与获取方式，绝不含 key 本身。
+
+    优先级保持 docs 顺序；来源标签供日志/返回体注明（F20 要求可追溯）。
+    """
+    env_name = str(
+        get_setting("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
+        or ""
+    ).strip()
+    for name in _key_envs(get_setting):
+        value = os.environ.get(name) or ""
+        if not value:
+            continue
+        if name == env_name:
+            return (value, f"env:{name}")
+        return (value, f"env:{name} (explicit via {ALLOW_FALLBACK_KEY_ENV}=1)")
     raise RuntimeError(
         "dashscope-native token-plan voice: no Token Plan API key. Set "
         f"{env_name or 'TOKEN_PLAN_API_KEY'} (sk-sp- key from the Token Plan "
-        f"console) or {FALLBACK_KEY_ENV}."
+        f"console). {FALLBACK_KEY_ENV} is NOT reused automatically — it is an "
+        "Anthropic-side credential; set "
+        f"{ALLOW_FALLBACK_KEY_ENV}=1 only if you deliberately share it."
     )
 
 
@@ -138,14 +177,21 @@ def _base_url(get_setting: SettingGetter) -> str:
 
 
 def make_poster(get_setting: SettingGetter) -> Poster:
-    """Default poster: httpx POST, timeout 300s per docs, raises on !ok with
-    the docs-style `<status>: <body>` message."""
+    """Default poster: httpx POST, timeout 300s per docs, raises on !ok.
+
+    F21：错误体是上游（不可信）文本，拼接前一律过 ds_client 的净化器——
+    状态码与错误类型保留，正文截断 800 字符并打断模板标记。
+    """
 
     def post(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .ds_client import upstream_error_message  # 函数内 import：避免包内循环
+
         httpx = _require_httpx()
         resp = httpx.post(url, headers=headers, json=payload, timeout=TIMEOUT_S)
         if resp.status_code >= 400:
-            raise RuntimeError(f"{resp.status_code}: {resp.text}")
+            raise RuntimeError(
+                upstream_error_message(resp.status_code, resp.text, "TokenPlanHTTPError")
+            )
         return resp.json()
 
     return post
@@ -198,13 +244,9 @@ class TokenPlanTTS(TTSProvider):
         """Local checks only (picker paints call this every frame)."""
         if importlib.util.find_spec("httpx") is None:
             return False
-        env_name = str(
-            self._get("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
-            or ""
-        )
-        return any(
-            os.environ.get(n) for n in (env_name, FALLBACK_KEY_ENV) if n
-        )
+        # 与 _resolve_key 同一份 env 名单：不允许复用时就不把 Anthropic
+        # 凭证算成"可用"（否则 picker 点亮、真调用必失败）。
+        return any(os.environ.get(n) for n in _key_envs(self._get))
 
     def list_models(self) -> List[Dict[str, Any]]:
         return [
@@ -280,7 +322,10 @@ class TokenPlanTTS(TTSProvider):
             )
         except (TypeError, ValueError):
             sample_rate = DEFAULTS["voice.token_plan.tts.sample_rate"]
-        key = _resolve_key(self._get)
+        key, key_source = _resolve_key(self._get)
+        logger.info(
+            "dashscope-native token-plan voice: TTS bearer source %s", key_source
+        )
         url = _base_url(self._get) + TTS_PATH
         payload = {
             "model": resolved_model,
@@ -298,9 +343,12 @@ class TokenPlanTTS(TTSProvider):
         )
         audio_url = ((data.get("output") or {}).get("audio") or {}).get("url")
         if not audio_url:
+            from .ds_client import sanitize_upstream_error_body  # F21：响应体同属不可信
+
             raise RuntimeError(
                 "dashscope-native token-plan voice: response has no "
-                f"output.audio.url — got: {str(data)[:300]}"
+                "output.audio.url — got: "
+                f"{sanitize_upstream_error_body(data, 300)}"
             )
         audio = self._getter(audio_url)  # URL expires — download immediately
         if not audio:
@@ -331,11 +379,8 @@ class TokenPlanSTT(TranscriptionProvider):
     def is_available(self) -> bool:
         if importlib.util.find_spec("httpx") is None:
             return False
-        env_name = str(
-            self._get("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
-            or ""
-        )
-        return any(os.environ.get(n) for n in (env_name, FALLBACK_KEY_ENV) if n)
+        # 同 TTS：key 名单只有一份来源（_key_envs），F20 开关在这里也生效。
+        return any(os.environ.get(n) for n in _key_envs(self._get))
 
     def list_models(self) -> List[Dict[str, Any]]:
         return [
@@ -413,7 +458,10 @@ class TokenPlanSTT(TranscriptionProvider):
                 },
                 "parameters": parameters,
             }
-            key = _resolve_key(self._get)
+            key, key_source = _resolve_key(self._get)
+            logger.info(
+                "dashscope-native token-plan voice: ASR bearer source %s", key_source
+            )
             url = _base_url(self._get) + ASR_PATH
             data = self._poster(
                 url,
@@ -435,8 +483,12 @@ class TokenPlanSTT(TranscriptionProvider):
                 "success": True,
                 "transcript": str(transcript or ""),
                 "provider": PROVIDER_NAME,
+                # F20：凭证来源可追溯（只写环境变量名，不含 key 本身）
+                "auth_source": key_source,
             }
         except Exception as exc:  # NEVER raise — error envelope by contract
+            from .ds_client import sanitize_exception_text  # F21：错误体不可信
+
             logger.warning(
                 "dashscope-native token-plan voice: transcribe failed", exc_info=True
             )
@@ -444,7 +496,7 @@ class TokenPlanSTT(TranscriptionProvider):
                 "success": False,
                 "transcript": "",
                 "provider": PROVIDER_NAME,
-                "error": str(exc),
+                "error": sanitize_exception_text(exc),
             }
 
 

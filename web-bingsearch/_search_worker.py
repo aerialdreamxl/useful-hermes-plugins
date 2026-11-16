@@ -1,14 +1,26 @@
-"""Bing HTML search child-process entrypoint, run as ``python _search_worker.py``.
+"""Bing HTML child-process entrypoint, run as ``python _search_worker.py``.
 
-Reads one JSON request ``{"queue": str, "settings": {...}}`` from stdin, writes one
-envelope ``{"ok": true, "results": [...]}`` / ``{"ok": false, "error": str}`` to
-stdout, exits. The parent (runHtmlSearchBounded) kills this process on a hard
-wall-clock deadline because primp can block in native code while holding the GIL.
+One-shot worker for both channels of the plugin (v1.4):
+
+* ``{"op": "search", "queue": str, "settings": {...}}``
+  -> ``{"ok": true, "results": [...], "debug": {...}}`` / ``{"ok": false, "error": str}``
+* ``{"op": "extract", "url": str, "settings": {...}}``
+  -> ``{"ok": true, "raw_content": str}`` / ``{"ok": false, "error": str}``
+
+A missing ``op`` means ``search`` (v1.3 wire format still accepted). Reads its one
+JSON request from stdin, writes one envelope to stdout, exits.
+
+Why a child process at all: primp blocks in native code while holding the GIL, so a
+slow Bing page or a slow extract target could freeze the whole gateway. The parent
+(runHtmlSearchBounded / runExtractBounded) only ever reads stdout and kills this
+process on a hard wall-clock deadline (terminate -> kill).
 
 The plugin directory name has a hyphen (web-bingsearch) so it cannot be imported
 as a normal package; we load __init__.py by file path via importlib. Settings are
 forwarded from the parent through a tiny shim so the child honors the user's
 stealth_headers / warm_homepage switches (the child has no live PluginContext).
+``primp`` is imported inside the plugin functions, i.e. only ever in here — the
+gateway process never imports it on the extract path.
 
 Test hooks (``"test_hook": "sleep"|"gil"|"empty"``) are honored only when
 ``HERMES_BING_ALLOW_TEST_HOOKS=1`` — used to prove the parent can kill a
@@ -81,11 +93,43 @@ def _fail(error: str, code: int) -> int:
     return code
 
 
+def _run_search(request: dict) -> int:
+    queue = str(request.get("queue") or "")
+    if not queue:
+        return _fail("empty queue", 2)
+    try:
+        mod = _load_plugin_module()
+        mod._pluginCtx = _SettingsShim(request.get("settings"))
+        results = mod.ladderSearchHtml(queue)
+        # F17：把子进程里记的诊断（尝试档数/最终 URL/页面体积）带回父进程
+        _write_envelope({"ok": True, "results": results, "debug": getattr(mod, "_lastSearchDiag", None) or {}})
+        return 0
+    except Exception as exc:
+        return _fail(f"{type(exc).__name__}: {exc}", 1)
+
+
+def _run_extract(request: dict) -> int:
+    """抓一个 URL：primp 在插件函数里 import，父进程只读这里吐出的 JSON。"""
+    url = str(request.get("url") or "")
+    if not url:
+        return _fail("empty url", 2)
+    try:
+        mod = _load_plugin_module()
+        mod._pluginCtx = _SettingsShim(request.get("settings"))
+        raw_content = mod.crawlUrlRawHtmlStealth(url)
+        _write_envelope({"ok": True, "raw_content": raw_content})
+        return 0
+    except Exception as exc:
+        return _fail(f"{type(exc).__name__}: {exc}", 1)
+
+
 def main() -> int:
     try:
         request = json.load(sys.stdin)
     except Exception as exc:
         return _fail(f"invalid request: {exc}", 2)
+    if not isinstance(request, dict):
+        return _fail("invalid request: not a JSON object", 2)
 
     hook = request.get("test_hook")
     if hook:
@@ -96,17 +140,12 @@ def main() -> int:
         _write_envelope(envelope)
         return 0 if envelope.get("ok") else 1
 
-    queue = str(request.get("queue") or "")
-    if not queue:
-        return _fail("empty queue", 2)
-    try:
-        mod = _load_plugin_module()
-        mod._pluginCtx = _SettingsShim(request.get("settings"))
-        results = mod.ladderSearchHtml(queue)
-        _write_envelope({"ok": True, "results": results})
-        return 0
-    except Exception as exc:
-        return _fail(f"{type(exc).__name__}: {exc}", 1)
+    op = str(request.get("op") or "search")  # 缺 op = v1.3 旧格式（只有 search）
+    if op == "extract":
+        return _run_extract(request)
+    if op == "search":
+        return _run_search(request)
+    return _fail(f"unknown op: {op!r}", 2)
 
 
 if __name__ == "__main__":

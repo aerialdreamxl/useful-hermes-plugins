@@ -20,9 +20,21 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+# ── 密钥/配置/记忆库（F4：默认必须排除，敏感三件套绝不能静默进包）──
+# 单独成表：--include-secrets 时整组不下发，其余内置规则照旧生效。
+# SQLite 旁车也一并排除——主库都不走了，留下 -wal/-shm 是孤儿碎片。
+SECRET_EXCLUDES = [
+    "/.env", "/.env.*",                     # 根级环境变量（含 .env.local/.env.production 变体）
+    "/config.yaml",                         # 主配置（含各类 key 与绝对路径）
+    ".advanced-custom-providers.json",      # 自定义 provider（明文 API key）
+    "credential*.json", "credential*.txt",  # 凭据文件
+    "*.db", "*.db-wal", "*.db-shm",          # SQLite 主库与旁车（记忆库/看板/状态）
+    "*.sqlite*",                            # 同一族的其它.sqlite/.sqlite3/-wal/-shm
+]
+
 # ── 内置黑名单（2026-10-31 实测盘点 hermes-home-sync-audit 的产物）──
 # 设计原则：①可再生（源码树/环境/工具/缓存）②运行时残渣（pid/lock/tmp/心跳）
-# ③过期快照与 .bak 全家桶。绝不含 *.db-wal / *.db-shm（必须随主库同迁）。
+# ③过期快照与 .bak 全家桶；④密钥/配置/记忆库（见上表 SECRET_EXCLUDES）。
 DEFAULT_EXCLUDES = [
     # 可再生大件（新机自动重建，~12GB 大头）
     "/hermes-agent/", "/installs/", "/tools/", "/cache/", "/lsp/", "/bin/",
@@ -50,7 +62,7 @@ DEFAULT_EXCLUDES = [
     "*.lock", "*.tmp", "*.bak", "*.bak-*", "*.orig", "*.part",
     "/SOUL.md.old.*", "/SOUL.md.original",
     "/sessions/request_dump_*.json",
-]
+] + SECRET_EXCLUDES
 
 
 class Blacklist:
@@ -194,25 +206,46 @@ def collect(home: Path, bl: Blacklist, out_path: Path):
 
 
 def package_main(args) -> int:
+    # 裸 cmd/cp936 控制台（无 PYTHONUTF8）遇到对勾/中文会抛 UnicodeEncodeError，
+    # 包写完却以异常收场。先兜住编码，再谈别的事。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:  # 被重定向到非 TextIOWrapper 时静默跳过
+                reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
     home = resolve_home(args.home)
-    rules = [] if args.no_default_excludes else list(DEFAULT_EXCLUDES)
+    rules = []
+    if not args.no_default_excludes:
+        if args.include_secrets:
+            # 显式放行：只摘掉 SECRET_EXCLUDES 这一组，其余内置规则照旧
+            secret = set(SECRET_EXCLUDES)
+            rules.extend(r for r in DEFAULT_EXCLUDES if r not in secret)
+        else:
+            rules.extend(DEFAULT_EXCLUDES)
     if args.exclude_file:
         user = Path(args.exclude_file).expanduser().resolve()
         if not user.is_file():
             print(f"[hermes-pack] 黑名单文件不存在: {user}")
             return 2
-        rules.extend(user.read_text(encoding="utf-8", errors="replace").splitlines())
-        print(f"[hermes-pack] 已加载用户黑名单 {user.name}（{len(user.read_text(encoding='utf-8', errors='replace').splitlines())} 行）")
+        # 只读一次：两次 read_text 之间文件变了，规则与报告行数就对不上
+        user_lines = user.read_text(encoding="utf-8", errors="replace").splitlines()
+        rules.extend(user_lines)
+        print(f"[hermes-pack] 已加载用户黑名单 {user.name}（{len(user_lines)} 行）")
     bl = Blacklist(rules)
+    if args.no_default_excludes:
+        print("[hermes-pack] --no-default-excludes：只用你的规则，密钥/配置/记忆库不再自动排除。")
+    elif args.include_secrets:
+        print("[hermes-pack] 警告：--include-secrets 已生效，.env / config.yaml / *.db 将明文进包，传播前请自行评估。")
+    else:
+        print("[hermes-pack] 密钥/配置/记忆库（.env、config.yaml、credential*.json、*.db）已排除；确需打包加 --include-secrets。")
 
     out_path = Path(args.output).expanduser()
     if not out_path.is_absolute():
         out_path = Path.cwd() / out_path
     if out_path.suffix.lower() != ".zip":
         out_path = out_path.with_suffix(".zip")
-    if out_path.exists() and not args.dry_run:
-        print(f"[hermes-pack] 目标已存在，拒绝覆盖: {out_path}（改名或先删）")
-        return 2
 
     running, why = gateway_running(home)
     if running and not args.force and not args.dry_run:
@@ -243,6 +276,17 @@ def package_main(args) -> int:
         return 0
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 原子预占：旧写法在扫描前 exists()，到真正写 zip 之间隔着分钟级全树遍历，
+    # TOCTOU 窗口里冒出来的同名包会被静默覆盖。'xb' 由内核裁定独占创建，
+    # 抢到即锁名；抢不到就拒绝，绝不碰别人的文件。（dry-run 早已 return，不建文件。）
+    try:
+        reserved = open(out_path, "xb")
+    except FileExistsError:
+        print(f"[hermes-pack] 目标已存在，拒绝覆盖: {out_path}（改名或先删）")
+        return 2
+    except OSError as exc:
+        print(f"[hermes-pack] 目标不可写: {out_path}（{exc}）")
+        return 2
     mode = zipfile.ZIP_STORED if args.store else zipfile.ZIP_DEFLATED
     manifest = {
         "tool": "hermes-pack", "pack_version": 1,
@@ -255,14 +299,14 @@ def package_main(args) -> int:
     written = 0
     vanished = 0
     t1 = time.time()
-    with zipfile.ZipFile(out_path, "w", mode, allowZip64=True, compresslevel=6 if mode == zipfile.ZIP_DEFLATED else None) as zf:
+    with reserved, zipfile.ZipFile(reserved, "w", mode, allowZip64=True, compresslevel=6 if mode == zipfile.ZIP_DEFLATED else None) as zf:
         zf.writestr("_hermes-pack-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for f in files:
             try:
                 zf.write(f, _rel(f, home))
             except (FileNotFoundError, zipfile.BadZipFile) as exc:
-                # 扫描与写入之间文件消失/被重写（SQLite -wal/-shm checkpoint、临时件轮换）。
-                # 旁文件本应随主库走，主库在包里，个别 sidecar 蒸发不构成损坏——计数继续。
+                # 扫描与写入之间文件消失/被重写（临时件轮换、SQLite checkpoint）。
+                # 个别文件蒸发不构成损坏——计数继续，别拖垮整包。
                 vanished += 1
                 if vanished <= 10:
                     print(f"  [跳过] {f.name}: {type(exc).__name__}（竞态蒸发）")
@@ -282,7 +326,7 @@ def package_main(args) -> int:
     zip_bytes = out_path.stat().st_size
     dur = time.time() - t1
     ratio = zip_bytes / max(1, total_bytes) * 100
-    print(f"[hermes-pack] ✔ {out_path}")
+    print(f"[hermes-pack] [OK] {out_path}")
     print(f"[hermes-pack]   {written+1} 条目 / {zip_bytes/1073741824:.2f} GB（压缩率 {ratio:.0f}%），扫描 {scan_s:.0f}s + 写入 {dur:.0f}s")
     print(f"[hermes-pack]   恢复端：解压到目标机 HERMES_HOME 后先跑 environment-migration-remap（.env/config.yaml 绝对路径重映射），再启动 Hermes。")
     return 0

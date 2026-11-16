@@ -71,6 +71,7 @@ _CORE_AUTOCONT_PREFIX = "[System note: Your previous turn"
 REPLAY_HEADER = "X-Session-Hold-Replay"
 _SNAP_MAX_BYTES = 4_000_000      # skip absurd payloads
 _SNAP_MAX_AGE_SECS = 24 * 3600   # a day-old frozen request is stale; normal flow resumes
+_SWEEP_MIN_INTERVAL_SECS = 300.0  # opportunistic frozen/ sweep: at most once per 5 min
 REPLAY_FRAME_CAP = 48            # per episode: appended assistant rows beyond this end it
 POLL_SECS = 0.4
 DEFAULT_PARK_TTL_SECS = 8 * 3600
@@ -145,6 +146,19 @@ def assistant_has_tool_calls(msg: Any) -> bool:
 
 # ------------------------------------------------------------- snapshot store
 
+def _as_ts(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# Process-wide sweep throttle: the first caller in this process always sweeps
+# (_last_sweep starts at 0), later ones ride the 5-minute window.
+_sweep_lock = threading.Lock()
+_last_sweep = 0.0
+
+
 class SnapshotStore:
     """Durable frozen payloads: <base>/frozen/<sha1(key)>.json holds the
     messages/input rows only (envelope params stay live so a model or toolset
@@ -199,6 +213,10 @@ class SnapshotStore:
 
     def load(self, key: str) -> Optional[Dict[str, Any]]:
         try:
+            self.sweep()   # reap expired orphans before reading this key
+        except Exception:  # noqa: BLE001 - housekeeping never breaks a load
+            pass
+        try:
             data = json.loads(self._path(key).read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - FileNotFoundError is the common case
             return None
@@ -220,6 +238,66 @@ class SnapshotStore:
             self._path(key).unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
             pass
+
+    def sweep(self, now: Optional[float] = None, force: bool = False) -> int:
+        """Reap expired debris from the whole frozen dir (returns the count).
+
+        load() only ever reaps the key it was asked for, so a snapshot whose
+        session never came back kept its bytes forever (a 35-day-old 486KB file
+        was still on disk, 2026-11-16). Walks <base>/frozen/*.json and unlinks
+        anything past _SNAP_MAX_AGE_SECS, plus remnants that are obviously not
+        snapshots (unreadable JSON, no key, no message rows).
+
+        Age is the MAX of the envelope's saved_at and the file mtime: a fresh
+        value on either side keeps the file, so a park that just wrote its
+        snapshot can never have it reaped from under the blocked turn (atomic
+        replace means a *.json is always a complete file; in-flight temps are
+        .<stem>_*.tmp and never match). Only mtime-stale files are parsed, so a
+        sweep over a healthy directory costs one stat per file. Runs at most
+        once per _SWEEP_MIN_INTERVAL_SECS unless force=. Total: never raises."""
+        global _last_sweep
+        stamp = time.time() if now is None else _as_ts(now)
+        try:
+            with _sweep_lock:
+                if not force and stamp - _last_sweep < _SWEEP_MIN_INTERVAL_SECS:
+                    return 0
+                _last_sweep = stamp
+        except Exception:  # noqa: BLE001
+            return 0
+        removed = 0
+        try:
+            frozen = self._base_getter() / "frozen"
+            if not frozen.is_dir():
+                return 0
+            for path in list(frozen.glob("*.json")):
+                try:
+                    if not path.is_file():
+                        continue
+                    mtime = path.stat().st_mtime
+                    if stamp - mtime <= _SNAP_MAX_AGE_SECS:
+                        continue   # fresh mtime is a keep; no need to parse the file
+                    snapshot, saved_at = False, 0.0
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001 - torn/foreign remnant
+                        data = None
+                    if isinstance(data, dict) and isinstance(data.get("key"), str) and data["key"]:
+                        payload = data.get("payload")
+                        if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+                            snapshot = True
+                            saved_at = _as_ts(data.get("saved_at"))
+                    if snapshot and stamp - saved_at <= _SNAP_MAX_AGE_SECS:
+                        continue   # a fresh stamp vetoes a stale mtime (clock/copy skew)
+                    path.unlink()
+                    removed += 1
+                    logger.debug("session-hold: swept %s (%s, mtime %.1fh old)", path.name,
+                                 "snapshot" if snapshot else "remnant",
+                                 (stamp - mtime) / 3600.0)
+                except Exception:  # noqa: BLE001 - one bad file stops only itself
+                    continue
+        except Exception as exc:  # noqa: BLE001 - housekeeping never breaks a turn
+            logger.debug("session-hold: snapshot sweep failed open: %s", exc)
+        return removed
 
 
 # ------------------------------------------------------------ park registry

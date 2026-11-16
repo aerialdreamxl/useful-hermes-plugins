@@ -123,6 +123,9 @@ def step4_dashboard():
         say("  dashboard 插件不存在，跳过")
         return
     text = DASH_INIT.read_text(encoding="utf-8")
+    if "_dashboard_state_path" in text and "_PLUGIN_ID" in text:
+        say("  新版权自带总线命名空间推导（cache/<_PLUGIN_ID>/），无需指针改写，跳过")
+        return
     old = '_STATE_PATH_HINT = ("cache", "gateway-fluent-gui")'
     new = '_STATE_PATH_HINT = ("cache", "gateway-ui")'
     if new in text:

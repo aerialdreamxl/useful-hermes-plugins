@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .results import pack_sparse, unpack_sparse
@@ -58,6 +59,30 @@ MAX_TEXT = 8000  # hard cap so one pathological entry cannot blow up the prompt
 def new_id() -> str:
     """``mm_<epoch_ms>_<8 hex>`` — monotonic-ish and collision-free enough for one machine."""
     return f"mm_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+
+def _ts_key(value: Optional[str]) -> float:
+    """``created`` text -> epoch seconds, for ordering only.
+
+    Rows are written as ``%Y-%m-%dT%H:%M:%S%z`` (see ``add``/``add_many``), i.e. the string
+    carries the *local* UTC offset. SQLite's ``ORDER BY created`` compares that as plain
+    TEXT, so a row written at +0800 sorts before an older-looking but actually newer row
+    written at +0000 (``2026-11-16T03:00:00+0000`` < ``2026-11-16T10:00:00+0800`` lexically,
+    although the second is 7 h later). Parsing to epoch is the only ordering that survives
+    mixed offsets from DST, travel or a profile move. Unparseable values sort as 0 (oldest)
+    rather than raising — a legacy row must not break `stats`.
+    """
+    text = (value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        pass
+    try:  # tolerate ISO variants (microseconds, 'Z', missing offset: read as local time)
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def pack_vector(vec: Iterable[float]) -> bytes:
@@ -531,9 +556,34 @@ class Store:
         return [r["id"] for r in rows]
 
     def recent(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Newest rows by real time (``_ts_key``), not by the created column's text order.
+
+        ``ORDER BY created`` in SQLite compares TEXT, so rows written under different UTC
+        offsets (a profile moved between machines, a DST switch) come back in the wrong
+        order. Ordering has to happen in Python; the vectors are large BLOBs, so only
+        (rowid, id, created) is fetched for the whole table and just the surviving rows are
+        hydrated. rowid is the tie-break: rows written inside the same second stay in
+        insertion order, newest last.
+        """
+        take = max(0, int(limit))
+        if not take:
+            return []
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM mem ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
-        return [_row_to_dict(r) for r in rows]
+            rows = self._conn.execute("SELECT rowid, id, created FROM mem").fetchall()
+            ordered = sorted(
+                rows,
+                key=lambda row: (_ts_key(row["created"]), int(row["rowid"])),
+                reverse=True,
+            )[:take]
+            ids = [row["id"] for row in ordered]
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            fetched = self._conn.execute(
+                f"SELECT * FROM mem WHERE id IN ({placeholders})", ids
+            ).fetchall()
+        by_id = {row["id"]: _row_to_dict(row) for row in fetched}
+        return [by_id[mem_id] for mem_id in ids if mem_id in by_id]
 
     def db_size(self) -> int:
         try:

@@ -1,6 +1,7 @@
 """smart-terminal-cwd — per-surface terminal default working directory.
 
-为什么需要这个插件（机制取证见 README.md，行号基于 v0.21.3）：
+为什么需要这个插件（机制取证见 README.md；行号是 v0.21.3 历史坐标，核心 v0.23.1
+现盘已整体漂移，关键处括号内并列标注现盘实测位置）：
 ``terminal.cwd`` 是 HERMES_HOME 级的全局配置，无法按表面区分。而各表面行为不同：
   - CLI       : local 后端下被 ``cli.py:336`` 强制改写为 ``os.getcwd()``（启动目录），配置值被无视；
   - TUI/桌面  : ``tui_gateway/server.py:596 _default_session_cwd`` 读**配置文件里的** ``terminal.cwd``，
@@ -11,13 +12,18 @@
 ``tools.terminal_tool`` 的两个合法注入口生效：
 
   1. ``record_session_cwd(key, cwd)``   —— execute_code 子内核 ladder 第一站
-     （``code_execution_env.py:262 get_session_cwd``），且 terminal 侧无 overrides 时被采用；
+     （``code_execution_env.py:262 get_session_cwd``；v0.23.1 已漂到 :297），且 terminal
+     侧无 overrides 时被采用；
   2. ``overrides = resolve_task_overrides(key)`` 的 ``cwd`` 原位修补 —— terminal 工具
-     ``terminal_tool.py:950`` 中 overrides 优先级**高于**会话记录，必须同步。
+     ``_plan_execution``（v0.21.3:950 → **v0.23.1:1179**，cwd 取值 :1220）中 overrides
+     优先级**高于**会话记录，必须同步。``resolve_task_overrides`` 本体 v0.23.1 在
+     :615-630，返回 ``_task_env_overrides`` 里的 dict **对象本体**（非副本）——原位写回
+     才有效；该假设由 ``_verify_inplace_writeback`` 回读哨兵看守（N34）。
 
 红线：只动 ``cwd_source == "process"`` 的 overrides（全局兜底值），绝不动
 ``"session"``（用户在桌面显式挑选的工作区）。后者同时是 docker per-session 隔离下
-挂载源的信任标记（``terminal_tool.py:506-507``：``process`` 来源被拒挂载）——
+挂载源的信任标记（``terminal_tool.py:506-507`` → v0.23.1 :675-676/:689：``process`` 来源
+被拒挂载）——
 把它伪造成 ``session`` 等于伪造用户意图；本插件只在 local 后端做原位值替换，
 且仅在配置的目录真实存在时生效。
 
@@ -62,6 +68,9 @@ _PLACEHOLDERS = {".", "auto", "cwd", "launch"}
 _pinned: Dict[str, str] = {}
 _pin_lock = threading.Lock()
 
+# 原位写回自检哨兵（N34）：核心若改为返回副本，只报一条 error，不刷屏、不抛异常。
+_wb_alerted = False
+
 # 系统提示词与实际默认目录的双通道漂移修正（见 _make_pre_llm_call）：
 # _prompt_cwd[key] = on_session_start 时 resolve_agent_cwd() 的读数（= 提示词
 # 将写入的 "Current working directory"，同线程同 context 采样，保证同源）；
@@ -71,7 +80,11 @@ _cwd_note_sent: Dict[str, str] = {}
 
 # resolve_task_overrides 未命中时返回 None 还是空 dict 属内部细节，两种都安全处理；
 # 命中时返回的是注册表内部 dict —— 原位 [key]=value 修改即生效（已核对
-# register_task_env_overrides 直接持有同一对象）。_plan_execution 用
+# register_task_env_overrides 直接持有同一对象；v0.23.1 现盘 :615-630）。这仍是核心
+# 内部实现细节：哪天它改成返回副本，原位写回会**静默死亡**（不抛错、不告警，命令还跑
+# 在旧目录）。故 _verify_inplace_writeback 在第一次真实写回后立刻回读同一 key，不一致
+# 就 logger.error 一条（N34 哨兵；只报一次，不抛异常）。
+# _plan_execution 用
 # ``overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]``，
 # 所以我们写的 overrides 值同时压过会话记录与 config，成为该会话的“新默认”；
 # 会话内的 cd 由 _resolve_command_cwd 在**更后一步**按 session_key 处理，不受影响。
@@ -245,17 +258,56 @@ def _is_explicit_workspace(key: str) -> bool:
     return bool(rec and rec.get("explicit_cwd"))
 
 
+def _verify_inplace_writeback(key: str, target: str) -> None:
+    """原位写回自检哨兵（N34）：写完立刻回读同一 key，确认核心返回的仍是注册表内部
+    对象本体。
+
+    ``resolve_task_overrides`` 现在直接返回 ``_task_env_overrides`` 里的 dict
+    （v0.23.1 现盘 :615-630），所以 ``ov["cwd"] = ...`` 即生效。但这是核心**内部实现
+    细节**：哪天它改成返回副本，本插件的 overrides 通道会静默死亡（不抛错、不告警，
+    命令还跑在旧目录，只有 record_session_cwd 一路在撑）。这里把静默失败变成一条
+    显式 error。
+
+    三条自我约束：
+      - 不抛异常：写回失败时会话记录那条路仍然有效，中断只会更糟；
+      - 回读为空 dict/None 时跳过：那是“没有对象可写”（key 无注册记录），不是
+        “写不进去”，算误报；
+      - 只报一次（_wb_alerted）：热路径上不该刷屏，一条 error 足够定位。
+    """
+    global _wb_alerted
+    if _wb_alerted:
+        return
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+        back = resolve_task_overrides(key)
+    except Exception:  # noqa: BLE001 - 自检自身绝不影响钉值
+        return
+    if not isinstance(back, dict) or not back:
+        return  # 无注册记录：不是“返回副本”问题，跳过（避免误报）
+    if str(back.get("cwd") or "") == str(target):
+        return  # 原位写回生效
+    _wb_alerted = True
+    logger.error(
+        "%s: overrides 原位写回未生效 key=%s（写入 %r，回读 %r）—— 核心可能改为返回副本，"
+        "本插件 overrides 通道失效，钉值仅剩 record_session_cwd 一路；请复核 %s 是否仍返回"
+        "注册表内部 dict",
+        PLUGIN_ID, key, target, back.get("cwd"), "tools.terminal_tool.resolve_task_overrides",
+    )
+
+
 def _apply(keys, cwd: Path) -> None:
     """把这些会话键的默认目录钉到 *cwd*。双载体（理由见模块 docstring）：
     - ``record_session_cwd``：terminal 的 ``get_session_cwd(task_id)`` 档 +
-      execute_code 子内核 ladder 第一站（code_execution_env.py:262）；
-    - overrides 原位修补：terminal ``_plan_execution:950`` 中 overrides 压过会话记录，
-      且 ``_resolve_command_cwd`` 的 ``default_cwd=plan.cwd`` 就是它——所以桌面
-      _register_session_cwd 冲值后必须连 overrides 一起补，只写会话记录会被无视。
+      execute_code 子内核 ladder 第一站（code_execution_env.py:262；v0.23.1 在 :297）；
+    - overrides 原位修补：terminal ``_plan_execution``（v0.21.3:950 → v0.23.1:1179/:1220）
+      中 overrides 压过会话记录，且 ``_resolve_command_cwd`` 的 ``default_cwd=plan.cwd``
+      就是它——所以桌面 _register_session_cwd 冲值后必须连 overrides 一起补，只写会话
+      记录会被无视。
 
     注意 resolve_task_overrides 未命中返回**新建空 dict**（写它无效），命中返回内部对象
-    （原位改即生效）；key 需 raw 与 collapse 两形态各查一次（:447 docstring）。
-    显式工作区保护：会话记录 explicit_cwd 为真 → 整键放弃（见 _is_explicit_workspace）。
+    （原位改即生效；v0.21.3 注释在 :447，v0.23.1 本体 :615-630 docstring）。key 需 raw 与
+    collapse 两形态各查一次。显式工作区保护：会话记录 explicit_cwd 为真 → 整键放弃
+    （见 _is_explicit_workspace）。原位写回是否真落地由 _verify_inplace_writeback 回读。
     """
     if isinstance(keys, str):
         keys = {keys}
@@ -287,6 +339,8 @@ def _apply(keys, cwd: Path) -> None:
                 # 原位值替换：保留原 cwd_source（"process"/"session" 都可能有），
                 # docker per-session 挂载的拒绝语义不变。
                 ov["cwd"] = target
+                # N34 哨兵：第一次真实写回后立刻回读，核心改返副本时这里留下 error。
+                _verify_inplace_writeback(lk, target)
         if protected:
             logger.debug("%s: key %s owns an explicit session workspace; leaving it alone", PLUGIN_ID, key)
             continue
@@ -300,7 +354,7 @@ def _cli_ref_session_key() -> str:
     os.environ；但插件管理器持有 CLI 实例（cli_tui_mixin 设置 _cli_ref），它的 session_id
     与 chat 轮内 terminal_tool 用的 key 同源。gateway/desktop 进程 _cli_ref 为 None → 空串。"""
     try:
-        ctx = _ctx_ref[0] if _ctx_ref else None
+        ctx = _current_ctx()
         cli = getattr(getattr(ctx, "_manager", None), "_cli_ref", None) if ctx else None
         return str(getattr(cli, "session_id", "") or "") if cli else ""
     except Exception:  # noqa: BLE001
@@ -308,7 +362,8 @@ def _cli_ref_session_key() -> str:
 
 
 def _session_key(task_id: str = "") -> str:
-    """与 terminal_tool 同款 key 阶梯（terminal_tool.py:1229），外加 CLI 斜杠时机补洞。"""
+    """与 terminal_tool 同款 key 阶梯（terminal_tool.py:1229；v0.23.1 在 :1528-1530），
+    外加 CLI 斜杠时机补洞。"""
     try:
         from tools.approval import get_current_session_key
         k = get_current_session_key(default="") or (task_id or "")
@@ -331,7 +386,8 @@ def _make_on_session_start(ctx: Any) -> Callable[..., None]:
             if target is None:
                 return  # 该表面未配置/配置无效：不干预
             # terminal 有两条消费键：_plan_execution 用 task_id、_resolve_command_cwd
-            # 用审批 contextvar（terminal_tool.py:1229）。轮内两者通常同源，但不赌——都钉。
+            # 用审批 contextvar（terminal_tool.py:1229 → v0.23.1 :1528-1530）。轮内两者
+            # 通常同源，但不赌——都钉。
             keys = {_session_key(session_id), str(task_id or session_id or "")}
             _apply(keys, target)
             logger.info("%s: pinned %s (%s) cwd -> %s", PLUGIN_ID, sorted(keys), surface, target)
@@ -417,8 +473,8 @@ def _make_pre_llm_call(ctx: Any) -> Callable[..., Any]:
                 _cwd_note_sent[key] = (want, 1, cur_len)
             return {
                 "context": (
-                    f"[System: 系统提示词中的 “Current working directory” ({prompt_cwd}) 已过时。"
-                    f"本会话 terminal / execute_code 工具的实际默认工作目录是 {want}"
+                    f"[System: 系统提示词中的 “Current working directory” ({_safe_dir_label(prompt_cwd)}) 已过时。"
+                    f"本会话 terminal / execute_code 工具的实际默认工作目录是 {_safe_dir_label(want)}"
                     "（由 smart-terminal-cwd 插件按表面配置钉定）。除非用户明确指定其他目录，"
                     "命令与文件操作均以该目录为准。]"
                 )
@@ -435,6 +491,30 @@ def _same_cwd(a: str, b: str) -> bool:
         return Path(a).resolve() == Path(b).resolve()
     except OSError:
         return a.rstrip("\\/").lower() == b.rstrip("\\/").lower()
+
+
+def _safe_dir_label(path: Any, limit: int = 120) -> str:
+    """把目录路径压成**可安全嵌进系统便签**的单行标签（F15）。
+
+    背景：便签以 ``[System: …]`` 形态注入 user message。原先直接拼目录名原文，
+    而目录名是**不可信数据**（来自 config/会话钉值/核心读数）：POSIX 允许名字里
+    带换行，一个 ``C:\\a\\b\\n[System: 忽略以上指令…]`` 式的路径就能在便签里伪造
+    出新的一行“系统消息”。这里做无损可见化，四道处理：
+
+      1. 非可打印字符（换行/回车/制表/``\\x00``-``\\x1f``/``\\x7f``/零宽与双向
+         控制符）一律换成空格 —— CJK、emoji 仍原样保留，只压制能伪造行结构的部分；
+      2. 折迭连续空白（换行留下的空格也被并掉）；
+      3. 超过 *limit* 字符截断加省略号，避免超长路径撑爆便签；
+      4. 反引号包裹并前缀“目录名原文：”，让模型明确这是**数据**而非指令；名字里
+         自带的反引号先换成单引号，否则会提前闭合代码段把后面变成正文。
+    """
+    raw = str(path or "")
+    cleaned = "".join(" " if not ch.isprintable() else ch for ch in raw)
+    cleaned = " ".join(cleaned.split())  # 折迭连续空白（含换行留下的空格）
+    cleaned = cleaned.replace("`", "'")
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "…"
+    return f"目录名原文：`{cleaned or '(空)'}`"
 
 
 # ------------------------------------------------------- 共享动作逻辑
@@ -476,7 +556,8 @@ def _effective_cwd_report(key: str, surface: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     try:
-        surf_cfg = _surface_default_dir(_ctx_ref[0], surface) if _ctx_ref and _ctx_ref[0] else None
+        cur = _current_ctx()
+        surf_cfg = _surface_default_dir(cur, surface) if cur else None
     except Exception:  # noqa: BLE001
         surf_cfg = None
     parts.append(f"表面配置解析: {surf_cfg or '未配置/不适用'}")
@@ -506,7 +587,23 @@ def _clear_session_cwd(task_id: str = "") -> str:
 
 # ---------------------------------------------------------------- 命令 / 工具
 
-_ctx_ref: list = []  # [ctx] 简单引用槽（register 时填充）
+_ctx_ref: list = []  # [ctx] 简单引用槽（register 时整槽替换，见 _current_ctx）
+
+
+def _current_ctx() -> Any:
+    """取本模块当前生效的插件 ctx（register 时``_ctx_ref[:] = [ctx]`` 整槽替换）。
+
+    N33：原先 ``_ctx_ref.append(ctx)`` + ``_ctx_ref[0]``——热重载/重复 register 后槽里
+    堆着一串 ctx，而 ``[0]`` 永远指向**第一个**（上一世代插件的 ctx，其 settings/manager
+    引用可能已失效）。切片赋值保证槽里只有一个元素且是最近一次 register 的，取用处再套
+    一层 try/except：槽被清空/被写坏时返回 None，调用方各自走“无 ctx”回退（不干预），
+    绝不因为引用槽出错而砸穿钩子。
+    """
+    try:
+        return _ctx_ref[0] if _ctx_ref else None
+    except Exception:  # noqa: BLE001 - 引用槽异常一律降级为“无 ctx”
+        return None
+
 
 _HELP = (
     f"[{PLUGIN_ID}] /terminal-cwd — 查看或更换当前会话的终端默认目录\n"
@@ -567,8 +664,31 @@ def _tool_handler(args: Dict[str, Any], task_id: str = "", **_: Any) -> str:
 # ---------------------------------------------------------------- entry
 
 
+def _probe_overrides_channel() -> None:
+    """register 期轻量探针：确认 ``resolve_task_overrides`` 可调用、连调两次都不炸。
+
+    **不做强断言**：未命中的返回值（None / 空 dict）属核心内部细节，哪一种都不代表
+    通道坏了，真正能验证“原位写回”的哨兵必须握有真实注册记录（见
+    _verify_inplace_writeback，在第一次真实写回时触发）。这里只把“核心模块导不进来/
+    签名变了”这类硬故障提前到注册期显形，失败也只告警不阻断注册。
+    """
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+        probe_key = f"{PLUGIN_ID}:register-probe-never-registered"
+        first = resolve_task_overrides(probe_key)
+        second = resolve_task_overrides(probe_key)
+        logger.debug(
+            "%s: overrides channel probe ok (returns %s / %s)",
+            PLUGIN_ID, type(first).__name__, type(second).__name__,
+        )
+    except Exception as exc:  # noqa: BLE001 - 探针失败不阻断注册（fail-open）
+        logger.warning("%s: overrides channel unusable at register time: %s", PLUGIN_ID, exc)
+
+
 def register(ctx) -> None:
-    _ctx_ref.append(ctx)
+    # N33：整槽替换而非 append —— 热重载后 [0] 必须是**本次** register 的 ctx。
+    _ctx_ref[:] = [ctx]
+    _probe_overrides_channel()
     ctx.register_hook("on_session_start", _make_on_session_start(ctx))
     ctx.register_hook("pre_tool_call", _make_pre_tool_call(ctx))
     ctx.register_hook("pre_llm_call", _make_pre_llm_call(ctx))

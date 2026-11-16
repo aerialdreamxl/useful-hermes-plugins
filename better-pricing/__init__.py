@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sqlite3
@@ -44,7 +45,8 @@ def config_path() -> Optional[Path]:
         pass
     candidates.append(PLUGIN_DIR / "better-pricing.yaml")
     candidates.append(PLUGIN_DIR.parent / "better-pricing.yaml")  # 开发态布局
-    candidates.append(Path.cwd() / "better-pricing.yaml")
+    # 故意不读 Path.cwd()：进程当前目录可以被任意仓库/目录劫持，价目表只认
+    # $HERMES_HOME 与插件目录（找不到就当无价目，绝不拿别人的 yaml 报账）。
     for c in candidates:
         if c.is_file():
             return c
@@ -91,29 +93,46 @@ def _provider_keys(billing_provider: str) -> Tuple[str, ...]:
     return tuple(k for k in out if k)
 
 
+def _list_price(entry: dict, model: str) -> Any:
+    """在 entry["models"] 里查该模型价：先精确、再大小写不敏感；查不到返回 None。"""
+    models = entry.get("models") or {}
+    price = models.get(model)
+    if price is None:
+        price = {str(k).lower(): v for k, v in models.items()}.get((model or "").lower())
+    return price
+
+
 def find_entry(cfg: dict, billing_provider: str, model: str) -> Optional[dict]:
-    """返回 {entry, key, price}（price 可为 None：free 提供商不要求列模型）。
-    提供商键未命中时退一级：模型价目全局唯一 → 也算命中（billing_provider 的
+    """返回 {entry, key, price}；price=None 只出现在 calculates=free 的条目（free 提供商
+    不要求列模型）。有价目条但没列该模型 → 视为未命中返回 None，绝不返回 price=None：
+    上层会把它算成 0 元并计入“有价”，是把无价目静默核销成免费（N26）。也不跨提供商
+    借价（宁可显示“无价目”，错价比 0 元更难发现）。
+    提供商键完全未命中时退一级：模型价目全局唯一 → 也算命中（billing_provider 的
     `custom:标签` 后缀与价目表键经常对不上，模型名是唯一可靠的兜底）。"""
     plist = cfg.get("price_list") or {}
+    matched = False
     for key in _provider_keys(billing_provider):
         entry = plist.get(key)
         if not isinstance(entry, dict):
             continue
-        models = entry.get("models") or {}
-        price = models.get(model)
-        if price is None:
-            price = {str(k).lower(): v for k, v in models.items()}.get((model or "").lower())
+        matched = True
+        price = _list_price(entry, model)
+        if price is None and (entry.get("calculates") or "").lower() != "free":
+            continue  # 有价目但缺这个模型：不猜价，按未命中处理
         return {"entry": entry, "key": key, "price": price}
+    if matched:
+        # 提供商条目存在却没列这个模型：直接无价目。此处若继续走下面的全局兜底，
+        # 就会拿别家（如 token-plan）的价目给本家账单定价——错价比 0 元更难发现。
+        return None
     # 兜底：按模型名全表搜（多提供商重价 → 不猜，视为未命中）
     found = []
     for key, entry in plist.items():
         if not isinstance(entry, dict):
             continue
-        models = entry.get("models") or {}
-        lower = {str(k).lower(): v for k, v in models.items()}
-        if (model or "").lower() in lower:
-            found.append((key, entry, lower[(model or "").lower()]))
+        price = _list_price(entry, model)
+        if price is None:
+            continue  # yaml 里写了模型但价为空（`model:` 无值）不算有价目
+        found.append((key, entry, price))
     if len(found) == 1:
         key, entry, price = found[0]
         return {"entry": entry, "key": key, "price": price}
@@ -125,7 +144,7 @@ def find_entry(cfg: dict, billing_provider: str, model: str) -> Optional[dict]:
 
 def native_cost(entry: dict, price: Any, counts: Dict[str, int]) -> float:
     """token: {input,output,cache[,cache_write]} 元/百万token；
-       calls: 数字 = 每次调用价；free / 缺价: 0。"""
+       calls: 数字 = 每次调用价；free: 0（缺价在上游 find_entry 已按未命中拦截）。"""
     calc = (entry.get("calculates") or "token").lower()
     if calc == "free":
         return 0.0
@@ -256,7 +275,7 @@ def build_report(raw_args: str = "") -> str:
     cfg = load_config()
     if cfg is None:
         return ("better-pricing: 未找到 better-pricing.yaml"
-                "（$BETTER_PRICING_CONFIG → $HERMES_HOME/ → 插件目录 → 当前目录）")
+                "（$BETTER_PRICING_CONFIG → $HERMES_HOME/ → 插件目录）")
     rows = [r for r in fetch_usage(days)
             if show_aux or (r["task"] or "main") == "main"]
     if provider_filter:
@@ -299,7 +318,12 @@ def build_report(raw_args: str = "") -> str:
             mult = float(entry.get("multiply") or 0)
             native = native_cost(entry, price, a)
             # 自有界面：永远按配置币种显示；USD 换算只发生在向 Hermes 报账时
-            if calc == "free":
+            if calc != "free" and price is None:
+                # 双保险（find_entry 已不再返回这种组合）：缺该模型价 = 无价目，
+                # 不许落进 0 元分支被算成“有价”（N26）。
+                unpriced += 1
+                cost_cell = "无价目"
+            elif calc == "free":
                 priced += 1
                 cost_cell = "free"
             elif mult <= 0:
@@ -332,7 +356,13 @@ def build_report(raw_args: str = "") -> str:
 # 回报 Hermes 计费管线（estimate_usage_cost 包装；按 native_report 档位）
 # ---------------------------------------------------------------------------
 
-_INJECT_STATE = {"patched": False, "orig": None}
+_INJECT_STATE: Dict[str, Any] = {
+    "patched": False, "orig": None, "wrapper": None, "sites": (),
+}
+_ATEXIT_STATE = {"registered": False}
+
+# 补丁落在这些模块的 from-import 绑定上（install 与 uninstall 共用同一份清单）
+_REPORT_SITES = ("agent.turn_usage", "agent.insights")
 
 
 def _pricing_from_config(model: str, provider: Optional[str], usage: Any) -> Optional[Any]:
@@ -374,15 +404,54 @@ def _pricing_from_config(model: str, provider: Optional[str], usage: Any) -> Opt
         notes=("better-pricing native_report={} currency={} mult={}".format(mode, currency, mult),))
 
 
+def _bp_orig_of(func: Any) -> Optional[Any]:
+    """wrapper 自报原函数：热重载后本模块被重新 import，靠它认领上一代 wrapper。"""
+    return getattr(func, "__bp_orig__", None)
+
+
+def uninstall_report_hook() -> bool:
+    """把 estimate_usage_cost 及其绑定点的原函数引用放回去；幂等，可反复调用。
+
+    真正的卸载路径是 ``ctx.on_unload(uninstall_report_hook)``（见 register）：核心的
+    VALID_HOOKS 里没有卸载 hook，但 PluginContext.on_unload 是宿主管理的注册项，
+    禁用插件/强制重发现时 ledger 会 dispose 它并调用本函数。
+    atexit 只是进程退出兜底（也覆盖 register 之后才懒装上、却再没人卸载的场景）。"""
+    wrapper, orig = _INJECT_STATE.get("wrapper"), _INJECT_STATE.get("orig")
+    restored = 0
+    if wrapper is not None and orig is not None:
+        try:
+            import agent.usage_pricing as up
+            if getattr(up, "estimate_usage_cost", None) is wrapper:
+                up.estimate_usage_cost = orig      # 还原成同一个函数对象（id 不变）
+                restored += 1
+        except Exception:
+            pass
+        for mod_name in _REPORT_SITES:
+            try:
+                m = __import__(mod_name, fromlist=["estimate_usage_cost"])
+            except Exception:
+                continue
+            if getattr(m, "estimate_usage_cost", None) is wrapper:
+                setattr(m, "estimate_usage_cost", orig)
+                restored += 1
+    _INJECT_STATE.update(patched=False, orig=None, wrapper=None, sites=())
+    if restored:
+        logger.info("better-pricing: report hook removed (%d binding(s) restored)", restored)
+    return restored > 0
+
+
 def install_report_hook() -> bool:
-    """patch usage_pricing.estimate_usage_cost + 顶层 from-import 绑定点。幂等。"""
+    """patch usage_pricing.estimate_usage_cost + 顶层 from-import 绑定点。幂等（含热重载后重装）。"""
     if _INJECT_STATE["patched"]:
         return True
     try:
         import agent.usage_pricing as up
     except Exception:
         return False
-    orig = up.estimate_usage_cost
+    current = up.estimate_usage_cost
+    # 强制重新发现插件会清 sys.modules 再 import 本模块（_clear_plugin_submodules），旧
+    # wrapper 还挂在核心上：认领它记下的原函数，绝不 wrapper 套 wrapper。
+    orig = _bp_orig_of(current) or current
     _INJECT_STATE["orig"] = orig
 
     def wrapper(model_name, usage, *, provider=None, base_url=None, api_key=None, **kw):
@@ -401,15 +470,24 @@ def install_report_hook() -> bool:
             return injected
         return orig(model_name, usage, provider=provider, base_url=base_url, api_key=api_key, **kw)
 
+    setattr(wrapper, "__bp_orig__", orig)       # 供下一代模块认领 / 卸载校验
+    setattr(wrapper, "__bp_owner__", "better-pricing")
     up.estimate_usage_cost = wrapper
-    for mod_name in ("agent.turn_usage", "agent.insights"):
+    sites: List[str] = []
+    for mod_name in _REPORT_SITES:
         try:
             m = __import__(mod_name, fromlist=["estimate_usage_cost"])
-            if getattr(m, "estimate_usage_cost", None) is orig:
-                setattr(m, "estimate_usage_cost", wrapper)
         except Exception:
-            pass
-    _INJECT_STATE["patched"] = True
+            continue
+        cur = getattr(m, "estimate_usage_cost", None)
+        # 原绑定，或上一代 wrapper（热重载残留）→ 都换成这一代，避免多层包装
+        if cur is orig or _bp_orig_of(cur) is not None:
+            setattr(m, "estimate_usage_cost", wrapper)
+            sites.append(mod_name)
+    _INJECT_STATE.update(patched=True, wrapper=wrapper, sites=tuple(sites))
+    if not _ATEXIT_STATE["registered"]:
+        atexit.register(uninstall_report_hook)   # 进程退出兜底还原
+        _ATEXIT_STATE["registered"] = True
     logger.info("better-pricing: report hook installed (native_report=%s)",
                 (load_config() or {}).get("native_report"))
     return True
@@ -466,6 +544,12 @@ def register(ctx) -> None:
         name="pricing-plus", handler=_slash_handler,
         args_hint="[--days N] [--provider KEY] [--aux]",
         description="独立计费报表（同 `hermes pricing-plus`）")
+    # 卸载路径：禁用插件 / 强制重发现时 ledger 会 dispose 这条注册 → 还原 estimate_usage_cost。
+    # （VALID_HOOKS 里没有卸载 hook 名，PluginContext.on_unload 才是真接口。）
+    try:
+        ctx.on_unload(uninstall_report_hook)
+    except Exception:
+        pass
     ok = install_report_hook()
     if not ok:
         try:

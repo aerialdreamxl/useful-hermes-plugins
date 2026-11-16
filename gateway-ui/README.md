@@ -204,7 +204,7 @@ DIY 规范：缺键逐键自动补齐（官方 writer）；**enable-pet 例外�
 | `bus_enabled` | true | events.jsonl 事件流写入 | false=dashboard 事件列表断粮；state.json 照写（托盘灯/桌宠状态不受影响） | 只影响事件流，不影响状态快照 |
 | `degrade_window_s` | 300 | 红灯观察窗秒数 | 越小红灯恢复越快 | 只影响灯色/档位，不影响桌宠 |
 | `verbose_log` | false | 详细日志 | true=GW/WK/PET 三前缀写 debug.log/pet_debug.log（400KB 滚动）；false=零写入 | 排故时开，定位后关；只读旁路无副作用 |
-| `package_index_url` | 清华镜像 | side-env 首装 pip 源 | 已装机器不触发安装，改它无感 | 仅新机器首装生效 |
+| `package_index_url` | 清华镜像 | side-env 首装 pip 源 | 已装机器不触发安装，改它无感 | **只接受 https 或空串**（明文 http 可被中间人换包）；仅新机器首装生效 |
 | `pet.enable-pet` | false | 桌宠总开关 | true=浮窗出现；菜单/设置页改动→官方 writer 落 config（0.25s watcher 仅差异才写） | 手改 config=重启后生效；缺键≠false，绝不补 false 固化 |
 | `pet.slug` | "" | 用哪只宠物 | 空=字母序第一只已安装 petdex | 菜单/设置页"切换宠物"即时生效 |
 | `pet.scale` | 0.7 | 大小 | 0.7→134×145px；合法域 0.1-3.0 | 菜单/设置页"大小"即时生效 |
@@ -217,7 +217,7 @@ DIY 规范：缺键逐键自动补齐（官方 writer）；**enable-pet 例外�
 | `balance.enabled` | false | 余额气泡总开关（余额气泡） | true=左键单击桌宠弹泡；false=入口禁用、宿主 watcher 空转不拉不写 | 修改类默认关（DIY 规范）；需投放目录有适配器才显示数据 |
 | `balance.refresh_s` | 300 | 宿主周期查询间隔 | 60~3600s 钳位；气泡只读缓存，点击绝不直连 API | 越短越新鲜但付费调用越频；Token Plan 源 SLOW 后台慢拉不阻塞快源 |
 | `balance.token_plan_edition` | individual | Token Plan 查询版本 | individual=个人版月额度；team=团队版席位额度 | 所选版本无生效订阅时气泡报错，不回落另一版 |
-| `balance.providers_dir` | ""（回落默认） | 适配器投放目录 | 空=`<home>/balance-providers`；显式路径优先 | 设置页"更改…"弹文件夹选择；密钥只走环境变量，配置面永不过明文 |
+| `balance.providers_dir` | ""（回落默认） | 适配器投放目录 | 空=`<home>/balance-providers`；显式路径优先；**必须是 HERMES_HOME 之下的绝对路径**（realpath 后严格在根内，`..`/同级前缀/跨盘一律拒）——这个目录里的 .py 会被宿主逐行执行，等于代码执行面 | 设置页"更改…"弹文件夹选择；密钥只走环境变量，配置面永不过明文 |
 
 注：`bus_enabled=false` 时 state.json 与 events.jsonl 都停写（消费者断供），
 托盘灯 8s 后转灰——这是预期行为，不是 bug。

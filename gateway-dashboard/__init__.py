@@ -6,6 +6,10 @@
 递归防线：spawn 时注入 HERMES_GATEWAY_DASHBOARD_CHILD=1；子进程再跑 register 见标即
 return（web_server_dashboard._plugin_host 会惰性 discover_and_load，实查会跑到这里）。
 宿主半：dashboard/plugin_api.py 供 /api/plugins/gateway-dashboard/* 挂载接缝 import。
+
+状态文件单写者铁律：本插件只写 <HERMES_HOME>/cache/gateway-dashboard/dashboard_state.json，
+绝不与 gateway-ui 共写 <HERMES_HOME>/cache/gateway-ui/state.json —— 那是 gateway-ui 宿主
+bus.py 的单写者文件（§5 姊妹契约），dashboard 只消费不写（F22）。
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,7 +35,9 @@ _DEFAULTS = {"dashboard_port": 9120, "host": "127.0.0.1", "skip_build": True,
              "isolated": True, "open_profile": "", "auto_restart": False}
 _HANDSHAKE_TIMEOUT_S = 30.0
 _HANDSHAKE_INTERVAL_S = 0.5
-_STATE_PATH_HINT = ("cache", "gateway-fluent-gui")
+# 自己的总线命名空间：<HERMES_HOME>/cache/<_PLUGIN_ID>/（不再硬编码已退役目录名）。
+_BUS_ROOT = "cache"
+_STATE_FILENAME = "dashboard_state.json"
 
 _kicked = threading.Event()  # 进程内 once-flag（懒起只踢一次）
 
@@ -44,14 +51,31 @@ def _s(ctx, key):
         return _DEFAULTS[key]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """3xx 不跟随：响应本身已证明服务器在，跟丢反而误判（F23）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 — urllib 回调签名
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _already_serving(host: str, port: int) -> bool:
-    """目标端口已有真 dashboard（HTML 含 token 名）→ 复用不双起。只判存在性。"""
+    """端口上已有 HTTP 服务 → 复用不双起。只判“有没有 HTTP 响应”，不判内容。
+
+    鉴权门开启时根路径回 401/403/302，旧实现要求 HTML 含 __HERMES_SESSION_TOKEN__
+    才认，于是探针恒假：每个 gateway 事件都踢一个注定失败的子进程（F23）。
+    现在任何 HTTP 状态码（含 401/403/302）都算已在服务；只有连接拒绝/超时/非 HTTP
+    应答（URLError 一族）才算没起。
+    """
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=2.0) as resp:
-            body = resp.read(65536).decode("utf-8", "replace")
-        return "__HERMES_SESSION_TOKEN__" in body
+        with _NO_REDIRECT_OPENER.open(f"http://{host}:{port}/", timeout=2.0):
+            return True
+    except urllib.error.HTTPError:
+        return True  # 401/403/302…：服务器在，只是拒了匿名访问
     except Exception:
-        return False
+        return False  # 连接拒绝/超时/非 HTTP：真的没起
 
 
 def _dashboard_root() -> Path | None:
@@ -115,23 +139,32 @@ def _spawn(cmd: list[str], root: Path) -> subprocess.Popen:
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _dashboard_state_path() -> Path:
+    """本插件自己的状态文件：<HERMES_HOME>/cache/<_PLUGIN_ID>/dashboard_state.json。"""
+    from hermes_cli.config import get_hermes_home
+    return Path(get_hermes_home()) / _BUS_ROOT / _PLUGIN_ID / _STATE_FILENAME
+
+
 def _write_dashboard_url(host: str, port: int) -> None:
-    """就绪后回写总线 state.json.dashboard_url（合并写；gateway-fluent-gui 未装则静默跳过）。"""
+    """就绪后回写自己的 dashboard_state.json（单写者；绝不碰 gateway-ui 的 state.json）。"""
     try:
-        from hermes_cli.config import get_hermes_home
-        state = Path(get_hermes_home()).joinpath(*_STATE_PATH_HINT) / "state.json"
-        if not state.parent.exists():
-            return
+        state = _dashboard_state_path()
+        state.parent.mkdir(parents=True, exist_ok=True)
         data = {}
         if state.exists():
-            data = json.loads(state.read_text(encoding="utf-8") or "{}")
+            try:
+                data = json.loads(state.read_text(encoding="utf-8") or "{}")
+            except (ValueError, OSError):
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
         data["dashboard_url"] = f"http://{host}:{port}/"
         data["updated_ts"] = time.time()
-        tmp = state.with_suffix(".tmp")
+        tmp = state.with_name(state.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, state)
     except Exception as exc:
-        logger.debug("gateway-dashboard: dashboard_url 回写跳过: %s", exc)
+        logger.debug("gateway-dashboard: 状态回写跳过: %s", exc)
 
 
 def _wait_ready(host: str, port: int) -> bool:

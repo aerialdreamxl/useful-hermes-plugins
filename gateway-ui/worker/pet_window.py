@@ -81,6 +81,9 @@ PAIR_DECAY_S = 300.0     # R26-5b（评审 P1-3）：线段对计数衰减窗—
 # 掷不中就安静站着（下次确认再掷）。与 R26-5 闸门叠加：闸门管"能不能"，
 # 概率管"想不想"。仅 vertical_roam=true 生效；false 保持旧行为必爬。
 CONTACT_CLIMB_CHANCE = 0.4
+# N15：线段找回容差——跟随/缩放重键后旧 seg 与新 seg 可能只差浮点 1ulp，
+# 元组精确相等判否会让 cur_owner 被清空（跟随断链）。0.5px 内视作同一线段。
+SEG_MATCH_EPS = 0.5
 # ---- 余额气泡（BalanceBubble 单击门槛，spike 实测定值）----
 CLICK_MAX_PX = 6       # press→release 位移 manhattanLength ≤6 判单击，>6 拖拽
 
@@ -367,16 +370,36 @@ class PetWindow(QWidget):
         self.ground_segs = segs
         self.seg_owner = owners
         if self.cur_seg is not None:
-            if self.cur_seg in owners:
-                # 值相同但对象换新：重绑到列表内实例（is 语义维持）
-                for sg in segs:
-                    if sg == self.cur_seg:
-                        self.cur_seg = sg
-                        break
-                self.cur_owner = owners.get(self.cur_seg)
+            # N15：先精确按值查（值相同但对象换新：重绑到列表内实例，is 语义
+            # 维持）；未命中再按 SEG_MATCH_EPS 容差找回——跟随/缩放重键后的
+            # 浮点 1ulp 差异会让元组精确相等判否，旧版到此清 owner = 跟随
+            # 断链。都失败才走原有落空分支。
+            seg = self._match_seg(self.cur_seg, segs)
+            if seg is not None:
+                self.cur_seg = seg
+                self.cur_owner = owners.get(seg)
             else:
                 self.cur_owner = None
         return segs
+
+    def _match_seg(self, seg, segs):
+        """N15：在重建后的线段列表里找回 seg：先精确相等，再取容差
+        SEG_MATCH_EPS 内最接近的一条（三项坐标差之和最小）；都不中返回 None
+        （线段真消失，调用方走落空分支）。"""
+        for sg in segs:
+            if sg == seg:
+                return sg
+        best, best_d = None, None
+        for sg in segs:
+            if abs(sg[0] - seg[0]) > SEG_MATCH_EPS \
+                    or abs(sg[1] - seg[1]) > SEG_MATCH_EPS \
+                    or abs(sg[2] - seg[2]) > SEG_MATCH_EPS:
+                continue
+            d = (abs(sg[0] - seg[0]) + abs(sg[1] - seg[1])
+                 + abs(sg[2] - seg[2]))
+            if best_d is None or d < best_d:
+                best, best_d = sg, d
+        return best
 
     def _bind_seg(self, seg):
         """R26-2：绑定站立线段并同步归属（站定/改绑/落位/攀爬完成统一走这里）。"""
@@ -410,15 +433,21 @@ class PetWindow(QWidget):
         if self._owner_rect is None:
             self._owner_rect = lr
             return False
-        dx = lr[0] - self._owner_rect[0]
-        dy = lr[1] - self._owner_rect[1]
-        dw = (lr[2] - lr[0]) - (self._owner_rect[2] - self._owner_rect[0])
+        old = self._owner_rect
+        dx = lr[0] - old[0]
+        dy = lr[1] - old[1]
+        dw = (lr[2] - lr[0]) - (old[2] - old[0])
+        # N14：高度变化必须并入零判定——用户只拖底边/顶边（纯垂直缩放）时
+        # dx/dy/dw 全零，旧版直接 return，站窗底沿的宠物原地不跟随。
+        dh = (lr[3] - lr[1]) - (old[3] - old[1])
         self._owner_rect = lr
-        if abs(dx) < 0.5 and abs(dy) < 0.5 and abs(dw) < 0.5:
+        if abs(dx) < 0.5 and abs(dy) < 0.5 and abs(dw) < 0.5 and abs(dh) < 0.5:
             return False
-        # 线段随窗口平移/伸缩：底沿 y=矩形 bottom，顶沿 y=矩形 top
+        # 线段随窗口平移/伸缩：底沿 y=矩形 bottom，顶沿 y=矩形 top。
+        # N14：底/顶沿归属按**旧基线**判——纯垂直缩放（dy=0、dh≠0）时若拿
+        # 新矩形反推旧底沿，压低/抬高的底沿会被误判成顶沿，宠物跳到顶沿。
         seg = self.cur_seg
-        on_bottom = abs(seg[1] - (self._owner_rect[3] - dy)) <= GROUND_STAND_EPS + 1
+        on_bottom = abs(seg[1] - old[3]) <= GROUND_STAND_EPS + 1
         new_y = lr[3] if on_bottom else lr[1]
         new_x1 = seg[0] + dx
         new_x2 = seg[2] + dx + dw
@@ -663,7 +692,25 @@ class PetWindow(QWidget):
             return False
         if random.random() >= ADJACENT_CHANCE:
             return False
-        dir_hint = 1 if self.walk_target >= float(self.x()) else -1
+        # N12：方向按行进方向取，不再看 walk_target 与 x 的关系——抵达时
+        # move 已把 x 吸附到 int(walk_target)，`int(walk_target) <= walk_target`
+        # 永真 → 旧版 dir_hint 恒 +1 → 左邻线段永远跳不到。walk 相位 dir 恒
+        # ±1；dir==0（异常路径兜底）才用 walk_target 与线段中点关系判向。
+        dir_hint = 1 if self.dir > 0 else -1
+        if self.dir == 0:
+            mid_x = (self.cur_seg[0] + self.cur_seg[2]) / 2.0
+            dir_hint = 1 if self.walk_target >= mid_x else -1
+        # N13：端点前置——只允许从行进方向端点起跳。_stroll_target 给的是
+        # 段内随机点，旧版在段中部抵达同样掷跳 = 对角滑移跳到邻段，远超
+        # "漫步走到端点后跳"的设计语义。可行域 [x1, x2-pet_w]（BUG3 纪律），
+        # 端点抵达后 x 与可行端点相差 ≤1px（move 的 int 吸附），用
+        # 2×ARRIVE_EPS 兜住；不满足就回去走既有 pause+确认计时链路。
+        hi_x = max(self.cur_seg[0], self.cur_seg[2] - float(self.width()))
+        end_x = hi_x if dir_hint > 0 else self.cur_seg[0]
+        if abs(float(self.x()) - end_x) > ARRIVE_EPS * 2:
+            self._plog(f"adjacent hop skipped: mid-seg stop "
+                       f"(x={self.x()} end={end_x:.0f} dir={dir_hint})")
+            return False
         found = find_adjacent_segment(self.ground_segs, self.cur_seg,
                                       float(self.width()),
                                       float(self.height()), dir_hint)

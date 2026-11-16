@@ -17,6 +17,7 @@ consumer 每拍可再调 write_view()（内容无变不空写）。
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -36,9 +37,29 @@ ID_KEEP = 64                # 幂等：最近 64 个已处理请求 id
 ERROR_MAX = 120             # error 串截断（view 渲染再截 24，日志留长一点）
 LOG_MAX_BYTES = 400_000
 LOG_KEEP_LINES = 2000
+WRITE_RETRIES = 4           # 原子写 Windows 共享冲突重试（读侧瞬时打开目标文件）
 
 _SK_RE = re.compile(r"sk-[A-Za-z0-9_-]{6,}")
 _HERE = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------- 子进程环境 ----
+# F26：binding 子进程不再继承全量 os.environ。providers_dir 里的 *.py 是"可投放
+# 代码"（作者/任何能写该目录的人写的都能跑），全量继承=把网关密钥、云凭证、代理
+# 令牌一并交出去。只给进程启动/编码必需项 + Hermes 自有命名空间。
+_ENV_KEEP = (
+    "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "COMSPEC", "PATHEXT",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    "PYTHONUTF8", "PYTHONIOENCODING",
+)
+# 出厂 binding 实测需要的（读 balance-providers/*.py 逐条核对，别删）：
+#   HERMES_HOME            deepseek.py 定位 <home>/.env（凭证后缀来源）
+#   HERMES_QIANWEN_PATH    等 HERMES_<CLI>_PATH 覆盖 CLI 路径（bailian_*.py）
+#   HERMES_BALANCE_*       token_plan_edition 等显式注入（extra_env，见 _fetch_one）
+#   DEEPSEEK_API_KEY       deepseek.py 进程环境优先的凭证（缺则回落 <home>/.env）
+_ENV_KEEP_KEYS = ("DEEPSEEK_API_KEY",)
+_ENV_KEEP_PREFIX = "HERMES_"
+DRAIN_TIMEOUT_S = 2.0       # 超时杀树后的管道收尾上限（不与 sleep 型测试的 <5s 冲突）
 
 # runner 注入：runpy 以 run_name='_binding_' 执行 binding——不触发其
 # if __name__=="__main__" 分支（避免双打印），直接取模块级 fetch() 结果。
@@ -133,6 +154,32 @@ def discover_providers(directory) -> list:
 
 
 # ---------------------------------------------------------------- 执行 ----
+def _child_env(extra_env=None) -> dict:
+    """binding 子进程环境（F26 白名单，见模块顶部 _ENV_KEEP 注释）。
+    extra_env 是宿主显式注入的（HERMES_BALANCE_TOKEN_PLAN_EDITION 等），始终覆盖。"""
+    env = {k: v for k, v in os.environ.items()
+           if k in _ENV_KEEP or k in _ENV_KEEP_KEYS
+           or k.startswith(_ENV_KEEP_PREFIX)}
+    env["PYTHONIOENCODING"] = "utf-8"
+    if isinstance(extra_env, dict):
+        env.update({str(k): str(v) for k, v in extra_env.items()})
+    return env
+
+
+def _kill_tree(pid) -> None:
+    """N23：超时后杀整棵进程树。subprocess 的 timeout 只 kill 直系子进程；binding
+    经 shell 包装 CLI 时（bailian_* → cmd /c qianwen → node），孙进程会脱管泄漏。
+    Windows 用 taskkill /F /T（静默、5s 上限）；其它平台交给 Popen.kill() 兜底。"""
+    try:
+        if os.name != "nt" or not pid:
+            return
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
+    except Exception:
+        pass
+
+
 def run_provider(path, timeout=None, python_exe=None, slow=False, log=None, **kwargs) -> dict:
     """宿主 python -I -X utf8=1 子进程隔离跑 binding。
     超时钳：普通 10s / SLOW 45s（显式 timeout 参数可覆盖，测试用）。
@@ -142,27 +189,38 @@ def run_provider(path, timeout=None, python_exe=None, slow=False, log=None, **kw
                   else (TIMEOUT_SLOW_S if slow else TIMEOUT_FAST_S))
     py = str(python_exe or sys.executable)
     cmd = [py, "-I", "-X", "utf8=1", "-c", _RUNNER_CODE, str(path)]
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
     # 余额气泡修订：binding 自定义配置经环境变量注入（宿主 get_cfg 读 config，
     # binding 子进程只读 env，不碰 config.yaml——worker/binding 零配置纪律）。
-    extra_env = kwargs.get("extra_env")
-    if isinstance(extra_env, dict):
-        env.update({str(k): str(v) for k, v in extra_env.items()})
+    env = _child_env(kwargs.get("extra_env"))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
-                              timeout=limit, env=env)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timeout {limit:g}s"}
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=env)
     except Exception as exc:
         return {"ok": False, "error": _short(f"spawn failed: {exc}")}
-    if log is not None and (proc.stderr or "").strip():
+    try:
+        out, err = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        # N23：先杀整棵树（Windows taskkill /T），再收管道；收尾限时不拖慢调用方。
+        _kill_tree(proc.pid)
+        with contextlib.suppress(Exception):
+            proc.kill()
         try:
-            log(f"{Path(path).name} stderr: {_short(proc.stderr.strip(), 300)}")
+            proc.communicate(timeout=DRAIN_TIMEOUT_S)
+        except Exception:
+            with contextlib.suppress(Exception):
+                for pipe in (proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
+        return {"ok": False, "error": f"timeout {limit:g}s"}
+    out = out or ""
+    err = err or ""
+    rc = proc.returncode
+    if log is not None and err.strip():
+        try:
+            log(f"{Path(path).name} stderr: {_short(err.strip(), 300)}")
         except Exception:
             pass
-    out = proc.stdout or ""
     result = None
     for line in reversed(out.splitlines()):
         line = line.strip()
@@ -177,15 +235,15 @@ def run_provider(path, timeout=None, python_exe=None, slow=False, log=None, **kw
             break
     if result is None:
         # 崩溃取证：优先取 stderr 最后的异常行（含错误消息），而非尾部文件路径堆栈。
-        err_lines = [ln.strip() for ln in (proc.stderr or "").splitlines() if ln.strip()]
+        err_lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
         exc_line = ""
         for ln in reversed(err_lines):
             if "Error" in ln or "Exception" in ln:
                 exc_line = ln
                 break
-        detail = exc_line or (proc.stderr or out or "").strip()[-200:]
+        detail = exc_line or (err or out or "").strip()[-200:]
         return {"ok": False,
-                "error": _short(f"binding failed (rc={proc.returncode}): {detail}")}
+                "error": _short(f"binding failed (rc={rc}): {detail}")}
     if not isinstance(result.get("ok"), bool):
         result["ok"] = False
     result["error"] = _short(result.get("error") or "")
@@ -306,11 +364,34 @@ def normalize(binding_result, meta, now=None) -> dict:
 
 
 # ---------------------------------------------------------------- 原子写 ----
+def _tmp_sibling(path: Path) -> Path:
+    """同目录唯一临时名（pid + 线程 id）：write_view 会被宿主消费线程与 watcher
+    线程并发调用（N18），固定 ".tmp" 名会互相踩（一方 rename 走另一方正在写的
+    文件 → FileNotFoundError 或半文件）。"""
+    return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+
+
 def _write_json_atomic(path: Path, obj) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    """tmp+rename 原子写（临时名带 pid+线程 id，N18）。
+    Windows 上若目标文件正被读侧打开（Python open 不带 FILE_SHARE_DELETE），
+    MoveFileEx 报 WinError 5——读侧只开几微秒，短退避重试即可，别丢整拍；
+    重试用尽仍失败才抛，失败路径必删 tmp（绝不攒 .tmp 垃圾）。"""
+    tmp = _tmp_sibling(path)
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    try:
+        for attempt in range(WRITE_RETRIES):
+            try:
+                tmp.write_text(data, encoding="utf-8")
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= WRITE_RETRIES:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
+    finally:
+        with contextlib.suppress(Exception):
+            if tmp.exists():
+                tmp.unlink()
 
 
 # ---------------------------------------------------------------- watcher ----
@@ -356,6 +437,11 @@ class BalanceWatcher:
         self._req_done = []         # 幂等：最近 64 个已处理请求 id
         self._view_sig = None
         self._lock = threading.Lock()
+        # N18：write_view 的 sig 判定+写盘+更新 sig 必须独占——本方法同时被宿主
+        # 消费线程（__init__._write_view）和 watcher 线程调用。独立锁，**绝不在
+        # _lock 内取它、也不在它内取 _lock 之外的东西**（_build_view 会取 _lock，
+        # 锁序固定 view_lock -> lock，反向嵌套=死锁）。
+        self._view_lock = threading.Lock()
         self._last_cfg = {"enabled": False, "refresh_s": 300, "providers_dir": ""}
 
     # ---------------- 配置/日志 ----------------
@@ -393,7 +479,7 @@ class BalanceWatcher:
                 fh.write(f"{time.strftime('%H:%M:%S')} BAL {msg}\n")
             if f.stat().st_size > LOG_MAX_BYTES:
                 keep = f.read_text(encoding="utf-8").splitlines()[-LOG_KEEP_LINES:]
-                tmp = f.with_name("balance_debug.log.tmp")
+                tmp = _tmp_sibling(f)
                 tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
                 os.replace(tmp, f)
         except Exception:
@@ -463,28 +549,32 @@ class BalanceWatcher:
 
     def write_view(self, metas=None, cfg=None) -> bool:
         """写 balance_view.json（原子 tmp+rename）；内容无变不空写。
-        consumer 同拍接线入口：metas/cfg 缺省时自查。返回是否真落盘。"""
-        cfg = cfg or self._cfg()
-        if not cfg["enabled"]:
-            return False
-        if metas is None:
-            d = self._resolve_dir(cfg)
-            metas = self._discover(d) if d is not None else []
-        if not metas:
-            return False
-        view = self._build_view(metas, cfg)
-        sig = json.dumps(view, ensure_ascii=False, sort_keys=True)
-        if sig == self._view_sig:
-            return False
-        self._view_sig = sig
-        view["ts"] = round(self._now(), 3)
-        try:
-            self.bus_dir.mkdir(parents=True, exist_ok=True)
-            _write_json_atomic(self.view_path, view)
-            return True
-        except Exception as exc:
-            self._log(f"view write failed: {_short(exc)}")
-            return False
+        consumer 同拍接线入口：metas/cfg 缺省时自查。返回是否真落盘。
+        N18：本方法被消费线程与 watcher 线程并发调用——sig 判定、写盘、更新 sig
+        必须在同一把 _view_lock 内完成，否则两线程交替写同一路径 + 同一个 .tmp，
+        读侧可能撞上半文件，或旧签名把新内容挡掉。"""
+        with self._view_lock:
+            cfg = cfg or self._cfg()
+            if not cfg["enabled"]:
+                return False
+            if metas is None:
+                d = self._resolve_dir(cfg)
+                metas = self._discover(d) if d is not None else []
+            if not metas:
+                return False
+            view = self._build_view(metas, cfg)
+            sig = json.dumps(view, ensure_ascii=False, sort_keys=True)
+            if sig == self._view_sig:
+                return False
+            self._view_sig = sig
+            view["ts"] = round(self._now(), 3)
+            try:
+                self.bus_dir.mkdir(parents=True, exist_ok=True)
+                _write_json_atomic(self.view_path, view)
+                return True
+            except Exception as exc:
+                self._log(f"view write failed: {_short(exc)}")
+                return False
 
     # ---------------- 手动刷新请求 ----------------
     def _poll_req(self, metas, state) -> None:
@@ -573,7 +663,8 @@ class BalanceWatcher:
                                 del self._entries[gone]
                                 self._last_fetch.pop(gone, None)
                     next_slow = {k: v for k, v in next_slow.items() if k in ids}
-                    self._view_sig = None  # provider 集合变了，view 必须重写
+                    with self._view_lock:      # N18：sig 归零也要与 write_view 同锁
+                        self._view_sig = None  # provider 集合变了，view 必须重写
                 now = self._now()
                 refresh = float(cfg["refresh_s"])
                 # 快源：每周期都拉（新 provider 立即拉）

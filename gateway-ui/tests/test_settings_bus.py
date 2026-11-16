@@ -5,6 +5,7 @@
 - _settings_watcher 集成：req→官方 writer(fake ctx)→ack；幂等；非法拒写。
 只用 scratch 总线，绝不碰真实总线/config。"""
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -174,8 +175,14 @@ ck("balance.refresh_s in-range honored", ok and v == 120)
 # --- providers_dir 绝对路径 / 不含 .. / 允许空 ---
 ok, k, v, e = cfg.validate_request({"key": "balance.providers_dir", "value": ""})
 ck("balance.providers_dir empty ok", ok and v == "")
+# F26 收窄：目录里的 *.py 会被宿主执行 → 只许 HERMES_HOME 之下（旧用例的
+# "任意绝对路径都放行"是修复前的契约，已作废）
+HOME_DIR = str(Path(os.environ["HERMES_HOME"]) / "balance-providers")
+ok, k, v, e = cfg.validate_request({"key": "balance.providers_dir", "value": HOME_DIR})
+ck("balance.providers_dir under HERMES_HOME ok", ok and v == HOME_DIR)
 ok, k, v, e = cfg.validate_request({"key": "balance.providers_dir", "value": "D:/custom/balance"})
-ck("balance.providers_dir absolute ok", ok and v == "D:/custom/balance")
+ck("balance.providers_dir outside HERMES_HOME rejected",
+   ok is False and "HERMES_HOME" in e)
 ok, k, v, e = cfg.validate_request({"key": "balance.providers_dir", "value": "relative/path"})
 ck("balance.providers_dir relative rejected", ok is False and "absolute" in e)
 ok, k, v, e = cfg.validate_request({"key": "balance.providers_dir", "value": "D:/a/../b"})

@@ -1,4 +1,4 @@
-# web-bingsearch — Bing HTML 直采搜索后端（v1.3.1）
+# web-bingsearch — Bing HTML 直采搜索后端（v1.4）
 
 把 **Microsoft Bing 的公开搜索结果页**（`cn.bing.com/search`，纯 HTML）直接转化为 Hermes 的原生搜索后端：无 API Key、无第三方聚合、零账号——发请求拿结果，纯白嫖路线。
 
@@ -11,7 +11,8 @@
 - **v1.0**（2026-08-31）：RSS 通道 + 三档截词阶梯。RSS 蜜罐静默降级（垃圾长得像真结果），已弃。
 - **v1.2**（2026-10-02）：纯 HTML 通道，不截词。源码随开发目录删除丢失，架构从记录还原。
 - **v1.3**（2026-11-12）：还原 v1.2 架构 + 三目标升级（客户端选型/伪装层/跨变体解析器）+ 子进程隔离 + settings 开关。v1.0 的 RSS 函数全部保留在源码但不接线。
-- **v1.3.1**（2026-11-12 晚，本版）：质量实测驱动的蜜罐回退大修——CJK 边界分词+品牌型号合并（RTX 5090→RTX5090）、纯中文长句前3字兜底候选、高置信度垃圾判定器（标识符全灭/覆盖率<1/3）、选词逆长度评分。回退默认改为开。8 查询出厂实测 48/68 相关、6/8 真结果（v1.3 默认仅 12/70）。
+- **v1.3.1**（2026-11-12 晚）：质量实测驱动的蜜罐回退大修——CJK 边界分词+品牌型号合并（RTX 5090→RTX5090）、纯中文长句前3字兜底候选、高置信度垃圾判定器（标识符全灭/覆盖率<1/3）、选词逆长度评分。回退默认改为开。8 查询出厂实测 48/68 相关、6/8 真结果（v1.3 默认仅 12/70）。
+- **v1.4**（2026-11-16）：安全与健壮性收口——extract 通道也进子进程隔离（原先只有 search 隔离，一个卡死的 URL 能冻住网关）、extract 入口加 scheme/私网校验（SSRF 闸）、零命中从"静默成功空表"改为 `success:false`（可用 `allow_empty` 回退）、显式 `0` 超时不再被 `or default` 吞掉、结果缓存读改写同锁、容量闸改 while 收敛。
 
 ## 安装与启用（依赖走 Hermes PM 新格式）
 
@@ -49,10 +50,15 @@
 | `cache_ttl_secs` | 300 | 缓存有效期（秒） | — | 仅 result_cache 开时生效 |
 | `search_timeout_secs` | 45 | 子进程墙钟上限（含退避重试） | 冷连接 5s+退避最坏 ~30s | 太小会误杀慢查询；超时 terminate→kill 并报错 |
 | `honeypot_truncation_fallback` | **true**（v1.3.1 起） | 判垃圾时降档：截3词→最值钱单词→纯中文长句前3字 | 三轮实测：关=12/70 相关，开=53/78；蜜罐不止打长查询，3-4词也给首词homepage垃圾 | 开了长查询质量稳，代价是垃圾查询多几秒+查询语义被削；显式关=不截词原教旨，长查询可能拿泛泛结果 |
+| `extract_timeout_secs` | 30 | extract 每个 URL 的墙钟上限（秒） | 子进程冷启动 ≈2.2s，30s 足够 | 手写键（未进 config_schema，面板不显示）：`plugins.entries.web-bing-search.settings.extract_timeout_secs` |
+| `allow_empty` | **false** | 解析出 0 条时的语义 | v1.3 静默返回 `success:true` + 空表，模型以为"网上没有" | 手写键：默认改为 `success:false` + `error:"no results parsed"`，让上游知道是解析/封禁失败而不是真没结果；显式 true 恢复旧行为 |
 
 ## extract 说明
 
 按 URL 抓原始 HTML 直接回 `raw_content`（伪装版：桌面指纹+伪装头+Bing Referer），不做正文解析。模型通常能自己啃 HTML，但 token 消耗比正经阅读器后端大。单个 URL 失败只标记该项 `error`，不整批失败。**返回纯列表**（包 success/data 外壳会炸掉 web_extract 消费端）。
+
+- **每个 URL 一个一次性子进程**（受 `subprocess_isolation` 管）：primp 持 GIL 卡住时父进程能硬超时击杀，一次慢 URL 不会冻住网关。代价是每 URL 多一次 python 冷启动（≈2.2s），批量的延迟随之线性上升。
+- **入口 URL 校验（SSRF 闸）**：只放行 `http/https`；host 取 `urlsplit().hostname`（挡 `https://evil@10.0.0.1/` 这类 userinfo 花招），loopback / 私网 / link-local / 保留段 / `localhost` 一律拒绝，只回该项 `error`、不起进程。确实要抓内网时设 `BING_ALLOW_PRIVATE_FETCH=1`。注意 primp 默认跟随 30x，重定向到内网仍会被跟随——这是本闸的已知边界。
 
 ## 合法合规提示
 

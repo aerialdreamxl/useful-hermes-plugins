@@ -143,7 +143,18 @@ def _approval_key() -> str:
 
 def _cli_ref():
     try:
-        return getattr(getattr(_ctx_ref[0], "_manager", None), "_cli_ref", None) if _ctx_ref else None
+        if _ctx_ref:
+            ref = getattr(getattr(_ctx_ref[0], "_manager", None), "_cli_ref", None)
+            if ref is not None:
+                return ref
+    except Exception:  # noqa: BLE001
+        pass
+    # The stored ctx can be a pre-reload one whose manager was torn down (its
+    # _cli_ref comes back None or the attribute walk raises): ask the live
+    # plugin manager once before giving up.
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        return getattr(get_plugin_manager(), "_cli_ref", None)
     except Exception:  # noqa: BLE001
         return None
 
@@ -446,9 +457,11 @@ def _make_hold_command() -> Callable[[str], str]:
                 return "\u26a0 could not resolve the session; pass /hold off <session_key>."
             _freeze.PARKS.release(key)  # wake a parked thread; it drains on the gone entry
             _SNAPSTORE.discard(key)
-            if _state.pop(key, None):
-                _persist_locked()
-                return f"\u25cf hold disarmed for {key}"
+            with _lock:  # pop+persist as one critical section (park reads _state too)
+                _load()
+                if _state.pop(key, None):
+                    _persist_locked()
+                    return f"\u25cf hold disarmed for {key}"
             return "\u25cf no active hold to disarm."
         if arg.lower() == "status" or arg == "":
             key, kind = _resolve_key()
@@ -461,10 +474,12 @@ def _make_hold_command() -> Callable[[str], str]:
                 return _status_line(key)
             if not key:
                 return "\u26a0 could not resolve the current session; pass /hold <session_key>."
-            e = _state.setdefault(key, {})
-            e.pop("resume_note", None)  # a fresh arm starts clean; don't strand a stale continuation
-            e.update(phase="armed", armed_at=time.time(), armed_kind=kind, mode="park")
-            _persist_locked()
+            with _lock:  # arm atomically: park middleware reads/writes _state too
+                _load()
+                e = _state.setdefault(key, {})
+                e.pop("resume_note", None)  # a fresh arm starts clean; don't strand a stale continuation
+                e.update(phase="armed", armed_at=time.time(), armed_kind=kind, mode="park")
+                _persist_locked()
             return (f"\u23f8 Hold armed on {key}. The session pauses at the next API call "
                     "— the model never learns a pause happened. Release later with /unhold "
                     "(works even after a restart).")
@@ -545,11 +560,16 @@ def _make_unhold_command() -> Callable[[str], str]:
 # ------------------------------------------------------------------ register
 
 def register(ctx) -> None:
-    _ctx_ref.append(ctx)
+    # In-place replace, never append: a hot reload must repoint the ONE slot,
+    # otherwise _cli_ref()/_find_agent() keep reading the first, now-dead ctx.
+    _ctx_ref[:] = [ctx]
     ctx.register_hook("pre_tool_call", _make_pre_tool_call())
     ctx.register_hook("pre_llm_call", _make_pre_llm_call())
     ctx.register_hook("post_api_request", _make_post_api_request())
     _freeze.set_agent_finder(_find_agent)
+    # load()-time TTL housekeeping for frozen/: expired orphans (a snapshot
+    # whose session never came back) are reaped here, throttled per process.
+    _SNAPSTORE.sweep()
     ctx.register_middleware(
         "llm_execution",
         _freeze.make_park_middleware(_state, _lock, _SNAPSTORE, _park_persist,

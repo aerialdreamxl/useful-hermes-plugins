@@ -133,15 +133,42 @@ class _ModelSparseIndex:
         self._append(mem_id, list(pairs))
 
     def remove(self, mem_id: str) -> bool:
+        """Swap-remove: move the last row into the hole, then pop the tail.
+
+        Clearing only the postings left a tombstone — ``ids``/``_row_terms`` kept growing
+        for the whole process, and a long-lived provider that replaces entries (every
+        ``append`` of an existing id removes first) slowly leaked rows no id could reach.
+        Same shape as ``_VectorMatrix.remove``; the extra work here is that postings are
+        keyed by *row*, so every term of the moved row must be re-keyed from ``last`` to
+        ``row`` — forgetting that is how a search starts returning the wrong entry.
+        """
         row = self.id_row.pop(mem_id, None)
         if row is None:
             return False
+        last = len(self.ids) - 1
         for term in self._row_terms[row]:
             bucket = self.postings.get(term)
             if bucket is not None:
                 bucket.pop(row, None)
                 if not bucket:
                     del self.postings[term]
+        if row != last:
+            moved_id = self.ids[last]
+            moved_terms = self._row_terms[last]
+            self.ids[row] = moved_id
+            self._row_terms[row] = moved_terms
+            self.id_row[moved_id] = row
+            for term in moved_terms:
+                bucket = self.postings.get(term)
+                if bucket is None:
+                    continue
+                value = bucket.pop(last, None)
+                if value is not None:
+                    bucket[row] = value
+                if not bucket:
+                    del self.postings[term]
+        self.ids.pop()
+        self._row_terms.pop()
         return True
 
     def search(self, query: Sequence[Tuple[int, float]], topk: int) -> Dict[int, float]:
@@ -1054,7 +1081,16 @@ class MinimemProvider(MemoryProvider):
 
         Entries are matched by exact text regardless of origin: if the same sentence is
         already stored (from either side), a second copy would only duplicate recall output.
+
+        Non-primary contexts (``agent_context`` = "cron"/"subagent"/"flush") must not run
+        this: the CLI builds a throwaway provider with ``agent_context="cron"``, and a plain
+        ``hermes-minimem stats`` (a read-only command) would otherwise embed every missing
+        MEMORY.md/USER.md entry and write rows into SQLite. Hermes' own contract for
+        providers is the same — skip writes for non-primary contexts; the primary gateway
+        provider owns the reconcile.
         """
+        if self._agent_context != "primary":
+            return
         if not self._store or not self._settings or not self._hermes_home:
             return
         candidates: List[tuple[str, str]] = []

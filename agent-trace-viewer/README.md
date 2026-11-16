@@ -31,6 +31,8 @@ GET /api/plugins/agent-trace-viewer/sessions/{id}/export
 
 不想要桌面端的话，这几个 HTTP 接口本身就是完整功能，`curl` 即可用。
 
+**导出接口需要会话鉴权**：`/sessions/{id}/export` 会把完整转录（含推理、工具参数、系统提示词）吐出来，属高价值数据，故要求携带 dashboard 的会话 token——桌面端页面自带（SPA 注入的 `window.__HERMES_SESSION_TOKEN__`），手写 `curl` 时加任一即可：`X-Hermes-Session-Token: <token>`、`X-Hermes-Token: <token>`、`Authorization: Bearer <token>` 或 `?token=<token>`。loopback 来源不豁免——本机任何进程都能开 127.0.0.1，故不做来源短路。列表/消息接口保持免 token（只读元数据与文本分页）。
+
 ## 设计边界
 
 - **严格只读**：数据库以只读模式打开，任何写操作都不存在；归档/删除会话请用 Hermes 原生命令。

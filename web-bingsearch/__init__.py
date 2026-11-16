@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
@@ -221,6 +222,11 @@ _settingsDefaults={
     # 三轮实测：关=12/70 相关，开=53/78；代价仅垃圾查询多几秒。显式存 false 可关（不截词原教旨）。
 }
 
+# v1.4 隐式设置（故意不进 _settingsDefaults：不进面板、不由 seedMissingSettings 写进主人 config，
+# 手写 config.yaml 的插件 settings 里加同名键即生效；缺键时读侧走各自默认）：
+#   extract_timeout_secs = 30   extract 每 URL 子进程墙钟上限（N2）
+#   allow_empty          = false 零命中是否允许静默返回空表（F17；默认关=报错）
+
 def getSetting(key: str):
     """读 plugins.entries.<id>.settings.<key>；读不到键按默认值（主人 11-09 规范）。
     显式存的 ""/false/0 是有效值，不会被默认覆盖（get_config 命中即返回）。"""
@@ -248,6 +254,21 @@ def seedMissingSettings(ctx):
                 ctx.set_config(key, _settingsDefaults[key])
             except Exception:
                 pass  # 写不进不拦加载，读侧有默认兜底
+
+def readIntSetting(key: str, default: int, minimum: int = 1):
+    """显式整数配置读取（N3 修复）：值缺失(None)才算没配，显式 0 是有效值。
+    原先 `int(getSetting(k) or default)` 会把显式配置的 0 吞成默认——0 秒超时 = 死循环，故钳到 minimum。
+    非数字垃圾值退回 default（面板手改 settings 可能塞进空串）。"""
+    raw=getSetting(key)
+    if(raw is None):
+        return(default)
+    try:
+        val=int(raw)
+    except (TypeError, ValueError):
+        return(default)
+    if(val < minimum):
+        return(minimum)
+    return(val)
 
 def pickNextDesktopFingerprint():
     """轮流取下一个桌面版本 TLS 指纹（模块级计数器轮转，同 v1.0 怪癖）"""
@@ -318,6 +339,53 @@ def crawlUrlRawHtmlStealth(url: str):
     resp=client.get(quote(url, safe=":/?#&=@%+~!$'()*,"), headers=headers)
     rawHtml=resp.text
     return(rawHtml)
+
+def isPrivateFetchHost(host: str):
+    """内网/环回/保留段判定（F18 SSRF 探测面）：IP 字面量走标准库 ipaddress，
+    localhost 一族直接拒。域名不在本函数处理（解析到内网 IP 的域名挡不住，见 README 风险段）。
+    返回 True=不许抓。"""
+    import ipaddress
+    h=(host or "").strip().lower()
+    if(h.startswith("[") and h.endswith("]")):
+        h=h[1:-1]  # urlsplit 已剥 IPv6 括号，这里兜一层手写调用
+    h=h.split("%")[0]  # IPv6 zone id（fe80::1%eth0）
+    if(not h):
+        return(True)
+    if(h == "localhost" or h.endswith(".localhost")):
+        return(True)
+    try:
+        ip=ipaddress.ip_address(h)
+    except ValueError:
+        return(False)  # 不是 IP 字面量：域名放行，交给 DNS/网络层
+    return(
+        ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
+        or ip.is_multicast or ip.is_unspecified
+    )
+
+def checkExtractUrlAllowed(url: str):
+    """extract 入口 URL 校验（F18）：只放行 http/https，IP 字面量不得落内网/保留段。
+    模型可控 URL 直接喂 primp 等于给 SSRF 探测面——错误消息里写明放行开关。
+    环境变量 BING_ALLOW_PRIVATE_FETCH=1 放行内网（自家 NAS / 内网 wiki 场景）。
+    返回 None=放行，否则返回错误串。"""
+    if(os.environ.get("BING_ALLOW_PRIVATE_FETCH") == "1"):
+        return(None)
+    from urllib.parse import urlsplit
+    raw=str(url or "").strip()
+    if(not raw):
+        return("empty url")
+    try:
+        parts=urlsplit(raw)
+    except Exception as e:
+        return("invalid url: %s" % e)
+    scheme=(parts.scheme or "").lower()
+    if(scheme not in ("http", "https")):
+        return("blocked scheme %r — extract only allows http/https" % (parts.scheme or ""))
+    host=parts.hostname or ""
+    if(not host):
+        return("blocked url: no host in %r" % raw)
+    if(isPrivateFetchHost(host)):
+        return("blocked private/loopback host %r (SSRF guard; set BING_ALLOW_PRIVATE_FETCH=1 to allow)" % host)
+    return(None)
 
 def rssLooksBlocked(rawHtml: str):
     """硬封禁判读（沿用 v1.2 命名）：captcha/verify 同现才判验证码页。
@@ -562,6 +630,21 @@ def htmlLooksLikeGarbage(parsed, queue: str):
         return(True)
     return(False)
 
+# 最近一次搜索的诊断（F17）：零命中时随 error 一起回给调用方，别让"网上没有"变成静默结论
+_lastSearchDiag={}
+
+def _recordSearchDiag(tiers: int, query: str, htmlLen: int = 0):
+    """记一次搜索的尝试档数/最终查询/最终 URL/最终页面体积（模块级，非线程局部；
+    并发搜索只会互相覆盖诊断字段，不影响结果本身）。"""
+    global _lastSearchDiag
+    from urllib.parse import quote
+    _lastSearchDiag={
+        "tiers_tried": tiers,
+        "final_query": query or "",
+        "final_url": "https://cn.bing.com/search?q="+quote(query or "")+"&setlang=zh-CN&ensearch=0",
+        "final_html_bytes": htmlLen,
+    }
+
 def ladderSearchHtml(queue: str):
     """
     不截词阶梯（v1.2 架构 + v1.3 修正）：原句完整直发，失败退避重试换桌面指纹。
@@ -581,8 +664,11 @@ def ladderSearchHtml(queue: str):
                 candidates.append(cand)
     lastErr=None
     lastParsed=[]
+    tiersTried=0
+    lastHtmlLen=0
     for ci in range(len(candidates)):
         use=candidates[ci]
+        tiersTried=ci + 1
         for attempt in range(3):
             fp=pickNextDesktopFingerprint()
             try:
@@ -592,6 +678,7 @@ def ladderSearchHtml(queue: str):
                 if(attempt < 2):
                     backoffDelay(attempt + 1)
                 continue
+            lastHtmlLen=len(rawHtml or "")
             if(rssLooksBlocked(rawHtml)):
                 raise RuntimeError("Bing hard block (captcha) — IP-level, retry cannot fix; rest a few minutes or change exit IP")
             if(htmlLooksDegraded(rawHtml)):
@@ -609,6 +696,8 @@ def ladderSearchHtml(queue: str):
             # 解析空但结构正常：可能是真没结果（b_no），也可能是新变体——再试一档
             if(attempt < 2):
                 backoffDelay(attempt + 1)
+    # F17：零命中/只剩渣时把诊断留给调用方（父进程读的是子进程信封里的 debug 字段）
+    _recordSearchDiag(tiers=tiersTried, query=candidates[-1], htmlLen=lastHtmlLen)
     if(lastParsed):
         return(lastParsed)
     if(lastErr is not None):
@@ -617,22 +706,27 @@ def ladderSearchHtml(queue: str):
 
 # ---- 结果缓存（U7，默认关）----
 _resultCache={}
+# N4：缓存是跨线程共享（search 可能被并发调用），get/put/清最旧必须同锁，
+# 否则 min() 迭代 dict 时另一线程写入会 RuntimeError: dictionary changed size during iteration
+_resultCacheLock=threading.Lock()
 
 def cacheGet(queue: str):
     import time
-    ttl=int(getSetting("cache_ttl_secs") or 300)
-    hit=_resultCache.get(queue)
+    ttl=readIntSetting("cache_ttl_secs", 300)
+    with _resultCacheLock:
+        hit=_resultCache.get(queue)
     if(hit and (time.time() - hit[0]) < ttl):
         return(hit[1])
     return(None)
 
 def cachePut(queue: str, parsed):
     import time
-    _resultCache[queue]=(time.time(), parsed)
-    # 简单容量闸：超过 128 条清最旧
-    if(len(_resultCache) > 128):
-        oldest=min(_resultCache, key=lambda k: _resultCache[k][0])
-        del _resultCache[oldest]
+    with _resultCacheLock:
+        _resultCache[queue]=(time.time(), parsed)
+        # 容量闸：超限就反复清最旧直到 <=128（不是只清一条——并发批量写会一次冲高）
+        while(len(_resultCache) > 128):
+            oldest=min(_resultCache, key=lambda k: _resultCache[k][0])
+            del _resultCache[oldest]
 
 # ---- 子进程隔离（D9，官方 ddgs 模板）----
 
@@ -681,43 +775,55 @@ def _spawnSearchWorker(env: dict):
         env=env, text=True, encoding="utf-8", errors="replace", **extraKwargs,
     ))
 
-def _parseWorkerEnvelope(raw: str, proc):
-    """解 worker stdout 信封，形状不对一律 RuntimeError"""
+def _snapshotSettings():
+    """把当前开关快照出来（子进程没有活 ctx，靠 _SettingsShim 读）"""
+    snapshot={}
+    for key in _settingsDefaults:
+        snapshot[key]=getSetting(key)
+    return(snapshot)
+
+def _workerEnvelopeDict(raw: str, proc, label: str = "search"):
+    """把 worker stdout 解成信封 dict，形状不对一律 RuntimeError（search/extract 共用）"""
     import json
-    raw=raw.strip()
+    raw=(raw or "").strip()
     if(not raw):
-        raise RuntimeError("Bing worker exited without a result (code=%s)" % proc.poll())
+        raise RuntimeError("Bing %s worker exited without a result (code=%s)" % (label, proc.poll()))
     try:
         envelope=json.loads(raw)
     except Exception as exc:
-        raise RuntimeError("Bing worker returned invalid JSON: %r" % raw[:200]) from exc
+        raise RuntimeError("Bing %s worker returned invalid JSON: %r" % (label, raw[:200])) from exc
     if(not isinstance(envelope, dict)):
-        raise RuntimeError("Bing worker returned an invalid envelope")
+        raise RuntimeError("Bing %s worker returned an invalid envelope" % label)
     if(not envelope.get("ok")):
-        raise RuntimeError(str(envelope.get("error") or "Bing worker failed"))
+        raise RuntimeError(str(envelope.get("error") or "Bing %s worker failed" % label))
+    return(envelope)
+
+def _parseWorkerEnvelope(raw: str, proc):
+    """解 worker stdout 信封，形状不对一律 RuntimeError"""
+    envelope=_workerEnvelopeDict(raw, proc, "search")
     results=envelope.get("results") or []
     if(not isinstance(results, list)):
         raise RuntimeError("Bing worker returned non-list results")
     return(results)
 
-def runHtmlSearchBounded(queue: str):
-    """
-    一次性子进程跑 ladderSearchHtml，硬墙钟超时 terminate→kill（D9 根治 GIL 冻结）。
+def _parseExtractEnvelope(raw: str, proc):
+    """解 extract worker 信封，取 raw_content 字符串"""
+    envelope=_workerEnvelopeDict(raw, proc, "extract")
+    content=envelope.get("raw_content")
+    if(not isinstance(content, str)):
+        raise RuntimeError("Bing extract worker returned no raw_content")
+    return(content)
+
+def _runWorkerBounded(request: dict, timeoutSecs: int, label: str = "search"):
+    """一次性子进程跑一个请求，硬墙钟超时 terminate→kill，返回 (stdout, proc)。
     父进程绝不 join 可能持 GIL 卡在 native 的子进程——轮询 communicate 线程+截止+中断旗标。
-    抛 TimeoutError / RuntimeError / InterruptedError。
-    """
+    抛 TimeoutError / InterruptedError；stdout 合法性交给调用方解析。"""
     import concurrent.futures as cf
     import json
     import os
     import time
     global _lastWorkerProc
-    # 把当前开关快照转发给子进程（子进程没有活 ctx，靠 _SettingsShim 读）
-    settingsSnapshot={}
-    for key in _settingsDefaults:
-        settingsSnapshot[key]=getSetting(key)
-    request={"queue": queue, "settings": settingsSnapshot}
-    if(os.environ.get("HERMES_BING_ALLOW_TEST_HOOKS") == "1" and _testHook):
-        request["test_hook"]=_testHook
+    secs=max(1, int(timeoutSecs))  # 0 秒 = 每次立刻超时，钳到 1
     env=dict(os.environ)
     proc=_spawnSearchWorker(env)
     _lastWorkerProc=proc
@@ -726,9 +832,8 @@ def runHtmlSearchBounded(queue: str):
     interrupted=False
     done=False
     raw=""
-    timeoutSecs=int(getSetting("search_timeout_secs") or 45)
     try:
-        deadline=time.monotonic() + timeoutSecs
+        deadline=time.monotonic() + secs
         while(not done and not (interrupted := _searchInterrupted()) and (remaining := deadline - time.monotonic()) > 0):
             try:
                 raw=fut.result(timeout=min(_pollIntervalSecs, remaining))[0] or ""
@@ -744,10 +849,71 @@ def runHtmlSearchBounded(queue: str):
                 pass
         pool.shutdown(wait=False, cancel_futures=True)
     if(interrupted):
-        raise InterruptedError("Bing search interrupted")
+        raise InterruptedError("Bing %s interrupted" % label)
     if(not done):
-        raise TimeoutError("Bing search timed out after %ds" % timeoutSecs)
-    return(_parseWorkerEnvelope(raw, proc))
+        raise TimeoutError("Bing %s timed out after %ds" % (label, secs))
+    return(raw, proc)
+
+def runHtmlSearchBounded(queue: str):
+    """
+    一次性子进程跑 ladderSearchHtml，硬墙钟超时 terminate→kill（D9 根治 GIL 冻结）。
+    v1.4：轮询/杀进程逻辑搬到 _runWorkerBounded，和 extract 通道共用。
+    抛 TimeoutError / RuntimeError / InterruptedError。
+    """
+    import json
+    import os
+    global _lastSearchDiag
+    # 把当前开关快照转发给子进程（子进程没有活 ctx，靠 _SettingsShim 读）
+    request={"op": "search", "queue": queue, "settings": _snapshotSettings()}
+    if(os.environ.get("HERMES_BING_ALLOW_TEST_HOOKS") == "1" and _testHook):
+        request["test_hook"]=_testHook
+    timeoutSecs=readIntSetting("search_timeout_secs", 45)
+    raw, proc=_runWorkerBounded(request, timeoutSecs, "search")
+    results=_parseWorkerEnvelope(raw, proc)
+    # F17：子进程里 ladderSearchHtml 记的诊断随信封回来（零命中时要给调用方看尝试档数/最终URL）
+    try:
+        debug=json.loads((raw or "").strip()).get("debug")
+    except Exception:
+        debug=None
+    if(isinstance(debug, dict) and debug):
+        _lastSearchDiag=debug
+    return(results)
+
+def _extractDatStub(url):
+    """extract 单项返回骨架（键结构与 v1.3 完全一致，只有 raw_content 由子进程填）"""
+    return({"url": url, "title": "Too lazy to parse out, see below.", "content": "Too lazy to parse out, see below.", "raw_content": ""}) # "我懒得解析出来了，直接看下面吧"
+
+def _runOneExtractBounded(url, settingsSnapshot, timeoutSecs):
+    """单个 URL：起子进程抓，硬墙钟超时 terminate→kill"""
+    import os
+    request={"op": "extract", "url": url, "settings": settingsSnapshot}
+    if(os.environ.get("HERMES_BING_ALLOW_TEST_HOOKS") == "1" and _testHook):
+        request["test_hook"]=_testHook
+    raw, proc=_runWorkerBounded(request, timeoutSecs, "extract")
+    return(_parseExtractEnvelope(raw, proc))
+
+def runExtractBounded(urls):
+    """extract 通道子进程隔离（N2）：每 URL 一个一次性子进程 + 硬墙钟 terminate→kill
+    （默认 30s，settings.extract_timeout_secs 可覆盖）。超时/崩溃只标记该 URL 的 error，
+    其余 URL 继续跑——primp 的 GIL 冻结再也冻不到网关进程，父进程只读 stdout 的 JSON。
+    F18：父进程入口先校验 scheme/内网（子进程不再判，免得绕路）。
+    返回 extract() 契约同款 list[dict]。"""
+    timeoutSecs=readIntSetting("extract_timeout_secs", 30)
+    settingsSnapshot=_snapshotSettings()
+    respDat=[]
+    for url in (urls or []):
+        dat=_extractDatStub(url)
+        reason=checkExtractUrlAllowed(url)
+        if(reason is not None):
+            dat["error"]=reason
+        else:
+            try:
+                dat["raw_content"]=_runOneExtractBounded(url, settingsSnapshot, timeoutSecs)
+            except Exception as e:
+                # 单个 URL 超时/崩溃只标记该项 error，其他 URL 照常返回（不整批失败）
+                dat["error"]=str(e)
+        respDat.append(dat)
+    return(respDat)
 
 def searchHtmlEntry(queue: str):
     """search 统一入口：缓存（可选）→ 子进程隔离（可选）→ 进程内直跑（兜底）。
@@ -781,13 +947,12 @@ class BingCrawlerWebSearchProvider(WebSearchProvider):
     def is_available(self) -> bool:
         # Cheap check — env var present, optional dep importable, etc.
         # MUST NOT make network calls (runs on every `hermes tools` paint).
+        # v1.4：改 find_spec 探 primp 是否可导入——父进程自己不再 import 它（N2：primp 只活在子进程里）
         try:
-            import primp
-            import xml.etree.ElementTree as ET
-            from html import unescape
-            return True
-        except:
-            return False
+            import importlib.util
+            return(importlib.util.find_spec("primp") is not None)
+        except Exception:
+            return(False)
 
     def supports_search(self) -> bool:
         return True
@@ -815,6 +980,22 @@ class BingCrawlerWebSearchProvider(WebSearchProvider):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+        # F17：零命中不再静默 success=True + 空表（最坏形态是让模型断言"网上没有"）。
+        # 只有显式打开 settings.allow_empty 才放行空表；debug 带尝试档数/最终 URL 便于归因。
+        if(not response):
+            if(bool(getSetting("allow_empty"))):
+                return {
+                    "success": True,
+                    "data": {
+                        "web": []
+                    }
+                }
+            return {
+                "success": False,
+                "error": "no results parsed (possible block/markup drift)",
+                "debug": dict(_lastSearchDiag or {}),
+            }
+
         # Response shape is fixed — see "Response shape" below.
         # return {
         #     "success": True,
@@ -840,10 +1021,21 @@ class BingCrawlerWebSearchProvider(WebSearchProvider):
     def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         # 契约：必须返回纯列表（web_tools.py 消费端直接 enumerate + .get("raw_content")，
         # 包 success/data 外壳会让 "success".get("error") 直接 AttributeError 炸掉 web_extract）
+        urls=list(urls or [])
+        if(bool(getSetting("subprocess_isolation"))):
+            # N2：默认每 URL 一个一次性子进程 + 硬墙钟（父进程不再 import primp，GIL 冻结止步于子进程）
+            return(runExtractBounded(urls))
+
+        # subprocess_isolation=false 时退回进程内直抓（v1.3 原行为，primp 持 GIL 有冻结风险）
         respDat=[]
 
         for url in urls:
-            dat={"url": url, "title": "Too lazy to parse out, see below.", "content": "Too lazy to parse out, see below.", "raw_content": ""} # "我懒得解析出来了，直接看下面吧"
+            dat=_extractDatStub(url)
+            reason=checkExtractUrlAllowed(url)  # F18：只放行 http/https，IP 字面量不得落内网/保留段
+            if(reason is not None):
+                dat["error"]=reason
+                respDat.append(dat)
+                continue
             try:
                 dat["raw_content"]=crawlUrlRawHtmlStealth(url)  # v1.3 伪装版（桌面指纹+伪装头+Bing Referer）
             except Exception as e:

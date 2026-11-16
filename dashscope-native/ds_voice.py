@@ -248,27 +248,33 @@ class DashScopeTTS(TTSProvider):
         )
         service_format = self._map_format(format)
         client = self._factory()
-        if _is_qwen_family(resolved_model):
-            # speed has no named slot on the http family — ignored (ABC allows).
-            audio = b"".join(
-                chunk.audio
-                for chunk in client.audio.tts.http.stream(
-                    text,
-                    model=resolved_model,
-                    voice=resolved_voice,
-                    format=service_format,
+        try:
+            if _is_qwen_family(resolved_model):
+                # speed has no named slot on the http family — ignored (ABC allows).
+                audio = b"".join(
+                    chunk.audio
+                    for chunk in client.audio.tts.http.stream(
+                        text,
+                        model=resolved_model,
+                        voice=resolved_voice,
+                        format=service_format,
+                    )
+                    if chunk.audio
                 )
-                if chunk.audio
-            )
-        else:
-            kwargs: Dict[str, Any] = {
-                "model": resolved_model,
-                "voice": resolved_voice,
-                "format": service_format,
-            }
-            if speed is not None:
-                kwargs["rate"] = speed
-            audio = client.audio.tts.synthesize(text, **kwargs)
+            else:
+                kwargs: Dict[str, Any] = {
+                    "model": resolved_model,
+                    "voice": resolved_voice,
+                    "format": service_format,
+                }
+                if speed is not None:
+                    kwargs["rate"] = speed
+                audio = client.audio.tts.synthesize(text, **kwargs)
+        except Exception as exc:  # SDK 把上游错误体拼进了文案（F21）→ 净化后再抛
+            from .ds_client import scrub_exception_message
+
+            scrub_exception_message(exc)
+            raise
         if not audio:
             raise RuntimeError(
                 "dashscope-native voice: synthesis returned no audio bytes "
@@ -299,19 +305,25 @@ class DashScopeTTS(TTSProvider):
         )
         client = self._factory()
         fmt = str(format or "opus").lower()
-        if _is_qwen_family(resolved_model):
-            kwargs: Dict[str, Any] = {"format": "pcm" if fmt == "pcm" else fmt}
-            if fmt == "pcm":
-                kwargs["sample_rate"] = _PCM_STREAM_RATE
-            for chunk in client.audio.tts.http.stream(
-                text, model=resolved_model, voice=resolved_voice, **kwargs
-            ):
-                if chunk.audio:
-                    yield chunk.audio
-        else:
-            yield from client.audio.tts.stream(
-                text, model=resolved_model, voice=resolved_voice, format=fmt
-            )
+        try:
+            if _is_qwen_family(resolved_model):
+                kwargs: Dict[str, Any] = {"format": "pcm" if fmt == "pcm" else fmt}
+                if fmt == "pcm":
+                    kwargs["sample_rate"] = _PCM_STREAM_RATE
+                for chunk in client.audio.tts.http.stream(
+                    text, model=resolved_model, voice=resolved_voice, **kwargs
+                ):
+                    if chunk.audio:
+                        yield chunk.audio
+            else:
+                yield from client.audio.tts.stream(
+                    text, model=resolved_model, voice=resolved_voice, format=fmt
+                )
+        except Exception as exc:  # 同上：流式路径的 SDK 错误文案也要净化（F21）
+            from .ds_client import scrub_exception_message
+
+            scrub_exception_message(exc)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -399,12 +411,14 @@ class DashScopeSTT(TranscriptionProvider):
                 "provider": PROVIDER_NAME,
             }
         except Exception as exc:  # NEVER raise — error envelope by contract
+            from .ds_client import sanitize_exception_text  # F21：错误体不可信
+
             logger.warning("dashscope-native voice: transcribe failed", exc_info=True)
             return {
                 "success": False,
                 "transcript": "",
                 "provider": PROVIDER_NAME,
-                "error": str(exc),
+                "error": sanitize_exception_text(exc),
             }
 
 

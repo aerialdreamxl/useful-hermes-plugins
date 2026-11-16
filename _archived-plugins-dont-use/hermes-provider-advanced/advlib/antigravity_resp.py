@@ -8,6 +8,8 @@ codex facade (oauth_client.py) established.
 
 from __future__ import annotations
 
+import calendar
+import codecs
 import json
 import time
 from types import SimpleNamespace
@@ -149,7 +151,9 @@ class StreamState:
         ct = resp.get("createTime")
         if ct:
             try:
-                self.created = int(time.mktime(time.strptime(
+                # createTime is UTC (proto JSON); timegm reads it as such —
+                # mktime would reinterpret it in the host zone (+8h under CST).
+                self.created = int(calendar.timegm(time.strptime(
                     str(ct)[:19], "%Y-%m-%dT%H:%M:%S")))
             except Exception:
                 pass
@@ -281,10 +285,12 @@ def iter_sse_json(chunks: "Iterator[bytes]") -> "Iterator[dict]":
                 pending = ps          # start of a multi-line JSON value
                 return None
         return None                   # bare line with no pending: event:/id:/comment
-
+    # Incremental decoder: a network chunk can end mid-codepoint, so a
+    # per-chunk decode("utf-8", "replace") turned split CJK text into U+FFFD.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     for raw in chunks:
         try:
-            buf += raw.decode("utf-8", "replace")
+            buf += decoder.decode(raw, final=False)
         except Exception:
             continue
         while "\n" in buf:
@@ -292,6 +298,10 @@ def iter_sse_json(chunks: "Iterator[bytes]") -> "Iterator[dict]":
             obj = _consume(line.rstrip("\r"))
             if obj is not None:
                 yield obj
+    try:
+        buf += decoder.decode(b"", final=True)   # flush a split multi-byte tail
+    except Exception:
+        pass
     if buf:
         obj = _consume(buf.rstrip("\r"))
         if obj is not None:

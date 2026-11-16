@@ -308,13 +308,14 @@ def build_ground_segments(pet_w, pet_h, screen_geo, self_hwnd, with_owners=False
         owner_map[sg] = owner
 
     for (pl, pt, pr, pb) in taskbars:
-        conv, scr, d = _to_logical_point(pl, pt)
-        if conv is None:
+        # N16：与窗口路径同口径——矩形求交选屏（R26-1），再按该屏 dpr 整体
+        # 换算。旧版拿左上角点换算，负原点/跨屏任务栏会被整条丢弃。
+        scr, d = _rect_screen(pl, pt, pr, pb)
+        if scr is None:
             continue
-        l, t = conv
-        r = pr / d
-        g = scr.availableGeometry()
-        if float(g.top()) + pet_h - 1 <= t:
+        l, t, r, b = pl / d, pt / d, pr / d, pb / d
+        tb_g = scr.availableGeometry()
+        if float(tb_g.top()) + pet_h - 1 <= t:
             add(l, t, r, t)  # 任务栏上界（BUG1 同款头顶空间过滤）
 
     g = screen_geo

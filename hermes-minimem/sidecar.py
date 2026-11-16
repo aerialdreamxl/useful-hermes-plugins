@@ -40,6 +40,49 @@ SECRET_KEYS = (
     "DASHSCOPE_API_KEY", "MNEMOSYNE_EMBEDDING_API_KEY", "MINIMEM_EMBEDDING_API_KEY",
     "OPENAI_API_KEY",
 )
+# F6: the sidecar interpreter is a private PM environment that pip-installs third-party
+# packages on demand (dashscope / fastembed). Handing it a copy of os.environ leaked every
+# *other* provider credential the gateway holds (OPENAI_API_KEY and friends) to code taken
+# from PyPI. Only this whitelist is forwarded; anything else must be passed explicitly.
+_SIDECAR_BASE_ENV = (
+    # process essentials: PATH is needed by some native wheels, SYSTEMROOT/WINDIR/COMSPEC
+    # by the Windows CRT, PATHEXT by any subprocess the SDK spawns.
+    "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HOME", "TMPDIR", "LANG",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    # per-user dirs: fastembed/huggingface resolve their cache under these.
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
+    # Python runtime knobs. The worker runs with -I -X utf8=1, which already ignores the
+    # PYTHON* variables, so these are belt-and-braces: UTF-8 stdout is what keeps the JSON
+    # protocol from corrupting on a cp936/cp1252 console.
+    "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONPATH",
+)
+# Not secrets, and the local backend cannot download an ONNX model without them on a
+# proxied/offline-CA machine. Deliberately a separate tuple so reviewers can see the
+# distinction at a glance.
+_SIDECAR_NETWORK_ENV = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HF_ENDPOINT",
+)
+
+
+def sidecar_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Build the child environment: a whitelist, plus explicitly passed extras.
+
+    Never starts from ``os.environ`` (F6). The embedding key does not travel through the
+    environment at all — it is part of the JSON request (``worker_config``) — so a missing
+    key here does not degrade the sidecar. ``extra`` values win over the whitelist, except
+    for ``SECRET_KEYS``, which are stripped even then: an explicit dict is still not a
+    licence to hand a provider key to the worker.
+    """
+    child = {key: os.environ[key] for key in _SIDECAR_BASE_ENV if key in os.environ}
+    for key in _SIDECAR_NETWORK_ENV:
+        if key in os.environ:
+            child[key] = os.environ[key]
+    if extra:
+        child.update({str(k): str(v) for k, v in extra.items()})
+        for key in SECRET_KEYS:
+            child.pop(key, None)
+    return child
 
 
 def dashscope_native_base(base_url: str) -> Optional[str]:
@@ -100,9 +143,7 @@ class SidecarProcess:
     def __init__(self, interpreter: Path, worker_path: Path, *, timeout: float = 60.0,
                  env: Optional[Dict[str, str]] = None,
                  secrets: Sequence[str] = ()) -> None:
-        child_env = dict(os.environ if env is None else env)
-        for key in SECRET_KEYS:
-            child_env.pop(key, None)
+        child_env = sidecar_env(env)
         child_env["PYTHONUTF8"] = "1"
         command = [str(interpreter), "-I", "-X", "utf8=1", str(worker_path)]
         self._proc = subprocess.Popen(
@@ -141,6 +182,9 @@ class SidecarProcess:
                     continue
                 if isinstance(message, dict):
                     self._responses.put(message)
+        except (OSError, ValueError):
+            # close() may close the pipe under this thread during its bounded drain.
+            pass
         finally:
             self._responses.put(None)
 
@@ -217,9 +261,34 @@ class SidecarProcess:
             self._proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             self._kill()
+        except Exception:
+            pass
+        self._final_drain()
+
+    def _final_drain(self) -> None:
+        """Bounded post-mortem: reap the child, let both readers hit EOF, close the pipes (N8).
+
+        A bare ``kill()`` after the 2 s grace left two loose ends: the process was never
+        reaped (a zombie, or on Windows an ONNX model dir still locked by a half-dead child)
+        and the reader threads kept a pipe open. Everything here is best effort by design —
+        ``close()`` runs from failure paths and must never raise.
+        """
+        try:
+            self._proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            logger.debug("minimem: sidecar worker still alive 1s after kill")
+        except Exception:
+            pass
+        for thread in (self._reader, self._stderr_reader):
             try:
-                self._proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
+                thread.join(timeout=1.0)
+            except Exception:
+                pass
+        for stream in (self._proc.stdout, self._proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
                 pass
 
 

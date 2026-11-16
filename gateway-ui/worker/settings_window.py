@@ -30,6 +30,7 @@ qfluentwidgets 1.11.3 控件坑（已实测）：
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -88,6 +89,9 @@ CUSTOM_SENTINEL = "__custom__"
 
 SCALE_X10_MIN, SCALE_X10_MAX = 1, 30      # 滑杆整数 = scale×10（0.1~3.0）
 WINDOW_MIN, WINDOW_MAX = 60, 1800          # 降级窗口整数秒
+# N19：pet_error.log 滚动闸（与 worker/main.pet_error_log 同策略，异常通道不许无界）
+PET_ERROR_MAX_BYTES = 1_000_000
+PET_ERROR_KEEP_LINES = 2000
 
 # 卡片副标题：改什么 / 会引发什么
 CONTENT = {
@@ -116,13 +120,13 @@ _MISSING = object()   # _effective 哨兵：区分"无 pending"与"pending 值�
 
 
 class _UrlDialog(MessageBoxBase):
-    """自定义包源输入框：限 http(s)，validate 不过点确定无效。"""
+    """自定义包源输入框：限 https，validate 不过点确定无效。"""
 
     def __init__(self, current: str, parent=None):
         super().__init__(parent=parent)
         self.titleLabel = QLabel("自定义包源地址", self.widget)
         self.edit = LineEdit(self.widget)
-        self.edit.setPlaceholderText("https://…（仅限 http/https）")
+        self.edit.setPlaceholderText("https://…（仅限 https）")
         self.edit.setText(current or "")
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.edit)
@@ -130,8 +134,10 @@ class _UrlDialog(MessageBoxBase):
         self.cancelButton.setText("取消")
 
     def validate(self) -> bool:
-        t = self.edit.text().strip()
-        return t.startswith("http://") or t.startswith("https://")
+        # N21：只认 https——明文 http 的 pip 源可被中间人换包（供应链投毒），
+        # 宿主 validate_request 同款拒收，这里提前拦，避免"填了却被拒"的来回。
+        t = self.edit.text().strip().lower()
+        return t.startswith("https://")
 
     def url(self) -> str:
         return self.edit.text().strip()
@@ -198,12 +204,21 @@ class SettingsWindow(FluentWindow):
 
     # ---------------------------------------------------------- 留证 ----
     def _log_error(self, exc) -> None:
-        """异常收敛留证：pet_error.log 带 traceback，绝不向外炸。"""
+        """异常收敛留证：pet_error.log 带 traceback，绝不向外炸。
+        N19：与 worker/main.pet_error_log 同一套滚动策略——>1MB 截断保留尾部
+        2000 行（tmp+replace）。设置窗口长开时这里才是写入主力，无闸会写爆盘。"""
+        f = self.bus_dir / "pet_error.log"
         try:
-            with open(self.bus_dir / "pet_error.log", "a", encoding="utf-8") as fh:
+            with open(f, "a", encoding="utf-8") as fh:
                 fh.write(time.strftime("%H:%M:%S ") + "SettingsWindow: "
                          + "".join(traceback.format_exception(
-                             type(exc), exc, exc.__traceback__)))
+                             type(exc), exc, exc.__traceback__)).rstrip() + "\n")
+            if f.stat().st_size > PET_ERROR_MAX_BYTES:
+                keep = f.read_text(encoding="utf-8", errors="replace").splitlines()[
+                    -PET_ERROR_KEEP_LINES:]
+                tmp = f.with_name(f"pet_error.log.{os.getpid()}.tmp")
+                tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+                os.replace(tmp, f)
         except Exception:
             pass
 
@@ -837,8 +852,9 @@ class SettingsWindow(FluentWindow):
                 self._rebuild_pkg_combo(current)   # 取消：回弹快照
                 return
             url = str(url).strip()
-            if not (url.startswith("http://") or url.startswith("https://")):
-                self._info("error", "地址无效", "包源地址仅限 http(s)")
+            if not url.lower().startswith("https://"):
+                self._info("error", "地址无效",
+                           "包源地址仅限 https://（明文 http 源可被中间人换包，宿主会拒收）")
                 self._rebuild_pkg_combo(current)
                 return
             self._request("package_index_url", url)

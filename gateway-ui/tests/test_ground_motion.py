@@ -409,66 +409,68 @@ wA._bind_seg(botA)
 wA._confirm_due = 0.0
 wA.pause_until = 0.0
 orig_rc = pw.REST_CHANCE
-# 骰盘 50/50 满格：上下领地各半（最坏情况：每次决策必有一动）
-pw.CLIMB_TERRITORY_W = pw.PLAN_DICE_MAX // 2
-pw.DESCEND_TERRITORY_W = pw.PLAN_DICE_MAX - pw.CLIMB_TERRITORY_W
-pw.REST_CHANCE = 0.0
 orig_cc5 = pw.CONTACT_CLIMB_CHANCE
-pw.CONTACT_CLIMB_CHANCE = 1.0  # 仿真钉死接触概率，保持 R26-5 有界断言语义
-transA = run_sim(wA, 150)
-# 修复前该场景约 1.5-2s 一次往返（>70 次/150s）；闸门后：8s 冷却+反向封禁递增
-ck("R26-5: A<->B loop bounded (<20 vertical trans / 150s worst-case dice)",
-   transA < 20)
-ck("R26-5: still vertically alive (>=2 trans in 150s)", transA >= 2)
+try:
+    # 骰盘 50/50 满格：上下领地各半（最坏情况：每次决策必有一动）
+    pw.CLIMB_TERRITORY_W = pw.PLAN_DICE_MAX // 2
+    pw.DESCEND_TERRITORY_W = pw.PLAN_DICE_MAX - pw.CLIMB_TERRITORY_W
+    pw.REST_CHANCE = 0.0
+    pw.CONTACT_CLIMB_CHANCE = 1.0  # 仿真钉死接触概率，保持 R26-5 有界断言语义
+    transA = run_sim(wA, 150)
+    # 修复前该场景约 1.5-2s 一次往返（>70 次/150s）；闸门后：8s 冷却+反向封禁递增
+    ck("R26-5: A<->B loop bounded (<20 vertical trans / 150s worst-case dice)",
+       transA < 20)
+    ck("R26-5: still vertically alive (>=2 trans in 150s)", transA >= 2)
 
-# 场景 B：同窗顶底沿互降排除（cur_owner 相同 → 主动下爬候选直接拒绝）
-wB = mkwin()
-HB = wB.height()
-wB.ground_segs = [topA, botA]
-wB.seg_owner = {topA: 555, botA: 555}   # 同一窗口
-wB._refresh_ground = lambda: wB.ground_segs
-wB.move(300, int(400 - HB))
-wB._bind_seg(topA)
-wB._vert_cooldown_until = 0.0
-wB._vert_ban.clear()
-orig_dv = ground.find_descend_target
-pw.random.seed(0)
-desc_diced = False
-for seed in range(30):
-    wB.phase = "pause"; wB.pause_until = 0.0
+    # 场景 B：同窗顶底沿互降排除（cur_owner 相同 → 主动下爬候选直接拒绝）
+    wB = mkwin()
+    HB = wB.height()
+    wB.ground_segs = [topA, botA]
+    wB.seg_owner = {topA: 555, botA: 555}   # 同一窗口
+    wB._refresh_ground = lambda: wB.ground_segs
+    wB.move(300, int(400 - HB))
+    wB._bind_seg(topA)
     wB._vert_cooldown_until = 0.0
-    random.seed(seed)
-    wB._plan(time.time())
-    if wB.phase == "descend":
-        desc_diced = True
-ck("R26-5: same-window top->bottom descend refused (owner exclusion)",
-   not desc_diced)
-ck("R26-5: (sanity) same pair WOULD be descendable without exclusion",
-   orig_dv([topA, botA], 300.0, 300.0 + wB.width(), 300.0, topA, HB) == botA
-   or wB.width() > (botA[2] - botA[0]) - 4)  # 若身体比底沿宽则本就不候选
+    wB._vert_ban.clear()
+    orig_dv = ground.find_descend_target
+    pw.random.seed(0)
+    desc_diced = False
+    for seed in range(30):
+        wB.phase = "pause"; wB.pause_until = 0.0
+        wB._vert_cooldown_until = 0.0
+        random.seed(seed)
+        wB._plan(time.time())
+        if wB.phase == "descend":
+            desc_diced = True
+    ck("R26-5: same-window top->bottom descend refused (owner exclusion)",
+       not desc_diced)
+    ck("R26-5: (sanity) same pair WOULD be descendable without exclusion",
+       orig_dv([topA, botA], 300.0, 300.0 + wB.width(), 300.0, topA, HB) == botA
+       or wB.width() > (botA[2] - botA[0]) - 4)  # 若身体比底沿宽则本就不候选
 
-# 场景 C：被动 rule7 爬的冷却生效——刚 descend 落地 8s 内 confirm 不再自动爬
-wC = mkwin()
-HC = wC.height()
-wC.ground_segs = [topA, botA]
-wC.seg_owner = {topA: None, botA: None}
-wC._refresh_ground = lambda: wC.ground_segs
-wC._begin_descend(botA, time.time())   # 假装刚从 top 下爬
-wC._note_vert(topA, botA, time.time())  # 落地登记（模拟 _consume 后状态）
-wC.move(300, int(500 - HC))
-wC._bind_seg(botA)
-wC._confirm_due = 0.0
-nowC = time.time()
-wC._confirm_ground(nowC, moving=False)
-ck("R26-5: passive rule7 climb blocked within cooldown", wC.phase != "climb")
-wC._vert_cooldown_until = 0.0   # 冷却过 -> 恢复可爬（不是永久禁）
-wC._confirm_ground(nowC + 100, moving=False)
-ck("R26-5: passive rule7 climb recovers after cooldown",
-   wC.phase in ("climb", "pause"))
-pw.CLIMB_TERRITORY_W = orig_ctw if 'orig_ctw' in dir() else 400
-pw.DESCEND_TERRITORY_W = orig_dtw if 'orig_dtw' in dir() else 400
-pw.REST_CHANCE = orig_rc
-pw.CONTACT_CLIMB_CHANCE = orig_cc5
+    # 场景 C：被动 rule7 爬的冷却生效——刚 descend 落地 8s 内 confirm 不再自动爬
+    wC = mkwin()
+    HC = wC.height()
+    wC.ground_segs = [topA, botA]
+    wC.seg_owner = {topA: None, botA: None}
+    wC._refresh_ground = lambda: wC.ground_segs
+    wC._begin_descend(botA, time.time())   # 假装刚从 top 下爬
+    wC._note_vert(topA, botA, time.time())  # 落地登记（模拟 _consume 后状态）
+    wC.move(300, int(500 - HC))
+    wC._bind_seg(botA)
+    wC._confirm_due = 0.0
+    nowC = time.time()
+    wC._confirm_ground(nowC, moving=False)
+    ck("R26-5: passive rule7 climb blocked within cooldown", wC.phase != "climb")
+    wC._vert_cooldown_until = 0.0   # 冷却过 -> 恢复可爬（不是永久禁）
+    wC._confirm_ground(nowC + 100, moving=False)
+    ck("R26-5: passive rule7 climb recovers after cooldown",
+       wC.phase in ("climb", "pause"))
+finally:
+    pw.CLIMB_TERRITORY_W = orig_ctw
+    pw.DESCEND_TERRITORY_W = orig_dtw
+    pw.REST_CHANCE = orig_rc
+    pw.CONTACT_CLIMB_CHANCE = orig_cc5
 
 # ============ R26-5b：评审 P0/P1 修复回归（生产保真度）============
 # P0 复现：_vertical_seg_alive 每帧 _refresh_ground 重建地面 → climb_seg

@@ -33,6 +33,11 @@ def _tail(r: subprocess.CompletedProcess, n: int = 2000) -> str:
     return text[-n:]
 
 
+def _confirmed(args: dict) -> bool:
+    """高危动作的确认门槛，与 fastboot flash/oem 同一套写法。"""
+    return str(args.get("confirm")).lower() in ("true", "1", "yes")
+
+
 def _adb(args: dict) -> str:
     action = (args.get("action") or "devices").strip().lower()
     adb = _adb_bin()
@@ -59,6 +64,8 @@ def _adb(args: dict) -> str:
                 cmd = " ".join(str(x) for x in cmd)
             if not cmd:
                 return err("shell 需要 'command'")
+            if not _confirmed(args):
+                return err("shell 是高危操作（等于在设备上执行任意命令）：确认命令内容后传 confirm=true 再执行")
             r = _run(base + ["shell", cmd], timeout=timeout)
         elif action == "push":
             local, remote = args.get("local"), args.get("remote")
@@ -74,8 +81,9 @@ def _adb(args: dict) -> str:
             n = int(args.get("lines") or 200)
             r = _run(base + ["logcat", "-d", "-t", str(n)], timeout=timeout)
         elif action == "screenshot":
+            # 毫秒时间戳：同一秒连拍不再互相覆盖
             out = args.get("path") or os.path.join(
-                config.scratch_dir("android"), "adb_shot_%d.png" % int(time.time()))
+                config.scratch_dir("android"), "adb_shot_%d.png" % int(time.time() * 1000))
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             r = _run(base + ["exec-out", "screencap", "-p"], timeout=timeout)
             blob = r.stdout or b""
@@ -89,11 +97,15 @@ def _adb(args: dict) -> str:
             apk = args.get("apk") or args.get("local")
             if not apk:
                 return err("install 需要 'apk'")
+            if not _confirmed(args):
+                return err("install 是高危操作（会覆盖安装/替换签名）：确认 apk 与设备后传 confirm=true 再执行")
             r = _run(base + ["install", "-r", apk], timeout=max(timeout, 300))
         elif action == "uninstall":
             pkg = args.get("package")
             if not pkg:
                 return err("uninstall 需要 'package'")
+            if not _confirmed(args):
+                return err("uninstall 是高危操作（会连同应用数据一起删除，不可撤销）：确认包名与设备后传 confirm=true 再执行")
             r = _run(base + ["uninstall", pkg], timeout=timeout)
         elif action == "props":
             r = _run(base + ["shell", "getprop"], timeout=timeout)
@@ -103,6 +115,8 @@ def _adb(args: dict) -> str:
                 cmd = " ".join(str(x) for x in cmd)
             if not cmd:
                 return err("%s 需要 'command'" % action)
+            if not _confirmed(args):
+                return err("%s 是高危操作（启动/强停/改权限/卸载组件）：确认命令后传 confirm=true 再执行" % action)
             r = _run(base + ["shell", action, cmd], timeout=timeout)
         else:
             return err("action 不支持：" + action)
@@ -176,9 +190,10 @@ _TOOLS = [
         "package": {"type": "string", "description": "uninstall: 包名"},
         "lines": {"type": "integer", "description": "logcat: 行数，默认 200"},
         "path": {"type": "string", "description": "screenshot: 输出 PNG 路径"},
+        "confirm": {"type": "boolean", "description": "shell/am/pm/install/uninstall 必须显式 true 才执行"},
         "timeout": {"type": "integer", "description": "超时秒数（默认 120）"},
     }, ["action"],
-     "Android 调试桥：devices/shell/push/pull/logcat/screenshot/install/uninstall/props/am/pm。多设备用 serial。"),
+     "Android 调试桥：devices/shell/push/pull/logcat/screenshot/install/uninstall/props/am/pm。多设备用 serial。shell/am/pm/install/uninstall 必须显式 confirm=true。"),
     ("androidfb", _fastboot, {
         "action": {"type": "string", "enum": ["devices", "flash", "reboot", "oem"],
                    "description": "fastboot 操作"},

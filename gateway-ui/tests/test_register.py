@@ -215,9 +215,12 @@ ck("clarify await_input attributed desktop", st["notice"]["kind"] == "await_inpu
 ck("clarify question never on bus", "SECRET_QUESTION" not in (BUS / "events.jsonl").read_text(encoding="utf-8"))
 
 # settings watcher 回写（设置界面）：请求 enable-pet true → 官方 writer 落 config + 回执
+# F5：总线鉴权——请求必须携带宿主 register 写下的 <bus>/.bus_token（与真实 worker 同款）
 def send_req(rid, key, value):
+    tok = (BUS / ".bus_token").read_text(encoding="utf-8").strip()
     (BUS / "settings_req.json").write_text(json.dumps(
-        {"id": rid, "ts": time.time(), "key": key, "value": value, "source": "settings"}),
+        {"id": rid, "ts": time.time(), "key": key, "value": value,
+         "source": "settings", "token": tok}),
         encoding="utf-8")
 
 send_req("req001", "pet.enable-pet", True)

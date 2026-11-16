@@ -27,6 +27,9 @@ def _provider():
 
     provider = MinimemProvider()
     hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    # "cron" is deliberate: any non-primary context keeps the provider from reconciling
+    # MEMORY.md/USER.md into the store, so a read-only command (stats/search/export) never
+    # embeds and writes rows just because it opened the database. See N5 in the audit.
     provider.initialize("cli", hermes_home=hermes_home, agent_context="cron")
     return provider
 

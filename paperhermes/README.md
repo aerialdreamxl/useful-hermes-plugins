@@ -45,7 +45,7 @@
 | `min_savings_chars` | 2048 | 净益门（预估回收−告知字节） | — | 载荷小的会话不折腾 | 回 2048 |
 | `audit_defer` | false | M4：面板显示失效 defer 项/重工具候选 | —（只读） | 无 | false |
 | `minify_json_tool_results` | false | M5a：完整 JSON 结果去缩进 | 待账本回填 | 结果人类可读性下降（信息无损） | false |
-| `strip_terminal_progress_noise` | false | M5b：去 ANSI/进度条中间帧/连续重复行 | 待账本回填 | 极少数靠 `\r` 帧计数的解读受影响 | false |
+| `strip_terminal_progress_noise` | false | M5b：去 ANSI/进度条中间帧/连续重复行 | 待账本回填 | 只删"帧"形态的行（纯 ANSI、`\r` 覆写帧、纯符号填充、百分比进度条）；**普通空行与段落间距原样保留**，`\r` 行末帧有实义文字时保留末帧 | false |
 | `spill_large_tool_results` | false | M6：>阈值结果写 spill/，载荷留头尾+路径 | 待账本回填 | 模型看不到中段（提示句给了逐字节取回路径）；召回 A/B 未过门前不建议开 | false + 清 spill/ |
 | `spill_min/head/tail_chars`、`spill_exclude_tools` | 20000/4000/4000/`[]` | M6 参数 | — | terminal 永远内建排除 | 回默认 |
 

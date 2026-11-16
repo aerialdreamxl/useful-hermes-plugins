@@ -34,6 +34,19 @@ logger = logging.getLogger("hermes.advanced_providers")
 REFRESH_SKEW_SECONDS = 120
 
 
+def _epoch(dt: "_dt.datetime") -> float:
+    """Epoch seconds for *dt*, reading a naive value as UTC.
+
+    Every writer in this tree stamps UTC (``_now_iso`` below, the login /
+    refresher ``expired`` values). A naive ``.timestamp()`` would read those
+    as local time and shift the answer by the host offset, so a stored
+    ``...T05:00:00`` expiry became 8h in the future under CST.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.timestamp()
+
+
 def parse_expiry(raw: Any) -> Optional[float]:
     """Unix timestamp (seconds) from the several shapes accounts carry, or None.
 
@@ -54,12 +67,12 @@ def parse_expiry(raw: Any) -> Optional[float]:
         return ts / 1000.0 if ts > 1e12 else ts
     try:
         iso = text.replace("Z", "+00:00")
-        return _dt.datetime.fromisoformat(iso).timestamp()
+        return _epoch(_dt.datetime.fromisoformat(iso))
     except ValueError:
         pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return _dt.datetime.strptime(text, fmt).timestamp()
+            return _epoch(_dt.datetime.strptime(text, fmt))
         except ValueError:
             continue
     return None

@@ -41,5 +41,5 @@ DASHSCOPE_T2I_BASE_URL=https://dashscope.aliyuncs.com
 
 - **纯文生图**：`capabilities()` 声明 text-only，传参考图/图生图参数会被明确拒绝（`Reference image input is NOT ready for use`），不会静默忽略。
 - 返回的是百炼侧的图片 URL（有效期内），由 Hermes 工具层负责落地。
-- 实现方式比较粗犷：拼一条 `curl` 命令走 shell 执行（**这是刻意的最小依赖路线**，代价是运行瞬间 API key 会出现在本机进程命令行里，多用户机器上请自行斟酌）。超时 120s。
+- **HTTP 走标准库 `urllib.request` 直发 JSON**（v1.1 起，原先拼 `curl` 走 `shell=True`）：prompt 直接进请求体、Key 放 `Authorization` 头，两者都不再经过命令行——shell 注入面与"API key 出现在进程命令行里"两个问题一起消失。超时 120s。缺 `DASHSCOPE_T2I_API_KEY` 或 `DASHSCOPE_T2I_BASE_URL` 时 `available()` 返回 false。
 - 计费跟着百炼账号按量走。

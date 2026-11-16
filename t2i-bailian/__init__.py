@@ -27,7 +27,7 @@ class BailianImageGenProvider(ImageGenProvider):
     def is_available(self) -> bool:
         # Return False if credentials or deps are missing.
         # The tool's availability gate calls this before dispatch.
-        if not os.environ.get("DASHSCOPE_T2I_API_KEY") and os.environ.get("DASHSCOPE_T2I_BASE_URL"):
+        if not os.environ.get("DASHSCOPE_T2I_API_KEY") or not os.environ.get("DASHSCOPE_T2I_BASE_URL"):
             return False
         return True
 
@@ -124,65 +124,64 @@ class BailianImageGenProvider(ImageGenProvider):
         stdout_text = ""
 
         try:
-            # ------
-            callCommand="""
-            curl -s -X POST "#BASEURL#/api/v1/services/aigc/multimodal-generation/generation" \\
-            -H "Authorization: Bearer #APIKEY#" \\
-            -H "Content-Type: application/json" \\
-            -d '{
-                "model": "#MODEL#",
-                "input": {
-                  "messages": [{"role":"user","content":[{"text":"#PROMPT#"}]}]
-                },
-                "parameters": {"size":"#SIZE#"}
-            }'
-            """
-
-            callCommand=callCommand.replace("#BASEURL#",os.environ.get("DASHSCOPE_T2I_BASE_URL"))
-            callCommand=callCommand.replace("#APIKEY#",os.environ.get("DASHSCOPE_T2I_API_KEY"))
-            callCommand=callCommand.replace("#MODEL#",model_id)
-            callCommand=callCommand.replace("#PROMPT#",prompt)
-            if aspect_ratio=="landscape":
-                callCommand=callCommand.replace("#SIZE#","1696*960")
-            elif aspect_ratio=="portrait":
-                callCommand=callCommand.replace("#SIZE#","960*1696")
-            else:
-                callCommand=callCommand.replace("#SIZE#","1280*1280")
-
-            # 1.调用我处理好的callCommand，从stdout读取服务器返回的json。
-            import subprocess
-            proc = subprocess.run(
-                callCommand,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            stdout_text = proc.stdout or ""
-
-            # 2.用json库加载json，读取"output.choices[*].message.content[*].image"中的图片URL，样例服务器返回信息在"return-msg.txt"
+            # 1.纯 Python POST（2026-11-16 修复：原实现把 prompt/model 直接替换进
+            #    curl 命令串并 shell=True —— prompt 里一个撇号就是宿主任意命令执行，
+            #    API key 也经命令行与异常文本双路外泄。改标准库直发 JSON。）
             import json
+            import urllib.error
+            import urllib.request
+
+            if aspect_ratio=="landscape":
+                size_text="1696*960"
+            elif aspect_ratio=="portrait":
+                size_text="960*1696"
+            else:
+                size_text="1280*1280"
+
+            api_key=os.environ.get("DASHSCOPE_T2I_API_KEY") or ""
+            base_url=(os.environ.get("DASHSCOPE_T2I_BASE_URL") or "").rstrip("/")
+            payload={
+                "model": model_id,
+                "input": {
+                    "messages": [{"role": "user", "content": [{"text": prompt}]}]
+                },
+                "parameters": {"size": size_text},
+            }
+            body=json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            request=urllib.request.Request(
+                base_url + "/api/v1/services/aigc/multimodal-generation/generation",
+                data=body,
+                headers={
+                    "Authorization": "Bearer " + api_key,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
             try:
-                resp = json.loads(stdout_text)
-            except json.JSONDecodeError as exc:
-                # raise RuntimeError(
-                #     f"Invalid JSON from backend (rc={proc.returncode}): {stdout_text[:500]!r}"
-                # ) from exc
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    stdout_text=(response.read() or b"").decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                detail=""
+                try:
+                    detail=(exc.read() or b"").decode("utf-8", "replace")[:500]
+                except Exception:
+                    detail=""
                 return error_response(
-                    error=str(exc),
-                    error_type=type(exc).__name__,
+                    error=f"HTTP {exc.code}: {detail or 'no body'}",
+                    error_type="RuntimeError",
                     provider=self.name,
                     model=model_id,
                     prompt=prompt,
                     aspect_ratio=aspect_ratio,
                 )
-            if proc.returncode != 0:
-                # raise RuntimeError(
-                #     f"curl failed rc={proc.returncode}: {proc.stderr or 'no stderr'}"
-                # )
+
+            # 2.用json库加载json，读取"output.choices[*].message.content[*].image"中的图片URL，样例服务器返回信息在"return-msg.txt"
+            try:
+                resp = json.loads(stdout_text)
+            except json.JSONDecodeError as exc:
                 return error_response(
-                    error=f"curl failed rc={proc.returncode}: {proc.stderr or 'no stderr'}",
-                    error_type="RuntimeError",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
                     provider=self.name,
                     model=model_id,
                     prompt=prompt,

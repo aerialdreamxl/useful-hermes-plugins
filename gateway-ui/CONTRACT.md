@@ -172,8 +172,13 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
 ### 6.1 settings_req.json（worker 写，宿主消费）
 ```json
 {"id": "hex8", "ts": 1794630867.47, "key": "pet.scale", "value": 1.0,
- "source": "settings|petmenu|petwindow"}
+ "source": "settings|petmenu|petwindow", "token": "hex32"}
 ```
+- **总线鉴权（F5）**：宿主 `register` 时生成 32 位随机 token 写 `<总线目录>/.bus_token`
+  （0600 尽力而为）；worker 每次请求现读该文件放进 `token` 字段，宿主用常量时间比较，
+  不匹配即回执 `ok=false, error="bad bus token ..."` 并**不进**幂等表、不进校验、不碰官方
+  writer。token 文件写不出来时宿主降级放行（一次性 warning，回执带 `"token":"missing"`）。
+  同用户进程仍能读 token 后伪造——这一层挡的是跨用户/盲写/误写，不是本机已被接管的场景。
 - `key` 白名单（宿主校验，越界拒绝）：顶层 5 键 `tray_enabled/bus_enabled/
   degrade_window_s/verbose_log/package_index_url` + pet 块 5 键（前缀 `pet.`）
   `enable-pet/slug/scale/roam/topmost`。
@@ -181,14 +186,17 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
   （宿主记最近 64 个已处理 id）。
 - 宿主 watcher 0.25s 轮询 mtime：校验 key/value 类型与范围（scale 钳 0.1-3.0、
   degrade_window_s 钳 60-1800、bool 强转、slug 限已安装库存或空串、url 限
-  http(s)）→ 合法则 `ctx.set_config(key, value)`（官方 writer）→ 写回执；
-  非法则回执带 error，不写 config。
+  **https 或空串**——明文 http 可被中间人换包，故直接拒）→ 合法则
+  `ctx.set_config(key, value)`（官方 writer）→ 写回执；非法则回执带 error，不写 config。
+- `balance.providers_dir` 额外要求：绝对路径、无 `..`、realpath 后**必须严格位于
+  HERMES_HOME 之下**（等于根、同级前缀、跨盘一律拒）。否则等于让模型指定一个目录、
+  宿主逐行 exec 里面的 .py——那是任意代码执行面。
 - **value 校验失败 ≠ 崩溃**：宿主照常运行，仅该请求被拒。
 
 ### 6.2 settings_ack.json（宿主写，worker 读）
 ```json
 {"id": "hex8", "ok": true, "key": "pet.scale", "value": 1.0,
- "error": "", "ts": 1794630867.5}
+ "error": "", "ts": 1794630867.5, "token": "***"}
 ```
 - worker 每 tick 读；`ok=true` → 更新内存 cfg + 刷新 UI；`ok=false` → InfoBar
   报错 + 卡片回滚到快照值。设置窗口据此给"已保存/保存失败"反馈。

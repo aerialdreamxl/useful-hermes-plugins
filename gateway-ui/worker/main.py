@@ -53,6 +53,7 @@ STATE_TTL = 8.0          # state 文件 mtime > 8s → 灯灰（失联）
 WRITER_LEASE_TTL = 4.0   # writer_lease.json mtime < 4s 才接受（写者租约）
 LEASE_FRESH_S = 8.0      # tray_lease 新鲜阈值（A3）
 LEASE_TOUCH_S = 5.0      # 硬件友好写盘：心跳=os.utime 间隔（<LEASE_FRESH_S）
+LEASE_VERIFY_S = 0.05    # N20：写租约后回读校验前的落盘安定窗（收窄并发覆盖窗口）
 _LAST_LEASE_TOUCH = 0.0
 _LAST_BEAT = 0.0
 WATCHDOG_TIMEOUT_S = 20.0
@@ -62,6 +63,10 @@ LAST_TICK_TS = time.time()
 _LAST_PET_ERR = 0.0
 _LAST_SHEET_WARN = 0.0
 _LAST_SYNC_ERR = 0.0
+# N19：pet_error.log 自带大小闸（与 debug.log/pet_debug.log 同款）——异常通道
+# 只限频不滚动的老写法会把盘写爆。
+PET_ERROR_MAX_BYTES = 1_000_000
+PET_ERROR_KEEP_LINES = 2000
 
 tray = None  # _main_inner 里 import 并接线（Qt import 必须在 boot trace 之后）
 TRAY_ICON = None  # 托盘左键改绑：桌宠不可见时气泡锚托盘图标几何
@@ -87,6 +92,23 @@ def vlog(msg: str) -> None:
         f = Path(META["bus_dir"]) / "debug.log"
         with open(f, "a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%H:%M:%S')} WK {msg}\n")
+    except Exception:
+        pass
+
+
+def pet_error_log(msg: str) -> None:
+    """pet_error.log 追加（桌宠/设置窗口异常通道取证）：>1MB 截断保留尾部
+    PET_ERROR_KEEP_LINES 行（tmp+replace 原子换，N19：老写法无上限会写爆盘）。"""
+    try:
+        f = Path(META["bus_dir"]) / "pet_error.log"
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%H:%M:%S ") + str(msg).rstrip() + "\n")
+        if f.stat().st_size > PET_ERROR_MAX_BYTES:
+            keep = f.read_text(encoding="utf-8", errors="replace").splitlines()[
+                -PET_ERROR_KEEP_LINES:]
+            tmp = f.with_name(f"pet_error.log.{os.getpid()}.tmp")
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            os.replace(tmp, f)
     except Exception:
         pass
 
@@ -154,13 +176,18 @@ def lease_self_check() -> str:
     return lease_decision(lease, time.time(), os.getpid(), pid_alive, mtime=mt)
 
 
-def write_lease() -> None:
+def write_lease() -> bool:
     """spawn 时写一次静态租约（pid/owner_pid/spawn_token，**无 ts**，硬件友好写盘：
-    心跳改由 touch_lease 的 os.utime 承担，JSON 不再每秒重写）。"""
+    心跳改由 touch_lease 的 os.utime 承担，JSON 不再每秒重写）。
+
+    N20：lease_self_check 的判定与这里的写入之间隔着 Qt 初始化，check-then-write
+    没有原子性——两个实例可能都判 pass 再各写一次。修法：tmp 名带 pid 的原子
+    replace + 回读校验 pid；被对方覆盖返回 False，调用方优雅退出。
+    写盘异常仍返回 True（fail-open：不把磁盘问题升级成"退让"）。"""
     global _LAST_LEASE_TOUCH
     try:
         p = Path(META["bus_dir"]) / "tray_lease.json"
-        tmp = p.with_name("tray_lease.json.tmp")
+        tmp = p.with_name(f"tray_lease.json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({
             "pid": os.getpid(),
             "owner_pid": int(META.get("gateway_pid") or 0),
@@ -168,8 +195,11 @@ def write_lease() -> None:
         }), encoding="utf-8")
         os.replace(tmp, p)
         _LAST_LEASE_TOUCH = time.time()
+        time.sleep(LEASE_VERIFY_S)     # 让并发写落盘：收窄同步竞态窗口
+        back = json.loads(p.read_text(encoding="utf-8"))
+        return int(back.get("pid") or 0) == os.getpid()
     except Exception:
-        pass
+        return True
 
 
 def touch_lease(now=None) -> None:
@@ -219,6 +249,17 @@ def pet_cfg() -> dict:
     return PET["cfg"]
 
 
+def bus_token() -> str:
+    """F5：settings 总线鉴权 token —— 宿主 register 时写 <bus>/.bus_token，本进程
+    每次发请求现读现带（宿主重 register 会换 token，长活 worker 必须跟新，不缓存）。
+    文件缺失返回空串：宿主侧降级放行并在 ack.token 标 "missing"（兼容旧宿主）。"""
+    try:
+        p = Path(META["bus_dir"]) / ".bus_token"
+        return p.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 def request_setting(key, value, source="petmenu"):
     """发配置修改请求（settings_req.json）→ 宿主官方 writer 落盘。
     乐观更新内存 cfg（菜单即时响应），记 pending 等回执确认/回滚。
@@ -229,9 +270,11 @@ def request_setting(key, value, source="petmenu"):
     SETTINGS["pending"][rid] = {"key": key, "value": value, "ts": time.time()}
     try:
         p = Path(META["bus_dir"]) / "settings_req.json"
-        tmp = p.with_name("settings_req.json.tmp")
+        tmp = p.with_name(f"settings_req.json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"id": rid, "ts": time.time(), "key": key,
-                                   "value": value, "source": source},
+                                   "value": value, "source": source,
+                                   # F5：总线鉴权（宿主校验，伪造请求会被拒）
+                                   "token": bus_token()},
                                   ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
         vlog(f"request_setting {key}={value!r} id={rid}")
@@ -366,13 +409,7 @@ def open_settings():
         return win
     except Exception as exc:
         trace(f"SettingsWindow create failed: {type(exc).__name__}: {exc}")
-        try:
-            with open(Path(META["bus_dir"]) / "pet_error.log", "a",
-                      encoding="utf-8") as fh:
-                fh.write(time.strftime("%H:%M:%S ") + "SettingsWindow: "
-                         + traceback.format_exc())
-        except Exception:
-            pass
+        pet_error_log("SettingsWindow: " + traceback.format_exc())
         return None
 
 
@@ -555,12 +592,7 @@ def sync_pet(app):
             if now2 - _LAST_PET_ERR > 10.0:  # 限频留证，不再静默
                 _LAST_PET_ERR = now2
                 vlog(f"PetWindow CREATE FAILED: {type(exc).__name__}: {exc}")
-                try:
-                    with open(Path(META["bus_dir"]) / "pet_error.log", "a",
-                              encoding="utf-8") as fh:
-                        fh.write(time.strftime("%H:%M:%S ") + traceback.format_exc())
-                except Exception:
-                    pass
+                pet_error_log(traceback.format_exc())
             return
     if win is None:
         return
@@ -716,7 +748,10 @@ def _main_inner():
     except Exception:
         pass
     # 启动后立即写一次租约（QApplication 建立后、tray.show() 前）。
-    write_lease()
+    # N20：写后回读校验——租约被判给别的实例就优雅退出（不弹窗、不报错、rc=0）。
+    if not write_lease():
+        trace("lease taken by another instance after write -> graceful exit")
+        return
     tray_icon = QSystemTrayIcon(QIcon(tray.tray_pixmap("green")))
     TRAY_ICON = tray_icon   # 托盘左键改绑：桌宠不可见时气泡锚托盘图标
     # 事件反应收口：托盘闪动控制器（light_fn 用当前灯色，闪动帧=灯色+事件高亮）。

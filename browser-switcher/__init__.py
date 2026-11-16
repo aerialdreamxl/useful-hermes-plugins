@@ -34,6 +34,7 @@ ShardX 配置全部来自环境（$HERMES_HOME/.env 或进程环境）：
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ import re
 import subprocess
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -214,12 +216,58 @@ def _shardx_stop(profile_id: str) -> None:
 
 
 # ── CDP 端点发现（http 端点 -> ws URL；ws 原样）─────────────────────────
+# F3 白名单只认 RFC1918 + IPv6 ULA；loopback / link-local 用 ipaddress 自带判定
+_LOCAL_V4 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+_LOCAL_V6 = (ipaddress.ip_network("fc00::/7"),)
+
+
+def _cdp_host_is_local(host: str) -> bool:
+    """只看字面：localhost / loopback / RFC1918 / ULA / link-local（不做 DNS 解析）。"""
+    h = (host or "").strip().rstrip(".").lower()
+    if not h:
+        return False
+    if h == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(h.split("%")[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback or ip.is_link_local:
+        return True
+    for n in (_LOCAL_V4 if ip.version == 4 else _LOCAL_V6):
+        if ip in n:
+            return True
+    return False
+
+
+def _check_cdp_endpoint(url: str) -> None:
+    """F3：cdp 后端的主机白名单 —— 默认只许本机/私网，公网端点会让整个浏览器工具面
+    指向外部端点。确需远程时显式开 BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1。"""
+    allow = (os.environ.get("BROWSER_SWITCHER_ALLOW_REMOTE_CDP") or "").strip().lower()
+    if allow in ("1", "true", "yes"):
+        return
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        host = ""
+    if _cdp_host_is_local(host):
+        return
+    raise RuntimeError(
+        f"CDP 端点主机 '{host or '?'}' 不在本地白名单（只允许 127.0.0.0/8、::1、localhost、"
+        "RFC1918 私网、IPv6 ULA fc00::/7、link-local）。若确需连远程端点，先设 "
+        "BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1。"
+    )
+
+
 def _discover_cdp_ws(url: str) -> str:
     url = url.strip()
     if not url:
         raise RuntimeError("CDP URL 为空")
     if not re.match(r"^(wss?|https?)://", url):
         raise RuntimeError(f"CDP URL 需以 ws:// wss:// http:// https:// 开头，收到: {url!r}")
+    _check_cdp_endpoint(url)
     if url.startswith(("ws://", "wss://")):
         return url
     version_url = url.rstrip("/") + "/json/version"
@@ -263,24 +311,34 @@ def _close_agent_browser_daemons_best_effort() -> None:
 
 # ── 核心：把 desired 落到进程实际状态 ──────────────────────────────────
 def _apply(desired: Dict[str, Any]) -> str:
-    """解析并挂载 desired；成功返回描述行，失败抛 RuntimeError（不改进程状态）。"""
+    """解析并挂载 desired；成功返回描述行，失败抛 RuntimeError（不改进程状态）。
+
+    N1：解析端点（ShardX start 最长 35s、CDP 发现 6s）与停旧 profile（10s）全部在 _lock
+    外做 —— _middleware 每次 browser_* 派发前抢同一把锁，持锁等网络会把其它线程全排住。
+    """
     provider = desired["provider"]
     global _attached
+    # 1) 先解析新端点（解析失败 = 进程状态原样，调用方回滚 desired）
+    if provider == "default":
+        new_cdp, shard_pid = "", ""
+    elif provider == "shardx":
+        started = _shardx_start(desired["extra"] or _shardx_default_name() or "", headless=desired.get("headless", True))
+        new_cdp, shard_pid = started["cdp"], started["profile_id"]
+    elif provider == "cdp":
+        _check_cdp_endpoint(desired["extra"] or "")
+        new_cdp, shard_pid = _discover_cdp_ws(desired["extra"]), ""
+    else:
+        raise RuntimeError(f"未知后端 '{provider}'")
+    to_stop = ""
     with _lock:
         old = _attached
-        # 1) 先解析新端点（解析失败 = 进程状态原样，调用方回滚 desired）
-        if provider == "default":
-            new_cdp, shard_pid = "", ""
-        elif provider == "shardx":
-            started = _shardx_start(desired["extra"] or _shardx_default_name() or "", headless=desired.get("headless", True))
-            new_cdp, shard_pid = started["cdp"], started["profile_id"]
-        elif provider == "cdp":
-            new_cdp, shard_pid = _discover_cdp_ws(desired["extra"]), ""
-        else:
-            raise RuntimeError(f"未知后端 '{provider}'")
-        # 2) 拆旧挂载的 ShardX profile（换 default / 换 shardx profile 时）
+        # 并发：解析期间别的线程已把同一 ShardX profile 挂上 → 复用它解析出的 cdp
+        if provider == "shardx" and old and old.get("provider") == "shardx" \
+                and old.get("shardx_profile_id") == shard_pid and old.get("cdp"):
+            new_cdp = old["cdp"]
+        # 2) 拆旧挂载的 ShardX profile（换 default / 换 shardx profile 时）—— 网络部分出锁再做
         if old and old.get("provider") == "shardx" and old.get("shardx_profile_id") and old["shardx_profile_id"] != shard_pid:
-            _shardx_stop(old["shardx_profile_id"])
+            to_stop = old["shardx_profile_id"]
         # 3) 装载新 env + 撕两类 daemon + 清 CDP supervisor 缓存判定（下条工具调用自然重建）
         _set_process_cdp(new_cdp or None)
         _stop_harness_daemons_best_effort()
@@ -294,11 +352,17 @@ def _apply(desired: Dict[str, Any]) -> str:
         for k in list(_attached_owner) :
             _attached_owner[k] = _now()
         logger.info("browser-switcher: attached provider=%s", provider)
-        if provider == "default":
-            return "已切回内建 Headless Chromium（default）。"
-        if provider == "shardx":
-            return f"已挂载 ShardX 指纹浏览器（profile: {desired['extra'] or _shardx_default_name()}，headless={desired.get('headless', True)}），CDP 握手正常。"
-        return f"已挂载外部 CDP 端点（{new_cdp.split('/devtools/')[0]}…）。"
+    if to_stop:
+        # 锁外停工；期间别的线程若又挂回同一 profile 就跳过（别掐活着的浏览器）
+        with _lock:
+            reused = ((_attached or {}).get("shardx_profile_id") or "") == to_stop
+        if not reused:
+            _shardx_stop(to_stop)
+    if provider == "default":
+        return "已切回内建 Headless Chromium（default）。"
+    if provider == "shardx":
+        return f"已挂载 ShardX 指纹浏览器（profile: {desired['extra'] or _shardx_default_name()}，headless={desired.get('headless', True)}），CDP 握手正常。"
+    return f"已挂载外部 CDP 端点（{new_cdp.split('/devtools/')[0]}…）。"
 
 
 def _status_line() -> str:
@@ -310,10 +374,11 @@ def _status_line() -> str:
         elif provider == "cdp":
             cdp = (_attached or {}).get("cdp", "")
             extra = f" url={cdp[:60]}{'…' if len(cdp) > 60 else ''}"
-        health = ""
-        if provider == "shardx":
-            health = "（launcher 在线）" if _shardx_health() else "（⚠ launcher 不在线）"
-        return f"当前会话后端: {provider or 'default'}{extra}{health}；作用域=仅本会话，重启进程后自动回到 default。"
+    # 健康探测是 4s 的网络调用，放锁外（否则 /browserswitch 与 middleware 互堵）
+    health = ""
+    if provider == "shardx":
+        health = "（launcher 在线）" if _shardx_health() else "（⚠ launcher 不在线）"
+    return f"当前会话后端: {provider or 'default'}{extra}{health}；作用域=仅本会话，重启进程后自动回到 default。"
 
 
 # ── 切换入口共享引擎（slash 与 tool 共用一条路，报告式返回）────────────

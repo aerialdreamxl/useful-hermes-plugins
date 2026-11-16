@@ -94,6 +94,9 @@ sidecar 上限压到 10——服务端 20 条整批会随机 500 "Receive batchi
   `dense&sparse` = 双份模型下载与内存；无需任何 API Key。
 - 后端连续失败 3 次：本会话停用该后端、退回关键词路；**绝不静默切换到另一个后端**（跨向量空间混用是 13.1 铁律）。
 - 后端依赖缺失且 `allow_pm_install: false`：明确报错提示，不自动装包。
+- **sidecar 子进程只拿到白名单环境变量**：`PATH`/`SYSTEMROOT`/`TEMP`/`USERPROFILE`/`APPDATA`/`PYTHONUTF8` 这类系统键 + 代理与 CA（`HTTP(S)_PROXY`/`SSL_CERT_FILE`/`HF_ENDPOINT`，模型下载需要）+ `HERMES_*` 命名空间。`OPENAI_API_KEY`、`DASHSCOPE_API_KEY`、`HF_TOKEN` 等一律不透传——embedding key 走请求 JSON 里的 `worker_config` 显式给。以前是 `dict(os.environ)` 全量继承，等于把宿主全部密钥交给 pip 装进来的第三方包。
+- **只有主会话（`agent_context == "primary"`）才做 MEMORY.md/USER.md 镜像同步**：cron、子代理、flush 上下文都不写库（Hermes 自己的 provider 契约就是这么要求的）。CLI 的只读命令（stats/search）不再顺带触发一次嵌入。
+- `recent()` 按解析后的时间戳排序，不再用 `created` 文本列做字典序比较（`+0800` 与 `+0000` 混存时文本序会把 10:00+0800 排到 04:00Z 前面）。代价是 `recent()` 变全表扫，仅在 stats/最后写入时间这类低频路径调用。
 
 ## 结构
 

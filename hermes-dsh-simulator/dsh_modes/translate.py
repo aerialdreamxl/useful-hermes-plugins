@@ -13,10 +13,12 @@ Design contract (from the user):
   ``[Command finished with exit code N]`` trailer).
 
 Local read-only pre-checks (existence, uniqueness of ``old_str``, insert-line
-range) are computed directly from the file — exactly what DSH does against its
-fs seam — so DSH's error texts can be reproduced with the real line numbers
-before anything is mutated. All mutations still go through the Hermes tools so
-Hermes' own guards, locks and approvals stay in force.
+range) are computed from the content the host ``read_file`` already returned —
+exactly what DSH does against its fs seam — so DSH's error texts can be
+reproduced with the real line numbers before anything is mutated, while every
+byte still crosses the host's read tracking, path policy and guards (no local
+``open()``). All mutations still go through the Hermes tools so Hermes' own
+guards, locks and approvals stay in force.
 """
 
 from __future__ import annotations
@@ -67,9 +69,166 @@ def _maybe_truncate(text: str) -> str:
     return text[:limit] + C.TRUNCATED_MESSAGE
 
 
-def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        return handle.read()
+# -- host reads --------------------------------------------------------------
+# No local ``open()`` anywhere below: the editor's content always comes from the
+# host ``read_file`` tool, so its read tracking, path policy, binary/encoding
+# checks and redaction stay in force exactly as for a native Hermes call.
+
+_READ_PAGE_LIMIT = 2000  # Hermes DEFAULT_READ_LIMIT
+_MAX_READ_PAGES = 200    # defensive: 200 x 2000 lines before we call a read inexact
+_GUTTER_RE = re.compile(r"^\d+\|")      # host pages render "<n>|content"
+_CLAMP_MARKER = "... [truncated]"       # host clamps an over-long line with this
+_UNKNOWN_BINARY_RE = re.compile(r"binary file \(unknown binary", re.IGNORECASE)
+_MOJIBAKE = "\ufffd"
+_page_cycle = [0]       # rotates the internal page size (see _next_page_limit)
+
+_NOT_UTF8_VIEW = 'cannot view "%s": file is not valid UTF-8 text (maybe GBK/ANSI); convert it first'
+_NOT_UTF8_EDIT = 'cannot edit "%s": file is not valid UTF-8 text (maybe GBK/ANSI); convert it first'
+_NOT_UTF8_INSERT = 'cannot insert into "%s": file is not valid UTF-8 text (maybe GBK/ANSI); convert it first'
+_NO_INSERT_READ = (
+    'cannot insert into "%s": the host read could not be reproduced verbatim '
+    "(an over-long line was clamped or content was redacted); use str_replace instead"
+)
+
+
+def _page_lines(content: str) -> list:
+    """Strip the host's ``<n>|`` gutter back to raw source lines."""
+    if content == "":
+        return []
+    return [_GUTTER_RE.sub("", line, count=1) for line in content.split("\n")]
+
+
+def _next_page_limit() -> int:
+    """A slightly different page size per internal read.
+
+    The host keys both its "unchanged" dedup and its repeated-read block on
+    ``(path, offset, limit)``. An edit's own pre-check read is not the model
+    re-reading on purpose, so it must not spend the model's read budget on a file
+    it is actively editing — a rotating size keeps those keys distinct.
+    """
+    _page_cycle[0] = (_page_cycle[0] + 1) % 4
+    return _READ_PAGE_LIMIT - _page_cycle[0]
+
+
+def _fit_original(text: str, file_size):
+    """Re-fit host page text to the on-disk byte shape. ``(text, matched)``.
+
+    The host read normalises before numbering lines (CR dropped, UTF-8 BOM
+    dropped, one final newline dropped), so a faithful ``before`` puts them back:
+    enumerate ``(eol, final newline, BOM)`` combinations and keep the one whose
+    UTF-8 length equals the host-reported ``file_size``. A BOM weighs exactly as
+    much as two CRs plus a newline, so a short file can admit two shapes — that
+    is reported as *unmatched* rather than guessed: callers that rewrite the file
+    must never invent bytes.
+    """
+    if not isinstance(file_size, int) or file_size <= 0:
+        return text, True
+    hits = []
+    for eol in ("\n", "\r\n"):
+        body = text if eol == "\n" else text.replace("\n", eol)
+        for tail in ("", eol):
+            for prefix in ("", "\ufeff"):
+                candidate = prefix + body + tail
+                try:
+                    size = len(candidate.encode("utf-8"))
+                except Exception:
+                    continue
+                if size == file_size and candidate not in hits:
+                    hits.append(candidate)
+    if len(hits) == 1:
+        return hits[0], True
+    return text, False
+
+
+def _host_read_page(path: str, fwd: Forwarders, kw: dict, offset: int, limit: int):
+    """One host read page. ``(page, error)``.
+
+    The host answers a repeated identical ``(path, offset, limit)`` read with an
+    "unchanged" stub instead of content (and blocks it after two), so a stub is
+    retried with a nudged ``limit``: every caller here needs real bytes.
+    """
+    for nudge in (0, 1, 2):
+        page = _parse(
+            fwd.read_file(
+                {"path": path, "offset": offset, "limit": max(1, limit - nudge)},
+                dict(kw),
+            )
+        )
+        if not isinstance(page, dict):
+            return None, 'cannot read "%s": the host read tool returned no page' % path
+        if page.get("error"):
+            return None, str(page["error"])
+        if page.get("dedup") or page.get("content_returned") is False:
+            continue
+        if isinstance(page.get("content"), str):
+            return page, None
+        return None, 'cannot read "%s": the host read tool returned no content' % path
+    return None, 'cannot read "%s": the host read tool kept returning its dedup stub' % path
+
+
+def _host_read_all(path: str, fwd: Forwarders, kw: dict, internal: bool = False):
+    """Read *path* wholly through the host read tool. ``(text, exact, error)``.
+
+    *text* is the file re-fitted to its on-disk shape (empty on error), *exact*
+    is False when the pages could not be reproduced verbatim (a line clamped by
+    the host's per-line limit, a mid-line char-budget cut, redacted content, or
+    the defensive page cap), and *error* is a host error string. *internal* marks
+    a read the plugin needs for its own pre-check (edit/insert) rather than one
+    the model asked for; it uses a rotating page size so it never trips the
+    host's repeated-read guard.
+    """
+    lines = []
+    offset = 1
+    page_limit = _next_page_limit() if internal else _READ_PAGE_LIMIT
+    total_lines = None
+    file_size = None
+    lossy = False
+    finished = False
+    for _ in range(_MAX_READ_PAGES):
+        page, error = _host_read_page(path, fwd, kw, offset, page_limit)
+        if error:
+            return "", False, error
+        if not isinstance(page, dict):
+            return "", False, 'cannot read "%s": the host read tool returned no page' % path
+        if total_lines is None:
+            total_lines = page.get("total_lines")
+            file_size = page.get("file_size")
+        page_lines = _page_lines(page["content"])
+        if page.get("truncated_lines"):
+            lossy = True
+        if any(line.endswith(_CLAMP_MARKER) for line in page_lines):
+            lossy = True
+        lines.extend(page_lines)
+        try:
+            next_offset = int(page.get("next_offset") or 0)
+        except (TypeError, ValueError):
+            next_offset = 0
+        if next_offset <= offset:
+            finished = True
+            break
+        offset = next_offset
+    if not finished:
+        lossy = True  # page cap: the tail never arrived
+    if isinstance(total_lines, int) and total_lines != len(lines):
+        lossy = True
+    text, matched = _fit_original("\n".join(lines), file_size)
+    return text, matched and not lossy, None
+
+
+def _host_error_is_encoding(error) -> bool:
+    """True when the host refused the read as undecodable bytes (a legacy-encoded
+    or genuine binary file) rather than as a path/guard/permission problem."""
+    text = str(error or "")
+    return bool(_UNKNOWN_BINARY_RE.search(text)) or "not valid utf-8" in text.lower()
+
+
+def _text_is_undecodable(text: str, exact: bool) -> bool:
+    """U+FFFD *and* no byte-size fit: the file is not UTF-8.
+
+    A valid UTF-8 file may legitimately contain U+FFFD (3 bytes, so the fit still
+    matches); replacements from decoding a GBK/ANSI file never do.
+    """
+    return bool(text) and _MOJIBAKE in text and not exact
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +279,6 @@ def handle_bash(args: dict, kw: dict, fwd: Forwarders) -> str:
 # ---------------------------------------------------------------------------
 
 _EDITOR_COMMANDS = ("view", "create", "str_replace", "insert")
-_READ_PAGE_LIMIT = 2000  # Hermes DEFAULT_READ_LIMIT
 
 
 def handle_editor(args: dict, kw: dict, fwd: Forwarders) -> str:
@@ -166,16 +324,13 @@ def _editor_view(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
     if not os.path.isfile(path):
         return 'cannot view "%s": not a regular file or directory' % path
 
-    forwarded = _parse(fwd.read_file({"path": path, "offset": 1, "limit": _READ_PAGE_LIMIT}, dict(kw)))
-    try:
-        content = _read_text(path)
-    except (UnicodeDecodeError, OSError):
-        if isinstance(forwarded, dict):
-            if forwarded.get("error"):
-                return str(forwarded["error"])
-            if isinstance(forwarded.get("content"), str):
-                return forwarded["content"]
-        return 'cannot view "%s": not a regular file or directory' % path
+    content, exact, error = _host_read_all(path, fwd, kw)
+    if error:
+        if _host_error_is_encoding(error):
+            return _NOT_UTF8_VIEW % path
+        return error
+    if _text_is_undecodable(content, exact):
+        return _NOT_UTF8_VIEW % path
     return _format_view(path, content, args.get("view_range"))
 
 
@@ -299,16 +454,23 @@ def _editor_replace(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
         return C.err_is_dir(path)
     if not os.path.isfile(path):
         return C.err_edit_not_file(path)
-    try:
-        before = _read_text(path)
-    except (UnicodeDecodeError, OSError):
-        return C.err_edit_not_file(path)
 
-    offsets = _match_offsets(before, old_value)
-    if not offsets:
-        return C.err_edit_not_found(path, old_value)
-    if len(offsets) > 1:
-        return C.err_edit_multiple(path, old_value, _line_numbers(before, offsets))
+    before, exact, error = _host_read_all(path, fwd, kw, internal=True)
+    if error:
+        if _host_error_is_encoding(error):
+            return _NOT_UTF8_EDIT % path
+        return error
+    if _text_is_undecodable(before, exact):
+        return _NOT_UTF8_EDIT % path
+
+    if exact:
+        offsets = _match_offsets(before, old_value)
+        if not offsets:
+            return C.err_edit_not_found(path, old_value)
+        if len(offsets) > 1:
+            return C.err_edit_multiple(path, old_value, _line_numbers(before, offsets))
+    # Inexact page (clamped line / redacted content): skip the local pre-check
+    # instead of denying an edit DSH would have found — the host patch decides.
 
     result = _parse(
         fwd.patch(
@@ -329,28 +491,46 @@ def _editor_replace(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
 
 # -- insert -------------------------------------------------------------------
 
-def _ensure_write_baseline(path: str, fwd: Forwarders, kw: dict):
-    """Page a full read through Hermes so its write_file guard sees a fresh
-    whole-file baseline; returns an error string or None."""
-    offset = 1
-    for _ in range(100):
-        result = _parse(fwd.read_file({"path": path, "offset": offset, "limit": _READ_PAGE_LIMIT}, dict(kw)))
-        if not isinstance(result, dict):
-            return None  # non-JSON result — let the write guard decide
-        if result.get("error"):
-            return str(result["error"])
-        next_offset = result.get("next_offset")
-        if not next_offset:
+def _insert_by_anchor(path: str, before: str, insert_line: int, new_value: str, fwd: Forwarders, kw: dict):
+    """Insert one line without rewriting the file, through the host patch.
+
+    Only used when the host page cannot be reproduced byte-for-byte (a short
+    file where a BOM and two CRs weigh the same, or a clamped line): the anchor
+    line's TEXT is still exact, and a single-line anchor carries no line ending,
+    so splicing it cannot disturb the rest of the file. Returns the result text,
+    or None when no anchor is unambiguous.
+    """
+    if not isinstance(insert_line, int) or isinstance(insert_line, bool):
+        return None
+    lines = before.split("\n")
+    if insert_line < 0 or insert_line > len(lines):
+        return None
+    candidates = []
+    if insert_line > 0:
+        candidates.append((insert_line - 1, False))   # append below the line above
+    if insert_line < len(lines):
+        candidates.append((insert_line, True))        # prepend above the line below
+    for index, prepend in candidates:
+        anchor = lines[index]
+        if not anchor.strip() or before.count(anchor) != 1:
+            continue  # blank or non-unique anchor: the host patch could misfire
+        replacement = (new_value + "\n" + anchor) if prepend else (anchor + "\n" + new_value)
+        result = _parse(
+            fwd.patch(
+                {
+                    "mode": "replace",
+                    "path": path,
+                    "old_string": anchor,
+                    "new_string": replacement,
+                    "replace_all": False,
+                },
+                dict(kw),
+            )
+        )
+        if isinstance(result, dict) and result.get("error"):
             return None
-        try:
-            next_page = int(next_offset)
-        except (TypeError, ValueError):
-            return None
-        if next_page <= offset:
-            # No forward progress — treat as complete and let the write guard decide.
-            return None
-        offset = next_page
-    return "Error: could not establish a full-file read baseline for %s (too many pages)." % path
+        return C.ok_edited(path)
+    return None
 
 
 def _editor_insert(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
@@ -369,10 +549,21 @@ def _editor_insert(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
         return C.err_is_dir(path)
     if not os.path.isfile(path):
         return C.err_insert_not_file(path)
-    try:
-        before = _read_text(path)
-    except (UnicodeDecodeError, OSError):
-        return C.err_insert_not_file(path)
+
+    # insert rewrites the whole file, so a page that is not byte-faithful would
+    # silently damage it: splice through the host patch when the byte shape is
+    # ambiguous, and refuse when even that anchor is unusable.
+    # The full paged read also establishes the host's write_file baseline.
+    before, exact, error = _host_read_all(path, fwd, kw, internal=True)
+    if error:
+        if _host_error_is_encoding(error):
+            return _NOT_UTF8_INSERT % path
+        return error
+    if _text_is_undecodable(before, exact):
+        return _NOT_UTF8_INSERT % path
+    if not exact:
+        spliced = _insert_by_anchor(path, before, insert_line, new_value, fwd, kw)
+        return spliced if spliced is not None else (_NO_INSERT_READ % path)
 
     lines = before.split("\n")
     if (
@@ -384,10 +575,15 @@ def _editor_insert(args: dict, path: str, fwd: Forwarders, kw: dict) -> str:
         return C.err_insert_range(insert_line, len(lines))
 
     after = "\n".join(lines[:insert_line] + new_value.split("\n") + lines[insert_line:])
-    baseline_error = _ensure_write_baseline(path, fwd, kw)
-    if baseline_error:
-        return baseline_error
     result = _parse(fwd.write_file({"path": path, "content": after}, dict(kw)))
+    if isinstance(result, dict) and result.get("stale_write_blocked"):
+        # The host refuses a whole-file overwrite when a read could not record a
+        # stable stat snapshot (on Windows a cached directory-entry ctime can
+        # differ from the file's own). Every byte was read, so splice the line in
+        # through the host patch instead of dropping the insert.
+        spliced = _insert_by_anchor(path, before, insert_line, new_value, fwd, kw)
+        if spliced is not None:
+            return spliced
     if isinstance(result, dict) and result.get("error"):
         return str(result["error"])
     return C.ok_edited(path)

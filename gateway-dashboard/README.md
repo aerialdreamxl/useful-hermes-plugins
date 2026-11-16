@@ -6,7 +6,7 @@
 
 | 文件 | 加载方 | 职责 |
 |---|---|---|
-| `__init__.py` register(ctx) | Gateway 进程（插件系统） | 订阅 `pre_gateway_dispatch`/`on_session_start`，首个事件踢起 dashboard 子进程（console python.exe + `windows_detach_flags()` 隐藏控制台、注入 `_CHILD` 标记）→端口探测握手→回写总线 `dashboard_url` |
+| `__init__.py` register(ctx) | Gateway 进程（插件系统） | 订阅 `pre_gateway_dispatch`/`on_session_start`，首个事件踢起 dashboard 子进程（console python.exe + `windows_detach_flags()` 隐藏控制台、注入 `_CHILD` 标记）→端口探测握手→把 `dashboard_url` 写进**自己的** `cache/gateway-dashboard/dashboard_state.json` |
 | `plugin.yaml` | Settings 面板 | config_schema 六键（§2A 全参数映射） |
 | `dashboard/manifest.json + plugin_api.py` | dashboard 进程 | `/api/plugins/gateway-dashboard/*` 只读 API（现为 spike3 `/ping`） |
 
@@ -41,7 +41,10 @@
 - Gateway 被强杀时子进程可能孤儿；下次 kick 探测复用自然收敛。手工清理 `hermes dashboard --stop`
   注意它停**全部** Hermes web 进程，慎用。
 - CLI venv 同步重生（pythonw→python.exe 孙进程）是正常路径，握手按端口不按 PID。
-- `state.json.dashboard_url` 回写：gateway-fluent-gui 未装时静默跳过。
+- **自己的状态文件**：`<HERMES_HOME>/cache/gateway-dashboard/dashboard_state.json`（由 `_PLUGIN_ID` 推导，
+  不再硬编码任何已退役目录名）。这是本插件**唯一**写入点——铁律：同一份总线 state 只允许一个插件写，
+  两个插件写同一个 state.json 会互相覆盖对方的 `dashboard_url`/`pet_enabled`。
+- `dashboard_state.dashboard_url` 回写：gateway-ui 未装时静默跳过。
 
 ## 验证状态
 

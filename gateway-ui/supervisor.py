@@ -102,7 +102,15 @@ class Supervisor:
         if found and Path(found).is_file():
             return Path(found)
         old = os.environ.get("UV_INDEX_URL")
-        url = self.index_url_fn()
+        # N21：注入 uv 的 pip 索引源**只接受 https**。明文 http 源可被中间人整包替换
+        # （供应链投毒）；而 UV_INDEX_URL 是进程全局 env（uv 子进程直接继承），一改
+        # 就顺带影响同进程里其它安装。写入侧 config.validate_request 已只放行
+        # https，这里再兜一层"作者手改 config.yaml 留下的 http 旧值"；finally 逐字
+        # 恢复原值，绝不把插件配置泄漏成进程级持久状态。
+        url = str(self.index_url_fn() or "").strip()
+        if url and not url.lower().startswith("https://"):
+            self._log(f"package_index_url ignored (not https): {url[:60]}")
+            url = ""
         try:
             if url:
                 os.environ["UV_INDEX_URL"] = url
