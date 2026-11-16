@@ -23,6 +23,9 @@ TOP_DEFAULTS = {
     "degrade_window_s": 300,
     "verbose_log": False,
     "package_index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+    # R27 子代理监听（修改类，默认 false）：subagent_busy 开=会话全空闲但
+    # delegate_task 子代理在跑时，忙线判 acting/灯橙（主人 2026-11-16 点名）。
+    "subagent_busy": False,
 }
 
 PET_DEFAULTS = {
@@ -31,6 +34,11 @@ PET_DEFAULTS = {
     "scale": 0.7,
     "roam": True,
     "topmost": True,
+    # 地面物理增强 R26（PROMPT §11）：显示类行为细节键（与 roam/topmost 同族，
+    # 缺键自动补齐走官方 writer）。follow_window=站立线段跟随来源窗口运动；
+    # vertical_roam=主动上下爬+跨线段跳转（关掉仍保留确认计时器被动上爬）。
+    "follow_window": True,
+    "vertical_roam": True,
     # 事件反应：会话事件反应（托盘闪动+桌宠 play_reaction）。作者本轮点名要此功能，
     # 默认 true（DIY 规范默认 false 的偏离已向作者申报）。修改类开关：
     # 缺键按默认 true 读，绝不自动落盘（A1 铁律），只有用户显式操作才写。
@@ -228,7 +236,8 @@ def validate_request(req, installed_slugs=()) -> tuple:
     leaf = key[4:] if key.startswith("pet.") else key
     try:
         if leaf in ("tray_enabled", "bus_enabled", "verbose_log",
-                    "enable-pet", "roam", "topmost", "event_reactions"):
+                    "enable-pet", "roam", "topmost", "event_reactions",
+                    "follow_window", "vertical_roam", "subagent_busy"):
             return (True, key, bool(val), "")
         if leaf == "scale":
             f = float(val)

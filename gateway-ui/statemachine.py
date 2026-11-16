@@ -89,6 +89,7 @@ class StateMachine:
         self.active: dict = {}          # session_key -> last_event_ts
         self.phase: dict = {}           # session_key -> (phase, ts)
         self.authority = None           # None=事件兜底；dict=权威 {key: phase}
+        self.subagents = 0              # R27：活跃子代理数（delegate_tool_registry）
         self.authority_streak = 0
         self.baseline_provider = None
         self.baseline_base_url = None
@@ -225,8 +226,10 @@ class StateMachine:
             self.error_active_until = ts + 30
 
     # ---------------------------------------------------------- 权威源 ----
-    def set_authority(self, items, now: float | None = None) -> None:
+    def set_authority(self, items, now: float | None = None, subagents: int = 0) -> None:
         """items = runner._running_agent_items() 的 (key, agent) 列表。
+        subagents = 本进程活跃子代理数（R27，delegate_tool_registry 表）——
+        会话全空闲但子代理在跑也算在工作（主人裁定 2026-11-16）。
 
         降级判定（内部链路优先）：任一活跃 agent 的 _provider_fallback_active
         为 True = 真走了失败切换链（try_activate_fallback 置位、主恢复清零；
@@ -234,6 +237,7 @@ class StateMachine:
         权威源可达期间端点启发式被门控掉，手动切供应商不再误判。"""
         import time as _time
         now = _time.time() if now is None else now
+        self.subagents = int(subagents or 0)
         auth = {}
         degraded_agent = None
         for k, agent in items:
@@ -259,8 +263,15 @@ class StateMachine:
     # ---------------------------------------------------------- 派生 ----
     def active_count(self) -> int:
         if self.authority is not None:
-            return len(self.authority)
-        return len(self.active)
+            n = len(self.authority)
+        else:
+            n = len(self.active)
+        # R27 子代理监听：会话数为 0 但子代理在跑 → 按 1 计（灯橙）。
+        # 有活跃会话时子代理不虚增计数（子代理是父会话工作的一部分，
+        # 单会话+子代理不升 busy）。
+        if n == 0 and self.subagents > 0:
+            return 1
+        return n
 
     def derive(self, now: float) -> str:
         auth = self.authority
@@ -282,6 +293,11 @@ class StateMachine:
                 return best
         if now < self.error_active_until and self.error_ts:
             return "error"
+        # R27 子代理监听：无活跃会话但子代理在跑 = 在工作（acting，
+        # 桌宠跑动+灯橙）。位于 error 短窗之后（错误情绪先展示 30s）、
+        # 压过 happy/listening/idle（工作是持续事实，情绪是瞬时展示）。
+        if self.subagents > 0:
+            return "acting"
         if now < self.happy_until:
             return "happy"
         if now < self.state_until:

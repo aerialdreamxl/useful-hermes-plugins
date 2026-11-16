@@ -137,6 +137,10 @@ win2.dragging = False
 # ============ rule7：站在低线段，高线段穿过身体 → 攀爬上去 ============
 win3 = PetWindow(meta, BUS, lambda: dict(cfg_on), None, pet_menu=None)
 win3.roam_on = True; win3.at_rest = True; win3.dragging = False
+# R26-6 接触概率钉死：本断言组测 rule7 机制本身（必爬语义），概率行为另测
+import pet_window as _pw3
+_cc3 = _pw3.CONTACT_CLIMB_CHANCE
+_pw3.CONTACT_CLIMB_CHANCE = 1.0
 Hh = win3.height()
 low_y = 700.0
 high_y = 700.0 - (Hh - 10)   # 高线段穿过身体（在窗口矩形内、更高）
@@ -159,6 +163,7 @@ for _ in range(200):
     time.sleep(1/90)
 ck("rule7: climb triggered", climbed)
 ck("rule7: climbed onto higher segment", reached_high)
+_pw3.CONTACT_CLIMB_CHANCE = _cc3  # R26-6：恢复真实概率，后续断言不受影响
 
 # ============ 无瞬移：单帧位移有界 ============
 win4 = PetWindow(meta, BUS, lambda: dict(cfg_on), None, pet_menu=None)

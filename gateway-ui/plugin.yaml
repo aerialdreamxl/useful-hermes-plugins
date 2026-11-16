@@ -28,6 +28,10 @@ config_schema:
     type: boolean
     default: false
     description: "详细日志：GW/WK/PET 三前缀写 cache/gateway-ui/debug.log（桌宠物理 pet_debug.log），400KB 滚动。false=零写入。"
+  subagent_busy:
+    type: boolean
+    default: false
+    description: "子代理忙线：无活跃会话但有 delegate_task 子代理在跑时，托盘灯亮橙、桌宠演工作。只覆盖本进程派发的子代理。"
   package_index_url:
     type: string
     default: "https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -35,7 +39,16 @@ config_schema:
   pet:
     type: object
     default: {}
-    description: "桌宠独立配置块（与 Hermes display.pet 完全隔开）。enable-pet 总开关默认 false 且三态处理（缺键≠false、默认值不回写）；slug 空=第一只已安装 petdex；scale 0.7；roam true；topmost true。"
+    description: "桌宠独立配置块（与 Hermes display.pet 完全隔开）。enable-pet 总开关默认 false 且三态处理（缺键≠false、默认值不回写）；slug 空=第一只已安装 petdex；scale 0.7；roam true；topmost true；follow_window true（站立线段跟随来源窗口运动）；vertical_roam true（主动上下爬+跨线段跳转）。"
+    properties:
+      follow_window:
+        type: boolean
+        default: true
+        description: "窗口跟随：桌宠知道自己站的线段属于哪个窗口，窗口移动/缩放时贴线跟随；窗口关闭/最小化立即落体。false=旧行为（靠确认计时器兜底落体）。仅游走开启时生效。"
+      vertical_roam:
+        type: boolean
+        default: true
+        description: "垂直游走：漫步决策时随机主动上爬/下爬（下爬为平滑动画非坠落），走到线段端点可跳到邻接线段。false=只保留确认计时器被动上爬，无主动垂直动作。仅游走开启时生效。"
   balance:
     type: object
     default: {}

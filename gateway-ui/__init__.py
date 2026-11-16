@@ -238,7 +238,19 @@ def _on_pre_approval(*, session_key="", surface="", session_id="", **kw):
 # ------------------------------------------------------------ 权威活跃源 ----
 def _poll_authority() -> None:
     """十五/写者租约：runner._running_agent_items() 全 turn 总登记（含桌面端）。
-    连续 3 拍不可达退事件兜底。"""
+    连续 3 拍不可达退事件兜底。
+    R27 子代理监听（subagent_busy 开才介入）：同进程直读
+    delegate_tool_registry.list_active_subagents()——子代理 spawn 注册、
+    结束注销，表寿命=真实运行期；后台派发父空闲后子代理仍挂表。
+    会话全空闲但子代理在跑 → derive acting / 灯橙（主人裁定：算在工作）。"""
+    n_sub = 0
+    if _s("subagent_busy"):
+        try:
+            from tools.delegate_tool_registry import list_active_subagents
+            n_sub = len(list_active_subagents())
+        except Exception:
+            n_sub = 0
+    _SM.subagents = n_sub
     try:
         from gateway.run import _gateway_runner_ref
         runner = _gateway_runner_ref()
@@ -246,9 +258,9 @@ def _poll_authority() -> None:
         if items is None:
             raise RuntimeError("no runner")
         prev = _SM.authority
-        _SM.set_authority(items)
+        _SM.set_authority(items, subagents=n_sub)
         if _SM.authority != prev:
-            _vlog(f"authority -> {_SM.authority}")
+            _vlog(f"authority -> {_SM.authority} subs={n_sub}")
     except Exception:
         _SM.authority_unreachable()
         if _SM.authority is None and _SM.authority_streak == 3:

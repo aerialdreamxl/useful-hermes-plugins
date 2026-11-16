@@ -57,6 +57,7 @@ TOP_DEFAULTS = {
     "degrade_window_s": 300,
     "verbose_log": False,
     "package_index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "subagent_busy": False,
 }
 PET_DEFAULTS = {
     "enable-pet": False,   # 三态：缺键运行时 false，但显示"未设置"
@@ -64,6 +65,8 @@ PET_DEFAULTS = {
     "scale": 0.7,
     "roam": True,
     "topmost": True,
+    "follow_window": True,    # R26-2：窗口跟随（显示类，与宿主 config.py 对齐）
+    "vertical_roam": True,    # R26-3：垂直游走（显示类）
     "event_reactions": True,  # 事件反应：作者点名默认开（缺键按 true 读，不落盘）
 }
 # 余额气泡：余额气泡（与宿主 config.py BALANCE_DEFAULTS 对齐，仅展示兜底）
@@ -92,12 +95,15 @@ CONTENT = {
     "bus_enabled": "网关总线通信开关。关闭后不再接收宿主状态、不再发配置请求",
     "degrade_window_s": "自动降级等待窗口（秒，60~1800）。超时无响应按降级处理",
     "verbose_log": "详细日志开关。开启后向总线目录写 debug.log / pet_debug.log",
+    "subagent_busy": "子代理忙线：无活跃会话但有子代理在跑时，托盘灯亮橙、桌宠演工作",
     "package_index_url": "pip 包安装源。影响依赖安装/更新时的下载地址",
     "enable-pet": "桌宠显示开关。关闭仅隐藏浮窗，不删除素材",
     "slug": "当前出场的 petdex 角色。切换即时重建预览与浮窗素材",
     "scale": "桌宠大小（0.1~3.0）。拖动即时重建预览与浮窗尺寸",
     "topmost": "桌宠窗口置顶。关闭后可被其他窗口遮挡",
     "roam": "桌宠游走（含爬窗）。关闭后变为静止浮窗",
+    "follow_window": "窗口跟随：站在窗口边沿时随窗口移动/缩放贴线跟随；窗口关闭立即落下。关闭=靠定时确认兜底",
+    "vertical_roam": "垂直游走：随机主动上爬/下爬（下爬是平滑动画），走到边沿可跳到邻接线段。关闭=只保留被动上爬",
     "event_reactions": "会话完成/失败/等人类输入时桌宠动作+托盘闪动（仅桌面端/TUI/CLI）",
     "balance_enabled": "左键单击桌宠弹出余额气泡。需先把适配器放进投放目录；密钥只走环境变量",
     "balance_refresh_s": "宿主周期查询间隔（秒，60~3600）。气泡只读缓存，点击绝不直连 API",
@@ -240,8 +246,11 @@ class SettingsWindow(FluentWindow):
             FluentIcon.HISTORY, "降级窗口（秒）", CONTENT["degrade_window_s"])
         self.verbose_card = SwitchSettingCard(
             FluentIcon.DOCUMENT, "详细日志", CONTENT["verbose_log"])
+        self.subagent_card = SwitchSettingCard(
+            FluentIcon.PEOPLE, "子代理忙线", CONTENT["subagent_busy"])
         g1.addSettingCards([self.tray_card, self.bus_card,
-                            self.degrade_card, self.verbose_card])
+                            self.degrade_card, self.verbose_card,
+                            self.subagent_card])
         g2 = SettingCardGroup("包源", page)
         self.pkg_card = ComboBoxSettingCard(
             OptionsConfigItem("ui", "package_index_url", PKG_PRESETS[0][1],
@@ -275,10 +284,15 @@ class SettingsWindow(FluentWindow):
             FluentIcon.PIN, "置顶", CONTENT["topmost"])
         self.roam_card = SwitchSettingCard(
             FluentIcon.MOVE, "游走（含爬窗）", CONTENT["roam"])
+        self.follow_card = SwitchSettingCard(
+            FluentIcon.LINK, "跟随窗口", CONTENT["follow_window"])
+        self.vertical_card = SwitchSettingCard(
+            FluentIcon.UP, "垂直游走", CONTENT["vertical_roam"])
         self.reactions_card = SwitchSettingCard(
             FluentIcon.MESSAGE, "事件反应", CONTENT["event_reactions"])
         g3.addSettingCards([self.enable_card, self.slug_card, self.scale_card,
-                            self.topmost_card, self.roam_card, self.reactions_card])
+                            self.topmost_card, self.roam_card, self.follow_card,
+                            self.vertical_card, self.reactions_card])
         g4 = SettingCardGroup("活体预览", page)
         self.preview_label = QLabel("预览加载中…", g4)
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -357,6 +371,8 @@ class SettingsWindow(FluentWindow):
             lambda v: self._request("bus_enabled", bool(v)))
         self.verbose_card.switchButton.checkedChanged.connect(
             lambda v: self._request("verbose_log", bool(v)))
+        self.subagent_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("subagent_busy", bool(v)))
         self.degrade_card.slider.valueChanged.connect(self._on_degrade)
         self.scale_card.slider.valueChanged.connect(self._on_scale)
         self.slug_card.comboBox.currentIndexChanged.connect(self._on_slug)
@@ -364,6 +380,10 @@ class SettingsWindow(FluentWindow):
             lambda v: self._request("pet.topmost", bool(v)))
         self.roam_card.switchButton.checkedChanged.connect(
             lambda v: self._request("pet.roam", bool(v)))
+        self.follow_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("pet.follow_window", bool(v)))
+        self.vertical_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("pet.vertical_roam", bool(v)))
         self.reactions_card.switchButton.checkedChanged.connect(
             lambda v: self._request("pet.event_reactions", bool(v)))
         # 余额气泡：余额三键
@@ -555,6 +575,10 @@ class SettingsWindow(FluentWindow):
             self._set_switch(self.verbose_card, top["verbose_log"])
         self._mark(self.verbose_card, "verbose_log",
                    "verbose_log" in expl["top"])
+        if not self._has_pending("subagent_busy"):
+            self._set_switch(self.subagent_card, top["subagent_busy"])
+        self._mark(self.subagent_card, "subagent_busy",
+                   "subagent_busy" in expl["top"])
         if not self._has_pending("package_index_url"):
             self._rebuild_pkg_combo(str(top["package_index_url"] or ""))
         self._mark(self.pkg_card, "package_index_url",
@@ -583,6 +607,14 @@ class SettingsWindow(FluentWindow):
         if not self._has_pending("pet.roam"):
             self._set_switch(self.roam_card, pet["roam"])
         self._mark(self.roam_card, "pet.roam", "roam" in expl["pet"])
+        if not self._has_pending("pet.follow_window"):
+            self._set_switch(self.follow_card, pet.get("follow_window", True))
+        self._mark(self.follow_card, "pet.follow_window",
+                   "follow_window" in expl["pet"])
+        if not self._has_pending("pet.vertical_roam"):
+            self._set_switch(self.vertical_card, pet.get("vertical_roam", True))
+        self._mark(self.vertical_card, "pet.vertical_roam",
+                   "vertical_roam" in expl["pet"])
         if not self._has_pending("pet.event_reactions"):
             self._set_switch(self.reactions_card, pet["event_reactions"])
         self._mark(self.reactions_card, "pet.event_reactions",
@@ -692,6 +724,8 @@ class SettingsWindow(FluentWindow):
                 self._set_slider(self.degrade_card, n, str(n))
             elif key == "verbose_log":
                 self._set_switch(self.verbose_card, v["top"]["verbose_log"])
+            elif key == "subagent_busy":
+                self._set_switch(self.subagent_card, v["top"]["subagent_busy"])
             elif key == "package_index_url":
                 self._rebuild_pkg_combo(str(v["top"]["package_index_url"] or ""))
             elif key == "pet.enable-pet":
@@ -710,6 +744,12 @@ class SettingsWindow(FluentWindow):
                 self._set_switch(self.topmost_card, v["pet"]["topmost"])
             elif key == "pet.roam":
                 self._set_switch(self.roam_card, v["pet"]["roam"])
+            elif key == "pet.follow_window":
+                self._set_switch(self.follow_card,
+                                 v["pet"].get("follow_window", True))
+            elif key == "pet.vertical_roam":
+                self._set_switch(self.vertical_card,
+                                 v["pet"].get("vertical_roam", True))
             elif key == "pet.event_reactions":
                 self._set_switch(self.reactions_card, v["pet"]["event_reactions"])
             elif key == "balance.enabled":

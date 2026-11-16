@@ -280,6 +280,43 @@ ck("wait dedup table gc", not sm._notice_waits)
 ck("sess plat table gc", not sm._sess_plat)
 ck("notice survives gc", sm.notice is not None)
 
+# --- R27 子代理忙线：会话全空闲但子代理在跑 = 在工作 ---
+reset()
+class _FA:
+    _last_activity_desc = "waiting for provider response"
+    _provider_fallback_active = False
+sm.set_authority([], subagents=3)          # 权威可达但零会话，3 个子代理在跑
+ck("R27: idle sessions + subagents -> acting", sm.derive(t) == "acting")
+ck("R27: active_count treats subagents as 1", sm.active_count() == 1)
+ck("R27: light orange while subagents run",
+   sm.tier_and_light(t, 300)[1] == "orange")
+sm.set_authority([], subagents=0)
+ck("R27: subs gone -> idle again", sm.derive(t) == "idle")
+ck("R27: active_count back to 0", sm.active_count() == 0)
+# 事件兜底分支同样生效（authority 不可达）
+reset()
+sm.subagents = 2
+ck("R27: events-fallback + subagents -> acting", sm.derive(t) == "acting")
+ck("R27: events-fallback active_count", sm.active_count() == 1)
+# 有活跃会话时子代理不虚增计数、不覆盖会话 phase
+reset()
+sm.set_authority([("desk:k1", _FA())], subagents=5)
+ck("R27: 1 session + subs keeps session phase", sm.derive(t) == "thinking")
+ck("R27: count stays 1 with session active", sm.active_count() == 1)
+sm.set_authority([("a", _FA()), ("b", _FA())], subagents=5)
+ck("R27: 2 sessions + subs still busy", sm.derive(t) == "busy")
+ck("R27: count stays 2", sm.active_count() == 2)
+# 优先级：error 短窗压过子代理，窗过子代理顶上；listening 让位
+reset()
+ev("error", t, session_key="S1")
+sm.subagents = 1
+ck("R27: error window beats subagents", sm.derive(t + 5) == "error")
+ck("R27: subagents after error window", sm.derive(t + 40) == "acting")
+reset()
+sm.state_until = t + 60                     # listening 窗内（无活跃会话）
+sm.subagents = 1
+ck("R27: subagents beat listening", sm.derive(t + 5) == "acting")
+
 fails = [n for n, ok in R if not ok]
 print("PASS" if not fails else "FAIL(" + str(len(fails)) + "): " + "; ".join(fails))
 for n, ok in R:

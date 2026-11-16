@@ -235,7 +235,8 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
     ComboBoxSettingCard package_index_url（清华/阿里/官方+自定义 LineEdit）。
   - 桌宠页：SwitchSettingCard enable-pet；ComboBoxSettingCard slug（实时扫描
     sprites.installed_pets 库存）；RangeSettingCard scale 0.1~3.0；SwitchSettingCard
-    topmost；SwitchSettingCard roam；**活体预览**：内嵌当前宠物 idle 动画
+    topmost；SwitchSettingCard roam；SwitchSettingCard follow_window（R26-2 跟随窗口）；
+    SwitchSettingCard vertical_roam（R26-3 垂直游走）；**活体预览**：内嵌当前宠物 idle 动画
     （复用 sprites.PetSheet），换宠/拉大小即时变。
   - 关于页：版本/更新状态/uptime（读 state.json）；PushSettingCard 打开日志目录/
     打开总线目录/VSCode 打开 HERMES_HOME。
@@ -267,6 +268,50 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
   （子线段±2px 判定不掉，否则落正下方第一条）；攀爬在落体判定后（更高+穿过身体+
   **全包含**，CLIMB_DUR_S=0.22 线性插值无瞬移）；站立=底边贴线 GROUND_STAND_EPS=3
   （无 FEET_DROP_PX 偏移）；漫步目标夹 [x1, x2-pet_w]；无落点先夹 x 回屏内再落。
+- **地面物理增强 R26（PROMPT §11，判定语义不动，只增不改）**：
+  - R26-1 遮挡修复：`build_ground_segments` 选屏改**矩形求交**（`_rect_screen`，
+    交面积最大屏的 dpr 整体换算）——最大化窗口负原点隐形边框不再整窗被丢，
+    z 序遮挡剔除恢复完整。默认返回形状（4 元组列表）与旧版全等。
+  - R26-2 归属+跟随：`build_ground_segments(..., with_owners=True)` 额外返回
+    `owner_map[seg]=HWND`（屏底/任务栏=None）。`pet.follow_window`（默认 true，
+    显示类）：pause 态每拍 `owner_window_rect(cur_owner)` O(1) 查询，矩形变化
+    → dx/dy 平移贴线+x 夹可行域；owner 关/最小化/cloaked → 立即 `_begin_fall`。
+    忙时/气泡聚焦/事件反应期间同样跟随；拖拽中不跟随。跟随落点写盘节流 0.5s。
+    站定/改绑/落位/攀爬完成统一走 `_bind_seg`（cur_seg+cur_owner+基准矩形同步）。
+  - R26-3 垂直游走：`pet.vertical_roam`（默认 true，显示类）。`_plan` 掷
+    VERTICAL_CHANCE=0.35（R26-5c 已退役，改大数轴骰盘）：旧版上爬优先（既有 find_climb_target），无则
+    `find_descend_target`（更低+全包含+下降路径无遮挡，取最近）。descend 复用
+    climb 插值管线（phase="descend"，时长=距离/600px/s 下限 0.22s，演 jumping
+    行）。walk 抵端点掷 ADJACENT_CHANCE=0.5 试 `find_adjacent_segment`（间隙
+    ≤pet_w、高差 ≤2×pet_h、目标站得下身体），climb/descend 带 target_x 平滑横移，
+    同高 walk 直送；每跳落地 `_on_seg` 强制 pause+确认。climb/descend 每帧
+    `_vertical_seg_alive` 校验目标仍在地面列表（按值），失效当帧中止转 fall。
+  - R26-5 反共振（主人实测反馈的 climb↔descend/hop 秒级闭环，对照取证
+    修复前 150s=49 次、修复后=3 次；决策层闸门，判定语义不动）：
+    `VERT_COOLDOWN_S=8` 任一垂直转移（含同高平移跳、含 rule7 被动爬受闸）
+    落地后全局冷却；`REVERSE_BAN_S=30×min(n,4)` 同一对线段反向转移递增封禁；
+    主动下爬目标与当前线段同 owner → 直接拒绝（同窗顶底互降排除）。
+    半途中止不登记；`vertical_roam=false` 不受闸（旧行为哨兵）。键=线段
+    取整几何，跟随挪位后仍匹配；ban 表 >256 条按时间戳清。
+  - R26-5b（评审轮）：`_consume_vert_pending` 落地匹配改值相等（`is` 在每帧
+    重建地面的生产路径恒 False，冷却/封禁曾整段死代码）；同窗排除对称化到
+    被动爬+主动上爬（owner=None 不参与）；`PAIR_DECAY_S=300` pair 计数空置
+    衰减+防胀回收纳入 pair 条目。生产保真度测试：仿真刷新每帧重建值相等的
+    新 tuple（冻结 tuple 装置测不出 identity 缺陷）。R26-5c（主人裁定）：
+    `_plan` 主动垂直改大数轴骰盘——`randrange(10000)` 一次掷骰，上爬领地
+    [0,400)、下爬领地 [400,800)、其余没想法；领地闲置/被闸拦=本轮不动，
+    不重掷不穿透（旧双骰穿透：上爬掷不中再掷下爬，两候选并存实际 26.6%）。
+    `VERTICAL_CHANCE` 删除；`CONTACT_CLIMB_CHANCE` 只剩被动 rule7 爬用。
+    无穿透证明进套件：同种子序列双候选与仅下爬候选的 descend 计数精确相等。
+  - R26-6 接触概率掷（主人裁定：不见梯子就爬）：`CONTACT_CLIMB_CHANCE=0.4`
+    内置常量——R26-5c 后只剩被动 rule7 爬过闸后再掷一次，掷不中
+    安静站着（每次确认到期=一次接触，持续接触按确认节奏反复掷）。
+    `vertical_roam=false` 不受概率影响。屏顶空间剔除升级：`_standable`
+    加 x 域检查（整个身体须站进某块屏）+ `screen_geos` 全量屏参数（任一屏
+    成立即保留；缺省单屏=旧行为）；负原点裁剪顶沿按裁剪前坐标补判。
+    剔除在注册源头生效，爬/跳/落体候选均选不到站不进的线段。
+  - 两键走 §6 settings 总线（REQ_PET_KEYS 自动派生），worker reload 读取；
+    A2 不变：跟随/寻路纯运行时零 settings_req。
 - 新建窗口一律屏内右下角地面（不读 pet_pos.json，屏内出生）；resize 路径（old_h>0）
   沿用存档+高度差微调，双向 clamp。拖拽落点/游走落点原子写 pet_pos.json。
 - host 状态映射：idle→idle listening→waiting thinking→review acting/busy→run
@@ -291,6 +336,11 @@ worker 启动命令行：`<env_python> -I -X utf8=1 <plugin>/worker/main.py --me
   权威源 gateway.run._gateway_runner_ref()._running_agent_items()（连续 3 拍不可达退
   事件兜底）、阶段直读 agent._last_activity_desc、降级优先读 agent._provider_fallback_active
   （真失败切换链才置位，手动 /model 切换不置位）；权威源不可达时退回 base_url 端点启发式。
+  R27 子代理忙线（subagent_busy 开才介入，修改类默认 false）：每拍并读同进程
+  tools.delegate_tool_registry.list_active_subagents()，无活跃会话但子代理在跑 →
+  derive acting / active_count 按 1 计（灯橙）；有活跃会话时子代理不虚增计数
+  （单会话不升 busy）；error 30s 短窗优先、压过 happy/listening/idle；
+  事件兜底分支经同字段统一生效。
 - supervisor.py：永不退出循环；tray_enabled=false 只杀 worker 不终止线程；
   心跳判活（§4）；失败指数退避 3→6→12→30s 封顶，成功心跳清零；**绝无永久放弃**。
 - 更新检查：官方 hermes_cli.banner.get_latest_release_tag()（本地 tag，带缓存），
