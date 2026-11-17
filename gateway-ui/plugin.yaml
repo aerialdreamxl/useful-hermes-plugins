@@ -70,3 +70,20 @@ config_schema:
         type: string
         default: "individual"
         description: "百炼 Token Plan 查询版本：individual=个人版月额度（默认），team=团队版席位额度。改它=下次刷新按所选版本取数；所选版本无生效订阅时气泡报错不回落另一版。"
+  approval:
+    type: object
+    default: {}
+    description: "审批弹窗 ApprovalPopup（PROMPT §12/§13）。popup_enabled 修改类默认 false：须用户先在 config.yaml 写 security.approval.transport: gateway-ui 选中本 transport，再开此开关才弹窗接管审批；只配 security 不开开关=审批 fail-closed 超时拒绝（About 页亮提醒）。popup_sounds 显示类默认 true（缺键自动补齐）。platform_takeover 修改类默认 false：R29 平台分流——消息平台（飞书/QQ 群/微信等）会话的审批交还原生聊天卡（present 立即 no_response，须配 security.approval.transport_fallback: builtin 才顺序回落）；true=全接管，远程审批也弹本机窗（主人不在家时远程审批断头）。"
+    properties:
+      popup_enabled:
+        type: boolean
+        default: false
+        description: "审批弹窗总开关。true=危险命令/execute_code 审批改道屏幕右侧 UAC 式弹窗（永远放行/会话放行/单次放行/拒绝四按钮）；false=不弹窗，已选中的 transport 审批只能超时 fail-closed。修改类默认 false，显式打开才接管。"
+      popup_sounds:
+        type: boolean
+        default: true
+        description: "审批弹窗到达提示音。true=弹窗飞入时播提示音（无音频设备则静音）；false=静音。显示类缺键自动补齐。"
+      platform_takeover:
+        type: boolean
+        default: false
+        description: "消息平台会话审批接管开关（R29）。false（默认）=飞书/QQ 群/微信等远程会话的审批交还原生聊天卡，本弹窗只接管本机（Desktop/TUI/CLI）会话；须 config.yaml 配 security.approval.transport_fallback: builtin 远程审批才会顺序回落到聊天卡，不配则远程审批被快速拒绝。true=全接管，远程审批也弹本机窗——仅主人确定自己总在场时开。修改类默认 false。"

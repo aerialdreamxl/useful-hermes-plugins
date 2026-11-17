@@ -44,8 +44,10 @@ ALIASES = {
 STATE_ALIASES = ALIASES  # 官方同名，便于对齐测试
 
 # host 状态 → 精灵姿态行（CONTRACT §7：fall/climb→jumping、walk→方向跑行在窗口侧）
+# R28-5：await（等待人类批准持续档）→ waiting 行（与 listening 同姿态，语义独立）。
 HOST_MAP = {"idle": "idle", "listening": "waiting", "thinking": "review",
-            "acting": "run", "busy": "run", "happy": "wave", "error": "failed"}
+            "acting": "run", "busy": "run", "happy": "wave", "error": "failed",
+            "await": "waiting"}
 
 
 def clamp_scale(scale: float) -> float:

@@ -48,6 +48,7 @@ config.yaml 的人工改动始终归你自己。
 |---|---|---|
 | 绿 | 空闲 | 活跃 session 数 = 0 |
 | 橙 | 忙碌 | ≥1 活跃；1 个时桌宠演该会话阶段（thinking/acting），≥2 一律 busy |
+| 黄 | 等待人类批准 | 有审批请求挂起（`pending_approvals>0`，approval transport 接管时）；压过橙/绿，红仍最优先；桌宠钉住 waiting 姿态 |
 | 红 | 需要留意 | 观察窗（默认 5min）内 LLM 降级（**读 Gateway 内部降级链路标志**判定：只有真走失败切换链才算，手动 `/model` 切供应商不误判；权威源不可达时退回 base_url 端点启发式）或错误连发≥2 |
 | 灰 | 失联 | state.json 停止更新 >8s（Gateway 已停） |
 
@@ -55,7 +56,7 @@ config.yaml 的人工改动始终归你自己。
 `runner._running_agent_items()`（含桌面端 turn），连续 3 拍不可达退事件兜底；
 阶段直读 `agent._last_activity_desc`（内部一手数据）。
 
-悬停 tooltip：`gateway-ui · 状态 · 档位 | uptime | 最近降级 host->host`。
+悬停 tooltip：`gateway-ui · 状态 · 档位 | uptime | 等待人类批准 N 项 | 最近降级 host->host`。
 字段走 §5 白名单——**不含消息正文与密钥**。
 
 ## 菜单
@@ -165,6 +166,54 @@ Fluent 设置窗口）/ 设置(VSCode) / 重启 / 退出。
 
 百炼两路依赖 qianwen CLI（npm 包）：CLI 缺失→ok=false+提示安装，不引入宿主硬依赖。
 
+## 审批弹窗（ApprovalPopup，`approval.popup_enabled` 默认关）
+
+把 Gateway 的"需要人类批准"信号接成屏幕右侧中部的 **UAC 高仿弹窗**（自绘盾牌，
+非系统 UAC），底部「永远放行 / 会话放行 / 单次放行 / 拒绝」四按钮一字排开，点哪个
+注入哪个 choice。同时根治"等待人类输入"灯态乱跳——pending 审批表作 await 状态权威源。
+
+**三步启用（缺一不可）**：
+1. 亲手在 `config.yaml` 写（配置神圣，插件永不代写 security 块）：
+   ```yaml
+   security:
+     approval:
+       transport: gateway-ui
+       transport_fallback: builtin   # R29 分流正门：远程审批顺序回落原生聊天卡
+   ```
+2. 设置页常规页开「启用审批弹窗」（`approval.popup_enabled=true`），重启 Gateway。
+3. 「接管消息平台会话审批」保持**关**（默认）——飞书/QQ 群/微信等远程会话的审批
+   交还原生聊天卡，弹窗只接管本机（Desktop/TUI/CLI）会话。
+
+> **平台分流（R29，默认行为）**：transport 选中后所有审批先经本插件，但 present
+> 按 session_key 平台段分流——消息平台会话**立即交还**（不弹窗、不亮黄灯、不占
+> transport 槽），宿主凭 `transport_fallback: builtin` **顺序**回落到该平台原生
+> 聊天审批卡（transport 答了内置面永不触发，不存在双提示并发）。**不配 fallback
+> 时交还即被快速拒绝**（比截胡更糟）——关于页⚠提醒 + deploy.py 自检双保险。
+> 只配 security 却不开 popup_enabled → 本机审批也无人能答，超时 fail-closed。
+> 「接管消息平台会话审批」开=全接管（远程审批也弹本机窗，你不在电脑前时远程
+> 审批断头到超时）——仅确定自己总在场时开。
+
+**机制**（官方 approval transport 正门，CONTRACT §11）：宿主注册 transport（惰性），
+审批到达 → present 在宿主 daemon 线程写 `approval_req.json`（脱敏命令/说明/四 choice）
+→ worker 弹窗 → 点击写 `approval_resp.json` → present 取回 `request.respond(choice)`
+注入 decision。policy/allowlist 持久化/YOLO 跳过全归宿主；digest 宿主绑定，插件不改算。
+
+**fail-closed**：worker 崩/没开开关/超时（timeout-5s 自终止）/turn 打断 → 一律 deny，
+归因 `transport_invalid`（**不冒充用户拒绝**）。worker 存活看 tray_lease mtime。
+
+**await 状态稳定化**：pending 表寿命=真实等待窗口，`pending_approvals>0` → 托盘黄灯
+常亮 + tooltip"等待人类批准 N 项" + 桌宠钉住 waiting 姿态（压过 idle/happy/活跃阶段；
+error 短窗与降级红仍优先）。清零即恢复。pending=0 字节级旧行为。**远程会话被分流
+交还时不登记 pending**——黄灯只为本机真实等待亮，不被飞书/QQ 群的审批点亮。
+
+**覆盖范围（如实申报）**：仅危险命令（noun=command）与 execute_code（noun=code）
+两类 + MCP untrusted 写经此门；plugin-escalated tool calls / protected writes
+（宿主侧 `transport=False`）**不经此门**，仍走内置审批面。clarify 选择题无 transport
+接缝，维持 notice 制现状（本轮只治 approvals 面乱跳）。
+
+**样例预览**：设置页「弹出样例窗口」按钮弹一个演示窗（假命令、四按钮全亮），点击只
+收窗不注入任何真实信号（纯预览，A2）。门控关也能弹样例。
+
 ## 设置界面（F7）
 
 托盘"设置"项打开 **Fluent 设置窗口**（FluentWindow 左侧导航三页），与托盘/桌宠
@@ -185,10 +234,10 @@ worker 进程从头到尾不打开 config.yaml；中文注释逐字节保全（�
 
 | 页 | 卡片 |
 |---|---|
-| 常规 | tray_enabled（关闭二次确认：会连设置窗口一起停）/ bus_enabled / degrade_window_s（60~1800s）/ verbose_log / package_index_url（清华/阿里/官方/自定义） |
+| 常规 | tray_enabled（关闭二次确认：会连设置窗口一起停）/ bus_enabled / degrade_window_s（60~1800s）/ verbose_log / subagent_busy / package_index_url（清华/阿里/官方/自定义）＋ **审批弹窗组**：启用审批弹窗（默认关）/ **接管消息平台会话审批**（默认关，R29 分流）/ 到达提示音 / **弹出样例窗口**（纯预览） |
 | 桌宠 | enable-pet / slug（实时库存）/ scale（0.1~3.0）/ topmost / roam / **跟随窗口**（R26-2）/ **垂直游走**（R26-3）/ **事件反应**（事件反应：完成/失败/等输入时桌宠动作+托盘闪动） + **活体预览**（当前宠物 idle 动画，换宠/拉大小即时变） |
-| 余额 | **启用余额气泡**（余额气泡，默认关）/ 刷新周期（60~3600s）/ 投放目录（更改…弹文件夹选择，留空=默认 HERMES_HOME\balance-providers）/ 打开投放目录 |
-| 关于 | 版本 / 更新状态 / uptime + 直达：打开日志目录 / 打开总线目录 / VSCode 打开 HERMES_HOME |
+| 余额 | **启用余额气泡**（余额气泡，默认关）/ 刷新周期（60~3600s）/ Token Plan 版本（个人/团队）/ 投放目录（更改…弹文件夹选择，留空=默认 HERMES_HOME\balance-providers）/ 打开投放目录 |
+| 关于 | 版本 / 更新状态 / uptime / 运行状态 / **审批通道**（未接管/仅本机+交还/仅本机⚠缺fallback/全接管/已接管未启用⚠） + 直达：打开日志目录 / 打开总线目录 / VSCode 打开 HERMES_HOME |
 
 每张卡片副标题写明"改什么/会引发什么"。缺键显示"默认值/未设置"角标
 （enable-pet 缺键≠false）。卡片改动即时发请求，回执 ok 提示已保存、fail 报错并回滚。
@@ -218,6 +267,9 @@ DIY 规范：缺键逐键自动补齐（官方 writer）；**enable-pet 例外�
 | `balance.refresh_s` | 300 | 宿主周期查询间隔 | 60~3600s 钳位；气泡只读缓存，点击绝不直连 API | 越短越新鲜但付费调用越频；Token Plan 源 SLOW 后台慢拉不阻塞快源 |
 | `balance.token_plan_edition` | individual | Token Plan 查询版本 | individual=个人版月额度；team=团队版席位额度 | 所选版本无生效订阅时气泡报错，不回落另一版 |
 | `balance.providers_dir` | ""（回落默认） | 适配器投放目录 | 空=`<home>/balance-providers`；显式路径优先；**必须是 HERMES_HOME 之下的绝对路径**（realpath 后严格在根内，`..`/同级前缀/跨盘一律拒）——这个目录里的 .py 会被宿主逐行执行，等于代码执行面 | 设置页"更改…"弹文件夹选择；密钥只走环境变量，配置面永不过明文 |
+| `approval.popup_enabled` | false | 审批弹窗总开关（R28） | true=危险命令/execute_code 审批改道屏幕右侧 UAC 式四按钮弹窗；false=不弹窗 | 修改类默认关；**须先配 security.approval.transport: gateway-ui**，只配 security 不开此开关=审批超时 fail-closed（关于页⚠提醒）；样例窗不受门控 |
+| `approval.popup_sounds` | true | 审批弹窗到达提示音 | true=飞入时播提示音（无音频设备静音）；false=静音 | 显示类缺键自动补齐（官方 writer） |
+| `approval.platform_takeover` | false | 消息平台会话审批接管（R29） | false=飞书/QQ 群/微信等远程审批交还原生聊天卡（present 立即 no_response，宿主凭 transport_fallback: builtin 顺序回落），弹窗只接管本机 Desktop/TUI/CLI 会话；true=全接管，远程审批也弹本机窗 | 修改类默认关；**分流须配 security.approval.transport_fallback: builtin**，不配则远程审批被快速拒绝（关于页⚠+deploy 自检）；本地判定白名单 local/cli/desktop/tui，未知平台一律交还（宁回落原生面不截胡） |
 
 注：`bus_enabled=false` 时 state.json 与 events.jsonl 都停写（消费者断供），
 托盘灯 8s 后转灰——这是预期行为，不是 bug。
@@ -240,16 +292,20 @@ DIY 规范：缺键逐键自动补齐（官方 writer）；**enable-pet 例外�
 - test_statemachine.py — 忙线判据+降级（内部链路标志/手动切换不误判/兜底启发式）+权威源+notice 派生/平台门控/幂等（81 断言）
 - test_supervisor.py — A3/A4 心跳判活/永不放弃/退避/venv 蹦床回归（30 断言）
 - test_register.py — 宿主总装冒烟：门控四形态/9 hook 接线/settings watcher 回写/幂等/非法拒写（40 断言）
-- test_settings_bus.py — settings 协议：validate_request 白名单/钳制 + build_view 快照/三态 + watcher 集成 + balance 四键链（93 断言）
+- test_settings_bus.py — settings 协议：validate_request 白名单/钳制 + build_view 快照/三态 + watcher 集成 + balance 四键链 + approval 两键链（94 断言）
 - test_notice_host.py — 事件反应 notice 宿主管线：on_session_end/approval/clarify→notice 集成（24 断言）
 - test_notices.py — NoticeTracker 纯逻辑：seq 去重/首轮不回放/过期/seq 回退基线（32 断言）
 - test_official_writer_e2e.py — 真·官方 writer 端到端：scratch 假 HERMES_HOME 实测 save_plugin_setting 保注释/锁/回读/A1（16 断言；依赖根自动探测 uv archive）
 - test_integration_smoke.py — 真集成：Supervisor 真实 spawn side-env worker，蹦床心跳 15s 无误杀+优雅停止无孤儿（12 断言，约 30s）
 - test_balance_host.py — 余额气泡宿主余额：provider 发现/子进程隔离/超时钳/normalize/密钥打码/手动刷新节流/SLOW 慢拉/签名去重/lines 透传(含 bar fraction)/extra_env 注入/Token Plan 版本选择（133 断言）
 - test_peak_rules.py — 余额气泡峰谷纯函数：ds_cn 边界/节假日/windows 优先/next_boundary 严格大于/倒计时格式（64 断言，宿主+side-env 双跑）
+- test_bus_guard.py — 总线鉴权/代执行/资源回归：F5 token/F26 投放目录根内+子进程环境白名单/N18 并发写 view/N19 日志闸/N20 租约回读/N21 https/N22 未知键保全/N23 超时杀进程树（70 断言）
+- test_approval_host.py — 审批弹窗宿主桥接（R28）+ R29 平台分流：真 ApprovalRequest digest/respond 绑定/pending 登记注销/req 快照白名单/resp 消费/fail-closed 矩阵（invalid/worker 死/自终止/cancel/stop）/withdrawn/并发多 pending/hint 上限/分流分类器（local/cli/desktop/tui 白名单+未知平台交还）/远程即时交还零副作用/takeover=true 全接管/cfg_fn 异常安全侧（68 断言）
+- test_approval_state.py — 审批弹窗状态机+配置（R28-5/R29）：await 档优先级（error 短窗/红仍优先）/压过活跃会话阶段与展示层/pending=0 字节级旧行为/150 拍单调无跳变/黄灯/config approval 白名单三键/三态/fill 不播种修改类/transport_selected+fallback_builtin 探针/整块合并（55 断言）
 
 side-env python（`<HERMES_HOME>/environments/gateway-ui-qt/gen-*/venv/Scripts/python.exe`，offscreen）：
 - test_ground.py — 线段制地面物理（39 断言）
+- test_ground_fixes.py — 地面物理 BUG 修复回归（24 断言）
 - test_ground_motion.py — 地面物理增强 R26：遮挡修复（负原点最大化窗）/线段归属+窗口跟随（平移/夹域/忙时/拖拽/失效落体/关闭哨兵）/下爬纯函数+动画+中途失效/端点跳转/_plan 垂直决策/R26-5 反共振闸门（振荡有界对照仿真，含生产同款每帧重建 tuple 保真档）/R26-5b 评审修复+R26-5c 骰盘（领地清零/满格/无穿透精确相等证明/4% 落位）/R26-6 接触概率+屏顶剔除（含多屏）/配置链路（76 断言）
 - test_pet_menu.py — 菜单驻留真实事件路由（19 断言）
 - test_spawn_pos.py — 屏内出生/出逃存档不复活（8 断言）
@@ -266,6 +322,9 @@ side-env python（`<HERMES_HOME>/environments/gateway-ui-qt/gen-*/venv/Scripts/p
 - test_balance_cards.py — 余额气泡设置余额页：四键请求映射/缺键角标/refresh 钳位/目录弹窗/版本选择/回执回滚/乐观值最后一条胜出（36 断言）
 - test_bubble_wire.py — 余额气泡收口接缝：门控三态/toggle/跟随/无锚必收/零 settings_req/balance 块进 worker/sync_pet 接 on_click/托盘左键改绑同款+托盘锚定（34 断言）
 - test_bubble_focus.py — 气泡聚焦增强：气泡聚焦钉住演 review 行/reaction 仍最高优先/解除恢复游走/main 接缝置位/零 settings_req（21 断言）
+- test_approval_popup.py — 审批弹窗窗体+管理器（R28-3/4）：纯函数几何/倒计时/自绘盾牌/四按钮固定序+allowed_choices 置灰/样例零总线写/Esc 无效/req 驱动/门控/堆叠折叠角标/withdrawn 收窗/resp 修剪/answered 防重建（53 断言）
+- test_approval_wire.py — 审批弹窗 main 收口接缝：reload 收 approval 块/门控/管理器单例/sync req 驱动/样例钩子/点击写 approval_resp 而非 settings_req（A2）/tick 纳入审批同步（20 断言）
+- test_approval_cards.py — 审批弹窗设置页卡组+关于页通道（R28/R29）：三开关请求映射/样例钩子零请求/钩子未注入报错/缺键角标/程序化刷新不回写/ack 回滚/审批通道五态（未接管/仅本机+交还/仅本机⚠缺fallback/全接管/未启用⚠）/takeover 开关回滚（35 断言）
 
 测试纪律：测试根目录由 `HERMES_HOME` 环境变量解析（`tests/_env.py`，未设置即拒绝运行）；
 一切测试只用 `<HERMES_HOME>/cache/scratch/` 下隔离总线目录，绝不碰真实总线与 config。
@@ -303,3 +362,17 @@ uptime 由消费侧自算 `now - boot_ts`（state 里是常量锚，不再每拍
   但 binding 自身若死循环占 CPU，超时钳只杀进程不限制其 CPU——投放目录只放可信脚本。
 - 百炼两路适配器依赖 qianwen CLI（npm 包）：未装→ok=false+提示，不自动安装
   （DIY 规范：不静默装软件）。Token Plan 源实测 18-28s，归 SLOW 后台慢拉。
+- 审批弹窗接管范围随 R29 分流：默认只接管本机（Desktop/TUI/CLI）会话；消息平台
+  （飞书/QQ 群/微信等）审批交还原生聊天卡，**须配 transport_fallback: builtin**
+  才顺序回落，不配则远程审批被快速拒绝（归因 transport_invalid，不冒充用户拒绝）。
+  worker 崩/没开 popup_enabled 时本机审批只能 fail-closed 到超时。务必搭配一致
+  （关于页⚠提醒 + deploy.py 自检）。「接管消息平台会话审批」开=全接管，远程审批
+  依赖你在电脑前。
+- 审批弹窗覆盖范围有限：仅危险命令/execute_code（spec.transport=True）+ MCP untrusted
+  写经此门；plugin-escalated tool calls / protected writes（transport=False）仍走内置面。
+  clarify 选择题无 transport 接缝，await 稳定化只治 approvals 面，clarify 维持 notice 制。
+- 审批弹窗 worker 存活判据=tray_lease mtime：Gateway 启动初期 worker 尚未 spawn（或
+  side-env 首装 1~3 分钟）时到达的审批会 fail-closed 拒绝（无 UI 可答，安全）；worker
+  起来后的审批正常弹窗。
+- 审批弹窗高仿 UAC 仅形态致敬（自绘盾牌/避开系统对话框精确像素规格，tooltip 注明
+  "非系统 UAC"），防社工式混淆；不提取微软版权素材。

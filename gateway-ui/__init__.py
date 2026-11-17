@@ -25,6 +25,7 @@ from pathlib import Path
 from queue import Queue, Empty, Full
 
 from . import config as cfgmod
+from . import approval_host
 from .bus import Bus, read_json, write_json
 from .statemachine import StateMachine, url_label
 from .supervisor import Supervisor
@@ -212,6 +213,8 @@ def _on_api_error(*, provider="", model="", status_code=None, error_type="", ses
 def _on_loop_stopped(*, session_key="", platform="", reason="", **kw):
     _put("turn_end", session_key=_clip(session_key), platform=_clip(platform, 24),
          ok=False, tool=_clip(reason, 24))
+    # R28：turn 打断 → 取消该会话的 pending 审批（present 下一拍释放 transport 槽）。
+    _put("cancel_approval", session_key=_clip(session_key))
 
 
 def _on_session_end(*, session_id="", task_id="", turn_id="", completed=False,
@@ -225,12 +228,19 @@ def _on_session_end(*, session_id="", task_id="", turn_id="", completed=False,
          completed=bool(completed), failed=bool(failed), interrupted=bool(interrupted))
 
 
-def _on_pre_approval(*, session_key="", surface="", session_id="", **kw):
+def _on_pre_approval(*, session_key="", surface="", session_id="", request_id="", **kw):
     """事件反应：tools/approval*.py 多处发 pre_approval_request（observer，不可否决）。
     command/description/pattern_key 等正文一律不入总线（字段白名单铁律）；
     surface 只取 cli/gateway/smart 三值（transport:*/mcp-elicitation 等归一 ""）。
     平台归因在状态机：session_key（gateway 键 agent:ns:platform:…）解析 +
-    session_id（_fire_approval_hook 注入，对 _sess_plat 表）双路，宁漏报不误报。"""
+    session_id（_fire_approval_hook 注入，对 _sess_plat 表）双路，宁漏报不误报。
+    R28：transport 面（surface=transport:*）带 request_id → O(1) 记会话 hint，
+    供 approval_host.cancel_session 按会话取消（turn 打断释放 transport 槽）。"""
+    # R29 hint 捕获：present 分流判定要现读 session_key（hook 与 present 同宿主
+    # 进程同线程顺序：pre_approval_request 先于 present_fn）。transport 面
+    # （surface=transport:*）才会进 present，条件保留。
+    if request_id and str(surface).startswith("transport:"):
+        approval_host.note_request_session(request_id, session_key or session_id)
     surf = surface if surface in ("cli", "gateway", "smart") else ""
     _put("await_input", source="approval", session_key=_clip(session_key),
          session_id=_clip(session_id), surface=surf)
@@ -293,6 +303,10 @@ def _consumer(stop=None) -> None:
         try:
             while True:
                 kind, ts, fl = _Q.get_nowait()
+                if kind == "cancel_approval":
+                    # R28 内部控制信号（不进总线/不计数）：取消该会话 pending 审批。
+                    approval_host.cancel_session(fl.get("session_key", ""))
+                    continue
                 dirty = True
                 _SEQ += 1
                 row = {"seq": _SEQ, "ts": round(ts, 3), "kind": kind}
@@ -315,6 +329,8 @@ def _consumer(stop=None) -> None:
         _SM.gc(now)
         deg_before_auth = _SM.last_degrade
         _poll_authority()
+        # R28-5：pending 审批表实时读数（权威源，表寿命=真实等待窗口）。
+        _SM.pending_approvals = approval_host.pending_count()
         # 权威源读内部降级标志新记的降级 → 补一条 degrade 事件（与事件启发式同格式）
         d = _SM.last_degrade
         if d is not None and d is not deg_before_auth and bool(_s("bus_enabled")):
@@ -338,6 +354,8 @@ def _consumer(stop=None) -> None:
                 "pet_state": _SM.pet_state,
                 "active_sessions": _SM.active_count(),
                 "active_source": "authority" if _SM.authority is not None else "events",
+                # R28-5：等待人类批准数（纯增量；dashboard 忽略未知字段不受影响）。
+                "pending_approvals": _SM.pending_approvals,
                 "verbose": _verbose(),
                 "writer_pid": my_pid,
                 # 硬件友好写盘：uptime 改 boot 锚（常量），消费侧自算 now-boot_ts；
@@ -423,6 +441,12 @@ def _apply_setting(key: str, value) -> None:
         block = dict(cfgmod.read_balance_explicit(_CTX))
         block[leaf] = value
         _CTX.set_config("balance", block)
+    elif key.startswith("approval."):
+        # 审批弹窗：approval.* 整块合并（基于 raw 保白名单外用户手加键，N22 同款）
+        leaf = key[len("approval."):]
+        block = dict(cfgmod.read_approval_raw(_CTX))
+        block[leaf] = value
+        _CTX.set_config("approval", block)
     else:
         _CTX.set_config(key, value)
 
@@ -568,6 +592,8 @@ def register(ctx) -> None:
         _s(k)  # 顶层显示类逐键补齐
     # pet 块：显示类缺键补齐；enable-pet 三态（缺键不落 false，A1 根除）
     cfgmod.fill_pet_display(ctx, cfgmod.read_pet_explicit(ctx))
+    # 审批弹窗：popup_sounds 显示类缺键补齐；popup_enabled 修改类缺失保持缺失（A1）
+    cfgmod.fill_approval_display(ctx)
     # F5：settings 总线 token（每轮 register 换新；worker 每次发请求前现读现带）
     _BUS_TOKEN["v"] = _write_bus_token(_home() / BUS_DIR_NAME)
     # 设置界面：pet_cfg.json 播种退役——config.yaml 唯一事实源，settings_view 由
@@ -581,6 +607,17 @@ def register(ctx) -> None:
     ctx.register_hook("agent_loop_stopped", _on_loop_stopped)
     ctx.register_hook("on_session_end", _on_session_end)          # 事件反应：per-turn 结局
     ctx.register_hook("pre_approval_request", _on_pre_approval)   # 事件反应：等人类审批
+    # 审批弹窗 R28-1：注册 approval transport（惰性——须用户配 security.approval.
+    # transport: gateway-ui 才激活；注册本身零副作用）。present 跑宿主 daemon 线程。
+    # 旧宿主无此 API → 静默降级（审批仍走内置面）。
+    approval_host.init(_home() / BUS_DIR_NAME, stop_event=_STOP,
+                       logger=getattr(ctx, "logger", None),
+                       cfg_fn=lambda: cfgmod.read_approval_explicit(ctx))
+    try:
+        ctx.register_approval_transport("gateway-ui", approval_host.present)
+        _log("approval transport registered (inactive until security.approval.transport selects it)")
+    except Exception as exc:
+        _log(f"approval transport unavailable (degraded to builtin): {exc}")
     _SUP = Supervisor(
         bus_dir=_home() / BUS_DIR_NAME, worker_path=WORKER_PATH,
         home=_home(), repo=_repo(), version_fn=_version,

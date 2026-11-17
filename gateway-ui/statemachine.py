@@ -90,6 +90,7 @@ class StateMachine:
         self.phase: dict = {}           # session_key -> (phase, ts)
         self.authority = None           # None=事件兜底；dict=权威 {key: phase}
         self.subagents = 0              # R27：活跃子代理数（delegate_tool_registry）
+        self.pending_approvals = 0      # R28-5：等待人类批准数（approval_host pending 表）
         self.authority_streak = 0
         self.baseline_provider = None
         self.baseline_base_url = None
@@ -274,6 +275,13 @@ class StateMachine:
         return n
 
     def derive(self, now: float) -> str:
+        # R28-5 持续 await 档：pending_approvals>0 = 有人在等批准（持续事实，压过
+        # 活跃会话阶段与 happy/listening/idle 展示层——被审批阻塞的会话不是在工作）。
+        # error 短窗仍优先；pending=0 时整段跳过，下方既有链字节级不变。
+        if self.pending_approvals > 0:
+            if now < self.error_active_until and self.error_ts:
+                return "error"
+            return "await"
         auth = self.authority
         if auth is not None:
             n = len(auth)
@@ -310,10 +318,13 @@ class StateMachine:
         recent_err = [t for t in self.error_ts if now - t <= window]
         err_active = now < self.error_active_until
         red = red or len(recent_err) >= 2 or err_active
-        light = "red" if red else ("orange" if self.active_count() else "green")
         if red:
-            tier = "需要留意"
-        elif recent_err:
+            return "需要留意", "red"
+        # R28-5：等待人类批准 = 持续黄灯档（压过橙/绿；红仍最优先）。
+        if self.pending_approvals > 0:
+            return f"等待人类批准 {self.pending_approvals} 项", "yellow"
+        light = "orange" if self.active_count() else "green"
+        if recent_err:
             tier = "轻微波动"
         elif self.update_available:
             tier = "更新可用！"

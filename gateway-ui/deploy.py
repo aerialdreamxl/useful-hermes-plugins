@@ -200,6 +200,47 @@ def step5_verify():
             sys.exit(1)
 
 
+def step6_approval_check():
+    """审批弹窗搭配自检（只读，绝不改 config）：security.approval.transport 选中
+    gateway-ui 时，approval.popup_enabled 必须同开，否则审批超时 fail-closed；
+    R29 分流（platform_takeover=false 默认）交还原生面须 transport_fallback:
+    builtin，否则远程（飞书/QQ/微信）审批会被快速拒绝。"""
+    say("[+] 审批弹窗搭配自检（只读）")
+    try:
+        import yaml
+    except ImportError:
+        say("  [skip] 无 PyYAML，跳过（请人工核对 security.approval 与 approval.* 搭配）")
+        return
+    try:
+        cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        say(f"  [skip] config 解析失败：{exc}")
+        return
+    sec = ((cfg.get("security") or {}).get("approval") or {})
+    transport = str(sec.get("transport") or "").strip().lower()
+    fallback = str(sec.get("transport_fallback") or "").strip().lower()
+    entry = ((cfg.get("plugins") or {}).get("entries") or {}).get(NEW_ID) or {}
+    appr = (entry.get("settings") or {}).get("approval") or {}
+    popup = appr.get("popup_enabled")
+    takeover = appr.get("platform_takeover")
+    if transport != "gateway-ui":
+        say(f"  [info] transport={transport or 'builtin'}（审批走内置面，弹窗未接管）")
+        return
+    if popup is not True:
+        say("  [WARN] transport=gateway-ui 但 popup_enabled 未开——审批将超时 fail-closed 拒绝！")
+        say("         设置页开「启用审批弹窗」，或改回 security.approval.transport: builtin")
+    else:
+        say("  [OK] transport=gateway-ui 且 popup_enabled=true")
+    if takeover is True:
+        say("  [info] platform_takeover=true：消息平台审批也弹本机窗（远程审批依赖你在场）")
+    elif fallback != "builtin":
+        say("  [WARN] 平台分流开启（takeover=false，默认）但未配 transport_fallback: builtin")
+        say("         → 飞书/QQ 群/微信等远程会话的审批将被快速拒绝（transport_invalid）！")
+        say("         config.yaml 的 security.approval 下补一行: transport_fallback: builtin")
+    else:
+        say("  [OK] 平台分流 + fallback=builtin：远程审批回原生聊天卡，本机审批走弹窗")
+
+
 def main():
     say("=== gateway-ui 部署（整体重写重写版） ===")
     if gateway_running():
@@ -211,6 +252,7 @@ def main():
     step4_dashboard()
     step4b_balance_providers()
     step5_verify()
+    step6_approval_check()
     say("")
     say("=== 部署完成。验证清单（起 Gateway 后逐项核对） ===")
     say(" 1. 托盘图标出现，灯=绿；agent.log 有 'gateway-ui: registered'")

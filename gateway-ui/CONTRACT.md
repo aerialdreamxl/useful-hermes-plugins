@@ -473,3 +473,118 @@ def fetch() -> dict:     # 必需：返回下述结构
   切换**不发任何 settings_req**（A2：点击≠指令）。
 - 气泡右键菜单（扁平两项）：立即刷新 / 关闭气泡。
 - 新鲜度：age > 2×refresh_s → 金额行灰 + "数据可能过期"角标。
+
+## 11. approval 总线协议（审批弹窗 ApprovalPopup：PROMPT §12，R28）
+
+官方正门 = approval transport（`hermes_cli/approval_transport.py`）。宿主 `register()`
+调 `ctx.register_approval_transport("gateway-ui", approval_host.present)` 注册（惰性，
+须用户配 `security.approval.transport: gateway-ui` 才激活；旧宿主无此 API → 静默降级
+内置面）。`present` 跑宿主 approval-transport 专属 daemon 线程（`invoke_approval_transport`
+起，≤8 并发槽），**绝不**在 asyncio 主循环上。policy/持久化/YOLO 跳过全归宿主；
+插件只呈现脱敏请求 + 回传相关 decision。
+
+### 11.1 approval_req.json（宿主写，worker 只读；atomic tmp+rename）
+pending 全量快照（present 登记/注销时重写）：
+```
+{"seq": int, "ts": float, "requests": [
+  {"request_id": str, "digest": str, "command": str, "description": str,
+   "surface": str, "session_key": str(≤16), "pattern_key": str,
+   "allowed_choices": [str], "timeout_seconds": float, "expires_ts": float}]}
+```
+- `command/description` = 宿主 `redact_approval_display(force=True)` 已脱敏副本，
+  原样透传零再加工。字段白名单：绝无消息正文/prompt/密钥。
+- `allowed_choices` ⊆ {once, session, always, deny}（smart-DENY owner override 收缩为
+  once/deny）；`digest` 由宿主绑定（含 session_key 的 canonical sha256）。
+
+### 11.2 approval_resp.json（worker 单写者，宿主只读；atomic）
+```
+{"entries": [{"request_id": str, "digest": str, "choice": str, "clicked_ts": float}]}
+```
+- worker 按钮点击追加条目；**按当前 req 快照修剪陈旧条目**（host 已消费=离开 req 的
+  rid 不再保留）。宿主只读不重写 → 消除跨进程读改写竞态。
+- 宿主 present 轮询（0.25s）取本 request_id 的 choice → `request.respond(choice)`
+  造 ApprovalDecision（request_id/digest 宿主绑定，插件不回显不改算）。
+- choice 映射：永远放行=always / 会话放行=session / 单次放行=once / 拒绝=deny。
+  choice ∉ allowed_choices → 宿主 `_validate_decision` 判 invalid fail-closed。
+
+### 11.3 approval_withdrawn.jsonl（宿主追加，worker 消费收窗）
+```
+{"request_id": str, "reason": "completed|expired|withdrawn", "ts": float}
+```
+present `finally` 追加（注销 pending 后）；worker 增量读（byte offset，文件截断重置）
+据此收窗。req 快照移除亦收窗（双保险）。
+
+### 11.4 present fail-closed 矩阵（全部 deny，不冒充用户拒绝）
+| 触发 | reason | 宿主归因 |
+|---|---|---|
+| 合法 choice 取回 | completed | choice 采纳 |
+| 自终止线 timeout-5s 到点 | expired | transport_invalid（no_response） |
+| worker 死（tray_lease mtime ≥8s/缺失） | expired | transport_invalid |
+| turn 打断（cancel_session） | withdrawn | transport_invalid |
+| 宿主 stop_event | withdrawn | transport_invalid |
+| worker 发非法 choice | — | transport_invalid |
+`no_response` ∉ allowed_choices → 宿主判 invalid → deny，outcome=`transport_invalid`
+（区别于用户主动 deny 的 `denied`）。**worker 存活判据 = tray_lease.json mtime**
+（writer_lease 是宿主自己的租约，不能判 worker 生死）。
+
+### 11.5 await 状态权威源（R28-5，state.json 纯增量）
+- 宿主进程内 pending 表（`approval_host._PENDING`，表寿命=真实等待窗口）每拍经
+  `_SM.pending_approvals` 上报；state.json 增 `pending_approvals: int`（dashboard
+  忽略未知字段不受影响）。
+- 状态机：`pending_approvals>0` → derive "await"（压过活跃会话阶段与 happy/listening/
+  idle；error 短窗仍优先）；tier_and_light → 黄灯 + "等待人类批准 N 项"（红仍最优先）。
+  pending=0 → 字节级旧行为。
+- worker：sprites.HOST_MAP["await"]="waiting"；tray.LIGHT_RGB 增 yellow；tooltip 增
+  "等待人类批准 N 项"段。
+
+### 11.6 settings 白名单扩展（§6 增补）
+- `approval.popup_enabled`（修改类默认 false）/ `approval.popup_sounds`（显示类默认
+  true 缺键补齐）。REQ_APPROVAL_KEYS 由 APPROVAL_DEFAULTS 派生；validate bool 分支；
+  `_apply_setting` approval.* 整块合并（基于 read_approval_raw 保未知键，N22 同款）。
+- build_view 增 `approval` 块（含 `transport_selected` = `read_security_transport()==
+  "gateway-ui"`，全局 config 只读探针）+ explicit.approval 键表。
+- 设置页常规页「审批弹窗」组（启用开关/提示音开关/弹出样例窗口按钮）；关于页
+  「审批通道」卡（未接管/已接管启用/已接管未启用⚠提醒）。样例按钮调 main 注入钩子
+  `_show_sample_approval`，纯预览零 settings_req（A2）。
+
+### 11.7 worker 交互契约（§7 增补）
+- ApprovalPopupWindow：无边框透明 Qt.Tool 窗，420×300，屏幕右侧中部飞入（180ms
+  OutCubic，animate=False 直接落位 offscreen 可测）；UAC 高仿形态（自绘盾牌，非系统
+  UAC，tooltip 注明）；不可拖拽、Esc/弃焦无效（超时归宿主判）。
+- 四按钮固定一字排开「永远放行/会话放行/单次放行/拒绝」；choice ∉ allowed_choices
+  置灰；拒绝恒在。点击 → 写 resp + 滑出收窗，**零 settings_req**（A2）。
+- 并发 >4 条折叠计数角标（最新窗 +N）；最近者占主位 slot0，旧者上移堆叠。
+- popup_enabled=false → 不弹真窗（样例窗不受门控）；门控关 sync 收所有真窗。
+- 覆盖范围：仅 `spec.transport=True` 两类（危险命令 noun=command / execute_code
+  noun=code）+ MCP untrusted 写（mcp_elicitation）。plugin-escalated/protected writes
+  （transport=False）不经此门，仍走内置面。
+
+### 11.8 R29 平台分流（platform_takeover，默认 false）
+
+**动机**：transport 是全局改道（`_present_with_selected_transport` 替换一切内置面），
+若不分流，飞书/QQ 群/微信会话的审批也被截到本机弹窗，群友 `/approve` 对空待批条目。
+
+**分类器**（approval_host.session_platform_of / is_local_session）：
+- session_key 布局 `agent:<ns>:<platform>:<chat_type>:…`（gateway/session.py:700
+  build_session_key 单一事实源），取第三段小写。
+- 本地白名单 = {local, cli} ∪ NOTICE_PLATFORMS{desktop, tui, cli}（local 实证：
+  session_local_recovery.local_source → Platform.LOCAL）。
+- 空键/非布局 → 本地（本机审批绝不静默拒）；**未知平台一律远程**（消息平台枚举
+  支持动态插件成员，白名单制防未来新平台漏进本机窗）。
+- session_key 来源：pre_approval_request hook（先于 present 同线程触发）的
+  request_id→session_key hint（ApprovalRequest 本体不带 session_key，只进 digest）。
+
+**交还路径**（takeover=false 且远程）：present **同步立即** respond("no_response")，
+不登记 pending、不写 req/withdrawn、释放 hint。宿主 `_validate_decision` 判
+invalid（no_response ∉ allowed_choices）→ `_transport_choice` 凭
+`transport_fallback: builtin` 返回 (None, None) → **顺序**继续内置面
+（`_await_gateway_decision` 原生聊天卡）。零并发双提示：transport 答了内置面永不触发。
+不配 fallback → 快速 deny（transport_invalid），比截胡更糟——README/关于页/deploy 三提醒。
+
+**takeover=true**：远程也走弹窗链路（R28 行为）；await 黄灯随之覆盖远程等待。
+cfg_fn（register 注入 read_approval_explicit）每次 present 现读——设置页改完下一单
+审批即生效，无需重启；cfg_fn 异常按默认 false（安全侧：交还）。
+
+**settings 增键**：approval.platform_takeover（修改类默认 false，fill 不播种）；
+build_view 增 fallback_builtin 探针（read_security_fallback()=="builtin"）；
+关于页通道卡五态；deploy step6 搭配矩阵（transport/popup/takeover/fallback 四元）。

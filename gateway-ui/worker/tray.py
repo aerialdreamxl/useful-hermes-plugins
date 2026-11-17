@@ -24,7 +24,9 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 from qfluentwidgets import RoundMenu
 
 LIGHT_RGB = {"green": (46, 204, 113), "orange": (243, 156, 18),
-             "red": (231, 76, 60), "gray": (150, 150, 150)}
+             "red": (231, 76, 60), "gray": (150, 150, 150),
+             # R28-5：等待人类批准持续档（黄灯，压过橙/绿，红仍最优先）
+             "yellow": (241, 196, 15)}
 STATE_TTL = 8.0
 
 # ---- 事件反应：会话事件托盘闪动 ----
@@ -182,6 +184,10 @@ def tooltip() -> str:
     if up is None:
         up = max(0.0, time.time() - float(st.get("boot_ts") or time.time()))
     seg.append(f"uptime {int(up) // 3600}h{int(up) % 3600 // 60:02d}m")
+    # R28-5：等待人类批准持续档（pending_approvals 纯增量字段）
+    pending = st.get("pending_approvals") or 0
+    if pending:
+        seg.append(f"等待人类批准 {pending} 项")
     deg = tray.get("degrade")
     if deg and time.time() - deg.get("ts", 0) <= STATE_TTL * 10:
         age = time.time() - deg.get("ts", 0)

@@ -57,6 +57,21 @@ BALANCE_DEFAULTS = {
     "token_plan_edition": "individual",   # individual | team
 }
 
+# 审批弹窗 ApprovalPopup（PROMPT §12 / CONTRACT §11）：popup_enabled 修改类
+# 默认 false（配了 security.approval.transport 但忘开弹窗时审批 fail-closed，
+# 安全但会超时——About 页亮提醒条）；popup_sounds 显示类默认 true 缺键补齐。
+# R29 平台分流：platform_takeover 修改类默认 false——消息平台（飞书/QQ/微信等）
+# 会话的审批交还原生聊天卡，present 立即 no_response + transport_fallback:
+# builtin 顺序回落；true=全接管（远程会话也弹本机窗，群友审批被本机截胡，主人
+# 不在家时远程审批断头，fail-closed 到超时）。
+APPROVAL_DEFAULTS = {
+    "popup_enabled": False,
+    "popup_sounds": True,
+    "platform_takeover": False,
+}
+APPROVAL_DISPLAY_KEYS = tuple(
+    k for k in APPROVAL_DEFAULTS if k not in ("popup_enabled", "platform_takeover"))
+
 # 显示类 pet 键：缺键自动补齐进 config（规范②）；enable-pet/event_reactions 不在其列。
 PET_DISPLAY_KEYS = tuple(k for k in PET_DEFAULTS if k not in ("enable-pet", "event_reactions"))
 
@@ -169,7 +184,8 @@ def watcher_merge(file_cfg: dict, explicit: dict) -> dict | None:
 REQ_TOP_KEYS = tuple(TOP_DEFAULTS)
 REQ_PET_KEYS = tuple("pet." + k for k in PET_DEFAULTS)
 REQ_BALANCE_KEYS = tuple("balance." + k for k in BALANCE_DEFAULTS)
-REQ_KEYS = REQ_TOP_KEYS + REQ_PET_KEYS + REQ_BALANCE_KEYS
+REQ_APPROVAL_KEYS = tuple("approval." + k for k in APPROVAL_DEFAULTS)
+REQ_KEYS = REQ_TOP_KEYS + REQ_PET_KEYS + REQ_BALANCE_KEYS + REQ_APPROVAL_KEYS
 
 SCALE_MIN, SCALE_MAX = 0.1, 3.0
 WINDOW_MIN, WINDOW_MAX = 60, 1800
@@ -210,6 +226,72 @@ def explicit_balance_keys(ctx) -> list:
     return list(read_balance_explicit(ctx))
 
 
+def read_approval_explicit(ctx) -> dict:
+    """审批弹窗：config.yaml approval 块的显式值（纯读，绝不写入、不补默认）。
+    popup_enabled 修改类（缺键按 false 读只在快照层做）；popup_sounds 显示类。"""
+    try:
+        cfg = ctx.get_config("approval", MISSING)
+    except Exception:
+        cfg = MISSING
+    if not isinstance(cfg, dict):
+        return {}
+    return {k: v for k, v in cfg.items() if k in APPROVAL_DEFAULTS}
+
+
+def read_approval_raw(ctx) -> dict:
+    """approval 块原样内容（含白名单外用户手加键，纯读不写；整块合并写回基于它）。"""
+    try:
+        cfg = ctx.get_config("approval", MISSING)
+    except Exception:
+        cfg = MISSING
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def explicit_approval_keys(ctx) -> list:
+    """config approval 块里真实存在的键名（缺键不在列）。"""
+    return list(read_approval_explicit(ctx))
+
+
+def fill_approval_display(ctx) -> dict:
+    """显示类 approval 键（popup_sounds）缺键补齐（官方 writer，整块合并保未知键）；
+    popup_enabled 修改类缺失保持缺失（A1 铁律：默认 false 绝不落盘）。"""
+    out = read_approval_raw(ctx)
+    changed = False
+    for k in APPROVAL_DISPLAY_KEYS:
+        if k not in out:
+            out[k] = APPROVAL_DEFAULTS[k]
+            changed = True
+    if changed:
+        with contextlib.suppress(Exception):
+            ctx.set_config("approval", out)
+    return out
+
+
+def read_security_transport() -> str:
+    """security.approval.transport 当前选择（全局 config 只读探针，绝不写）。
+    供 build_view 出 transport_selected（About 页搭配提醒）；读不到返回空串。"""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        return str(((cfg.get("security") or {}).get("approval") or {})
+                   .get("transport") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def read_security_fallback() -> str:
+    """security.approval.transport_fallback 当前选择（全局 config 只读探针，绝不写）。
+    R29 平台分流依赖：builtin 才能把交还原生面的审批顺序回落到聊天卡；其余值
+    （默认 deny）= 交还即快速 fail-closed 拒绝。读不到返回空串。"""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        return str(((cfg.get("security") or {}).get("approval") or {})
+                   .get("transport_fallback") or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def hermes_home_root() -> str:
     """HERMES_HOME 真实绝对路径（realpath）：providers_dir 白名单根（F26）。
     优先环境变量（与宿主/worker 同源，测试也靠它注入），缺失回落官方
@@ -241,6 +323,12 @@ def validate_request(req, installed_slugs=()) -> tuple:
     if "value" not in req:
         return (False, key, None, "missing value")
     val = req["value"]
+    # 审批弹窗 §12：approval 两键（popup_enabled 修改类 / popup_sounds 显示类，均 bool）
+    if key.startswith("approval."):
+        aleaf = key[len("approval."):]
+        if aleaf in APPROVAL_DEFAULTS:
+            return (True, key, bool(val), "")
+        return (False, key, val, f"unhandled key: {key!r}")
     # 余额气泡 §10.4：balance 三键（全修改类；providers_dir 空串=用默认目录）
     if key.startswith("balance."):
         bleaf = key[len("balance."):]
@@ -343,10 +431,23 @@ def build_view(ctx, installed_slugs=()) -> dict:
     balance["providers_dir"] = str(balance_explicit.get("providers_dir", "") or "")
     ed = str(balance_explicit.get("token_plan_edition", "individual") or "").strip().lower()
     balance["token_plan_edition"] = ed if ed in ("individual", "team") else "individual"
+    # 审批弹窗 §12：approval 块——popup_enabled 修改类缺键按 false 读（不落 config）；
+    # popup_sounds 显示类缺键补默认仅进快照。transport_selected = security 只读探针。
+    approval_explicit = read_approval_explicit(ctx)
+    approval = dict(APPROVAL_DEFAULTS)
+    approval.update(approval_explicit)
+    approval["popup_enabled"] = bool(approval_explicit.get("popup_enabled", False))
+    approval["popup_sounds"] = bool(approval_explicit.get("popup_sounds", True))
+    approval["platform_takeover"] = bool(approval_explicit.get("platform_takeover", False))
+    approval["transport_selected"] = (read_security_transport() == "gateway-ui")
+    # R29 分流提醒用探针：交还原生面须 transport_fallback: builtin 才顺序回落
+    approval["fallback_builtin"] = (read_security_fallback() == "builtin")
     return {
         "top": top,
         "pet": pet,
         "balance": balance,
+        "approval": approval,
         "explicit": {"top": explicit_top(ctx), "pet": explicit_pet_keys(ctx),
-                     "balance": explicit_balance_keys(ctx)},
+                     "balance": explicit_balance_keys(ctx),
+                     "approval": explicit_approval_keys(ctx)},
     }

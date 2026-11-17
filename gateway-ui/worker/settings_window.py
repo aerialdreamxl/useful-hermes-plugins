@@ -78,6 +78,12 @@ BALANCE_DEFAULTS = {
     "token_plan_edition": "individual",   # 余额气泡修订：individual|team，默认个人版
 }
 REFRESH_MIN, REFRESH_MAX = 60, 3600   # 余额刷新周期整数秒（与宿主钳位一致）
+# 审批弹窗（与宿主 config.py APPROVAL_DEFAULTS 对齐，仅展示兜底）
+APPROVAL_DEFAULTS = {
+    "popup_enabled": False,    # 修改类默认关（DIY 规范）
+    "popup_sounds": True,      # 显示类默认开
+    "platform_takeover": False,  # R29 分流：默认不接管消息平台会话审批
+}
 
 # 包源预设（label, url）；第四项"自定义…"弹 LineEdit 输入，限 http(s)。
 PKG_PRESETS = (
@@ -113,6 +119,10 @@ CONTENT = {
     "balance_refresh_s": "宿主周期查询间隔（秒，60~3600）。气泡只读缓存，点击绝不直连 API",
     "balance_providers_dir": "适配器投放目录。留空=默认 HERMES_HOME\\balance-providers（出厂三适配器已播种）",
     "balance_token_plan_edition": "百炼 Token Plan 查询版本。个人版=月额度；团队版=席位额度；所选版本无生效订阅时报错不回落",
+    "approval_popup_enabled": "审批弹窗总开关。需先在 config.yaml 配 security.approval.transport: gateway-ui；只配 security 不开此开关=审批超时 fail-closed 拒绝",
+    "approval_popup_sounds": "审批弹窗到达提示音。关闭=静音（无音频设备也静音）",
+    "approval_platform_takeover": "消息平台会话审批接管。关（默认）=飞书/QQ 群/微信等远程审批交还原生聊天卡，弹窗只接管本机（Desktop/TUI/CLI）会话——需配 security.approval.transport_fallback: builtin；开=远程审批也弹本机窗，你不在电脑前时远程审批会等到超时",
+    "approval_sample": "弹出样例审批窗口预览 UAC 式形态与四按钮。纯演示，点击不注入任何真实信号",
 }
 MARK_DEFAULT = "｜默认值（未写入 config）"
 MARK_UNSET = "｜未设置（运行时关闭）"
@@ -182,6 +192,9 @@ class SettingsWindow(FluentWindow):
         self.confirm_tray_off = self._confirm_tray_off_dialog
         self.ask_custom_url = self._ask_custom_url_dialog
         self.ask_providers_dir = self._ask_providers_dir_dialog
+        # 审批弹窗样例窗口钩子（main.open_settings 注入 _show_sample_approval；
+        # 未注入时按钮提示不可用）。纯预览，零配置写（A2）。
+        self.show_sample_approval = None
 
         self._code_cmd = None
         for cand in ("code.cmd", "code.exe", "code"):
@@ -274,8 +287,21 @@ class SettingsWindow(FluentWindow):
             FluentIcon.GLOBE, "pip 安装源", CONTENT["package_index_url"],
             texts=[t for t, _ in PKG_PRESETS] + ["自定义…"])
         g2.addSettingCard(self.pkg_card)
+        # ---------- 常规页：审批弹窗组（R28-7）----------
+        g8 = SettingCardGroup("审批弹窗", page)
+        self.approval_card = SwitchSettingCard(
+            FluentIcon.ACCEPT, "启用审批弹窗", CONTENT["approval_popup_enabled"])
+        self.approval_takeover_card = SwitchSettingCard(
+            FluentIcon.GLOBE, "接管消息平台会话审批", CONTENT["approval_platform_takeover"])
+        self.approval_sounds_card = SwitchSettingCard(
+            FluentIcon.VOLUME, "到达提示音", CONTENT["approval_popup_sounds"])
+        self.approval_sample_card = PushSettingCard(
+            "弹出样例窗口", FluentIcon.PLAY, "预览审批弹窗", CONTENT["approval_sample"])
+        g8.addSettingCards([self.approval_card, self.approval_takeover_card,
+                            self.approval_sounds_card, self.approval_sample_card])
         lay.addWidget(g1)
         lay.addWidget(g2)
+        lay.addWidget(g8)
         lay.addStretch(1)
         self.addSubInterface(page, FluentIcon.SETTING, "常规")
 
@@ -352,8 +378,10 @@ class SettingsWindow(FluentWindow):
         self.update_card = SettingCard(FluentIcon.UPDATE, "更新状态", "")
         self.uptime_card = SettingCard(FluentIcon.HISTORY, "网关运行时长", "")
         self.state_card = SettingCard(FluentIcon.IOT, "运行状态", "")
+        self.approval_channel_card = SettingCard(FluentIcon.ACCEPT, "审批通道", "")
         g5.addSettingCards([self.version_card, self.update_card,
-                            self.uptime_card, self.state_card])
+                            self.uptime_card, self.state_card,
+                            self.approval_channel_card])
         g6 = SettingCardGroup("快速打开", page)
         self.logdir_card = PushSettingCard(
             "打开", FluentIcon.FOLDER, "日志目录", "资源管理器打开 log_dir")
@@ -410,6 +438,14 @@ class SettingsWindow(FluentWindow):
         self.balance_dir_card.clicked.connect(self._on_balance_dir)
         self.balance_open_card.clicked.connect(
             lambda: self._open_explorer(self._effective_balance_dir()))
+        # 审批弹窗：三开关 + 样例按钮（样例纯预览，零 settings_req，A2）
+        self.approval_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("approval.popup_enabled", bool(v)))
+        self.approval_takeover_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("approval.platform_takeover", bool(v)))
+        self.approval_sounds_card.switchButton.checkedChanged.connect(
+            lambda v: self._request("approval.popup_sounds", bool(v)))
+        self.approval_sample_card.clicked.connect(self._on_sample_approval)
         self.pkg_card.comboBox.currentIndexChanged.connect(self._on_pkg)
         self.enable_card.switchButton.checkedChanged.connect(
             lambda v: self._request("pet.enable-pet", bool(v)))
@@ -499,6 +535,8 @@ class SettingsWindow(FluentWindow):
         leaf = key[4:] if key.startswith("pet.") else key
         if key.startswith("balance."):
             leaf = "balance_" + key[8:]   # CONTENT 用 balance_enabled 等扁平名
+        if key.startswith("approval."):
+            leaf = "approval_" + key[len("approval."):]   # approval_popup_enabled 等
         text = CONTENT[leaf] + suffix
         if card.contentLabel.text() != text:
             card.setContent(text)
@@ -520,11 +558,14 @@ class SettingsWindow(FluentWindow):
         pet.update(raw.get("pet") or {})
         bal = dict(BALANCE_DEFAULTS)
         bal.update(raw.get("balance") or {})
+        appr = dict(APPROVAL_DEFAULTS)
+        appr.update(raw.get("approval") or {})
         expl = raw.get("explicit") or {}
-        return {"top": top, "pet": pet, "balance": bal,
+        return {"top": top, "pet": pet, "balance": bal, "approval": appr,
                 "explicit": {"top": list(expl.get("top") or []),
                              "pet": list(expl.get("pet") or []),
-                             "balance": list(expl.get("balance") or [])}}
+                             "balance": list(expl.get("balance") or []),
+                             "approval": list(expl.get("approval") or [])}}
 
     def _poll_view(self) -> None:
         """mtime+内容签名双判：内容没变不空转；同 tick 内容变了仍处理。"""
@@ -556,6 +597,8 @@ class SettingsWindow(FluentWindow):
             full = key
         elif section == "balance":
             full = "balance." + key
+        elif section == "approval":
+            full = "approval." + key
         else:
             full = "pet." + key
         val = _MISSING
@@ -655,6 +698,22 @@ class SettingsWindow(FluentWindow):
                    "providers_dir" in expl.get("balance", []))
         self.balance_dir_card.setContent(
             CONTENT["balance_providers_dir"] + "｜当前：" + self._effective_balance_dir())
+
+        # 审批弹窗：三开关（缺键角标同款；修改类缺省 false）
+        appr = v.get("approval") or APPROVAL_DEFAULTS
+        if not self._has_pending("approval.popup_enabled"):
+            self._set_switch(self.approval_card, appr.get("popup_enabled", False))
+        self._mark(self.approval_card, "approval.popup_enabled",
+                   "popup_enabled" in expl.get("approval", []))
+        if not self._has_pending("approval.platform_takeover"):
+            self._set_switch(self.approval_takeover_card,
+                             appr.get("platform_takeover", False))
+        self._mark(self.approval_takeover_card, "approval.platform_takeover",
+                   "platform_takeover" in expl.get("approval", []))
+        if not self._has_pending("approval.popup_sounds"):
+            self._set_switch(self.approval_sounds_card, appr.get("popup_sounds", True))
+        self._mark(self.approval_sounds_card, "approval.popup_sounds",
+                   "popup_sounds" in expl.get("approval", []))
 
         # 预览：换宠/拉大小即时重建（未决键用乐观值）
         slug = str(self._effective("pet", "slug") or "")
@@ -783,6 +842,18 @@ class SettingsWindow(FluentWindow):
                     self.balance_edition_card,
                     str(v.get("balance", BALANCE_DEFAULTS).get(
                         "token_plan_edition") or "individual"))
+            elif key == "approval.popup_enabled":
+                self._set_switch(self.approval_card,
+                                 v.get("approval", APPROVAL_DEFAULTS).get(
+                                     "popup_enabled", False))
+            elif key == "approval.platform_takeover":
+                self._set_switch(self.approval_takeover_card,
+                                 v.get("approval", APPROVAL_DEFAULTS).get(
+                                     "platform_takeover", False))
+            elif key == "approval.popup_sounds":
+                self._set_switch(self.approval_sounds_card,
+                                 v.get("approval", APPROVAL_DEFAULTS).get(
+                                     "popup_sounds", True))
         except Exception as exc:
             self._log_error(exc)
 
@@ -902,6 +973,19 @@ class SettingsWindow(FluentWindow):
             return
         self._request("balance.token_plan_edition", str(data))
 
+    def _on_sample_approval(self) -> None:
+        """审批弹窗「弹出样例窗口」：调 main 注入的钩子（纯预览，零 settings_req，A2）。
+        钩子未注入（独立构造/旧宿主）→ 提示不可用，绝不自己碰总线。"""
+        fn = self.show_sample_approval
+        if fn is None:
+            self._info("error", "样例窗口不可用", "审批弹窗管理器未就绪（请经托盘设置入口打开）")
+            return
+        try:
+            fn()
+        except Exception as exc:
+            self._log_error(exc)
+            self._info("error", "样例窗口弹出失败", str(exc))
+
     def _on_balance_dir(self) -> None:
         """投放目录：弹文件夹选择（可注入 ask_providers_dir）。空串=恢复默认。"""
         current = str(self._effective("balance", "providers_dir") or "")
@@ -978,6 +1062,7 @@ class SettingsWindow(FluentWindow):
             tray = data.get("tray") or {}
             ver = self.meta.get("version") or "unknown"
             self.version_card.setContent(f"gateway-ui {ver}")
+            self._update_approval_channel()
             if not data:
                 self.update_card.setContent("无状态数据（网关未连接）")
                 self.uptime_card.setContent("—")
@@ -996,6 +1081,35 @@ class SettingsWindow(FluentWindow):
                 f"桌宠：{data.get('pet_state', '?')}｜"
                 f"活跃会话：{data.get('active_sessions', 0)}｜"
                 f"灯：{tray.get('light', '?')}")
+        except Exception as exc:
+            self._log_error(exc)
+
+    def _update_approval_channel(self) -> None:
+        """关于页审批通道卡：transport 是否接管 + 搭配提醒（R28-7 / R29 分流）。
+        只配 security 不开 popup_enabled → 黄色警告（审批会超时 fail-closed）；
+        分流交还（takeover 关）但没配 transport_fallback: builtin → 同样警告
+        （交还即被快速拒绝，远程审批断头）。"""
+        try:
+            appr = (self._view or {}).get("approval") or {}
+            selected = bool(appr.get("transport_selected", False))
+            enabled = bool(self._effective("approval", "popup_enabled"))
+            takeover = bool(self._effective("approval", "platform_takeover"))
+            fb = bool(appr.get("fallback_builtin", False))
+            if not selected:
+                self.approval_channel_card.setContent(
+                    "未接管（审批走内置面）｜如需弹窗：config.yaml 配 "
+                    "security.approval.transport: gateway-ui")
+            elif enabled and takeover:
+                self.approval_channel_card.setContent(
+                    "已接管（全部会话）｜远程审批也弹本机窗")
+            elif enabled:
+                note = "远程审批交还原生聊天卡" if fb else \
+                    "⚠ 交还将被快速拒绝——须配 security.approval.transport_fallback: builtin"
+                self.approval_channel_card.setContent(
+                    f"已接管（仅本机会话）｜{note}")
+            else:
+                self.approval_channel_card.setContent(
+                    "⚠ 已接管但弹窗未启用——审批将超时拒绝，请开启「启用审批弹窗」")
         except Exception as exc:
             self._log_error(exc)
 

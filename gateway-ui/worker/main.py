@@ -39,7 +39,9 @@ LAST = {"light": None, "pet_state": None, "verbose": False}
 PET = {"win": None, "cfg": {}, "cfg_mtime": 0.0, "menu": None,
        "hidden": False, "last_enable": None,
        # 余额气泡：余额气泡（balance.enabled 门控，左键单击本体 toggle）
-       "bubble": None, "balance_cfg": {}}
+       "bubble": None, "balance_cfg": {},
+       # 审批弹窗：ApprovalPopup（approval.popup_enabled 门控，宿主 req 驱动）
+       "approval_mgr": None, "approval_cfg": {}}
 LIFECYCLE_PENDING = {"until": 0.0}
 OWNER_ALIVE = True
 
@@ -337,6 +339,9 @@ def reload_settings():
                 # 余额气泡：balance 块进 worker（缺块=功能关，A1 缺键不落盘语义由宿主保证）
                 bal = view.get("balance")
                 PET["balance_cfg"] = dict(bal) if isinstance(bal, dict) else {}
+                # 审批弹窗：approval 块进 worker（缺块=popup_enabled false，门控关）
+                appr = view.get("approval")
+                PET["approval_cfg"] = dict(appr) if isinstance(appr, dict) else {}
         elif not PET["cfg"]:
             PET["cfg"] = dict(META.get("pet") or {})
             vlog(f"settings_view absent -> seeded from tray_meta: {PET['cfg']}")
@@ -401,6 +406,8 @@ def open_settings():
         from settings_window import SettingsWindow
         win = SettingsWindow(META, STATE, request_setting,
                              home=META.get("hermes_home", ""))
+        # 审批弹窗：样例窗口钩子（设置页「弹出样例窗口」按钮 → 纯预览，A2）
+        win.show_sample_approval = _show_sample_approval
         SETTINGS_WIN["win"] = win
         win.show()
         win.raise_()
@@ -568,6 +575,53 @@ def _sync_bubble():
         vlog(f"sync_bubble RAISED: {exc}")
 
 
+# ------------------------------------------------------- approval popup ----
+# 审批弹窗 R28：宿主 approval_req.json 驱动，approval.popup_enabled 门控。
+# 点击注入 approval decision（写 approval_resp.json），零 settings_req（A2）。
+def _approval_enabled() -> bool:
+    """审批弹窗门控：approval.popup_enabled 缺省 false（DIY 修改类默认关）。"""
+    return bool(PET.get("approval_cfg", {}).get("popup_enabled", False))
+
+
+def _ensure_approval_mgr():
+    """惰性建 ApprovalPopupManager（单例）。失败留证不炸 tick。"""
+    if PET.get("approval_mgr") is not None:
+        return PET["approval_mgr"]
+    try:
+        from approval_popup import ApprovalPopupManager
+        mgr = ApprovalPopupManager(META, META["bus_dir"],
+                                   get_cfg=lambda: PET.get("approval_cfg", {}))
+        PET["approval_mgr"] = mgr
+        vlog("ApprovalPopupManager created")
+        return mgr
+    except Exception as exc:
+        trace(f"ApprovalPopupManager create failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _sync_approval():
+    """每拍维护审批弹窗：读 req/withdrawn、门控、堆叠、倒计时。失败不拖垮 tick。"""
+    mgr = _ensure_approval_mgr()
+    if mgr is None:
+        return
+    try:
+        mgr.sync()
+    except Exception as exc:
+        vlog(f"sync_approval RAISED: {exc}")
+
+
+def _show_sample_approval():
+    """设置页「弹出样例窗口」回调：纯预览，不注入真信号（A2）。"""
+    mgr = _ensure_approval_mgr()
+    if mgr is None:
+        return None
+    try:
+        return mgr.show_sample()
+    except Exception as exc:
+        vlog(f"show_sample RAISED: {exc}")
+        return None
+
+
 def sync_pet(app):
     """按 pet 配置块维护浮窗：enable-pet 开=建/显，关=隐；配置变更热重载。
     构造/sheet 缺失异常通道全部 vlog+限频 pet_error.log 留证（播种对账，不静默）。"""
@@ -689,6 +743,10 @@ def tick(app, tray_icon, menu):
             _sync_bubble()   # 余额气泡：余额气泡门控/刷新/跟随（失败不拖垮 tick）
         except Exception as exc:
             vlog(f"sync_bubble RAISED: {exc}")
+        try:
+            _sync_approval()   # 审批弹窗：req 驱动/门控/堆叠（失败不拖垮 tick）
+        except Exception as exc:
+            vlog(f"sync_approval RAISED: {exc}")
         if LIFECYCLE_PENDING["until"] and now > LIFECYCLE_PENDING["until"]:
             app.quit()
         if not OWNER_ALIVE:
