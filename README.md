@@ -65,6 +65,15 @@ Windows 与 Linux 实测过；macOS 理论上没有平台相关问题，但没�
 - aerialdreams-toolsets 内置 Nayuki qrcode-generator（MIT，版权头原样保留在 `common/qrcodegen.py`）。
 - hermes-minimem / browser-switcher 只对接阿里云百炼与 ShardX 的公开 API/协议，不捆绑任何第三方代码。
 
+## 关于一位客人的来访
+前几天我收到了来自Ivan的电子邮件，希望我以MIT署名公开几个提交，**本人已经接受且允许**。
+这里附上Ivan的[XERJ](https://github.com/xerj-org/xerj)项目以示友好。
+
+## 关于这个仓库偶尔回退的问题
+我最近发现这个仓库好像在因某种原因回退至第二个提交处
+如有人正在同步推送，请及时更新此仓库，我会在发现问题的第一时间重新提交我本地电脑上的最新副本。
+如果有人及其依赖此仓库中的部分代码，还请在这些问题查明之前保存自己的Fork。
+
 ## 使用过的LLM名单
 - Qwen3.8-Flash
 - Qwen3.8-Max
