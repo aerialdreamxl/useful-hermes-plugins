@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes.dashscope_native.transport")
 
-API_MODE = "qwen_dashscope"
+API_MODE = "dashscope"  # v0.5 命名统一（PROMPT.md §3.1）：原 qwen_dashscope，config 无旧名引用，零迁移
 
 
 def _chat_transport():

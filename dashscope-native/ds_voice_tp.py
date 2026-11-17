@@ -40,12 +40,14 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.tts_provider import TTSProvider
 from agent.transcription_provider import TranscriptionProvider
 
+from . import ds_settings
+
 logger = logging.getLogger("hermes.dashscope_native.voice_tp")
 
 PROVIDER_NAME = "dashscope-tp"
 
 # Documented constants (speech-synthesis / speech-recognition best-practices).
-DEFAULT_HOST = "https://token-plan.maas.qianwenaiapi.com"
+DEFAULT_HOST = "https://token-plan.cn-beijing.maas.aliyuncs.com"  # v0.5: owner template host
 TTS_PATH = "/api/v1/services/audio/tts/SpeechSynthesizer"
 ASR_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
 TIMEOUT_S = 300  # docs script timeout
@@ -57,20 +59,11 @@ ALLOW_FALLBACK_KEY_ENV = "DASHSCOPE_VOICE_ALLOW_ANTHROPIC_TOKEN"
 _TRUTHY = ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
-# Settings (DIY 插件规范: per-key auto-fill, explicit values never overwritten)
+# Settings: v0.5 shared tree (ds_settings.DEFAULTS). TP lane params read via
+# ds_settings.lane_value(..., tp=True): tp_model/tp_voice/tp_sample_rate first,
+# fall back to the bare metered key when the tp_ twin is absent (§4 ruling).
 # ---------------------------------------------------------------------------
-DEFAULTS: Dict[str, Any] = {
-    "voice.token_plan.base_url": DEFAULT_HOST,
-    "voice.token_plan.api_key_env": "TOKEN_PLAN_API_KEY",
-    "voice.token_plan.tts.enabled": False,
-    "voice.token_plan.tts.model": "qwen-audio-3.0-tts-plus",
-    "voice.token_plan.tts.voice": "longanhuan_v3.6",
-    "voice.token_plan.tts.sample_rate": 22050,
-    "voice.token_plan.stt.enabled": False,
-    "voice.token_plan.stt.model": "qwen-audio-3.0-asr-flash",
-}
-
-_MISSING = object()
+DEFAULTS = ds_settings.DEFAULTS
 
 # qwen-audio-3.0-tts-plus system voices verified on the official voice-list
 # page (2026-11-11). longanhuan_v3.6 is the best-practices doc's default
@@ -131,12 +124,12 @@ def _allow_fallback_key() -> bool:
 def _key_envs(get_setting: SettingGetter) -> List[str]:
     """按既有优先级列出可用的 key 环境变量名（只列名，不读值、不外泄）。
 
-    顺序：voice.token_plan.api_key_env（默认 TOKEN_PLAN_API_KEY）→
-    ANTHROPIC_AUTH_TOKEN（仅在显式开关打开时追加）。把 api_key_env 显式设成
+    顺序：顶层 tp_key_env（默认 DASHSCOPE_TOKEN_PLAN_API_KEY）→
+    ANTHROPIC_AUTH_TOKEN（仅在显式开关打开时追加）。把 tp_key_env 显式设成
     ANTHROPIC_AUTH_TOKEN 属于用户自己写明，不算隐式复用，照旧生效。
     """
     env_name = str(
-        get_setting("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
+        get_setting("tp_key_env", DEFAULTS["tp_key_env"])
         or ""
     ).strip()
     names: List[str] = [env_name] if env_name else []
@@ -151,7 +144,7 @@ def _resolve_key(get_setting: SettingGetter) -> tuple:
     优先级保持 docs 顺序；来源标签供日志/返回体注明（F20 要求可追溯）。
     """
     env_name = str(
-        get_setting("voice.token_plan.api_key_env", DEFAULTS["voice.token_plan.api_key_env"])
+        get_setting("tp_key_env", DEFAULTS["tp_key_env"])
         or ""
     ).strip()
     for name in _key_envs(get_setting):
@@ -163,7 +156,7 @@ def _resolve_key(get_setting: SettingGetter) -> tuple:
         return (value, f"env:{name} (explicit via {ALLOW_FALLBACK_KEY_ENV}=1)")
     raise RuntimeError(
         "dashscope-native token-plan voice: no Token Plan API key. Set "
-        f"{env_name or 'TOKEN_PLAN_API_KEY'} (sk-sp- key from the Token Plan "
+        f"{env_name or 'DASHSCOPE_TOKEN_PLAN_API_KEY'} (sk-sp- key from the Token Plan "
         f"console). {FALLBACK_KEY_ENV} is NOT reused automatically — it is an "
         "Anthropic-side credential; set "
         f"{ALLOW_FALLBACK_KEY_ENV}=1 only if you deliberately share it."
@@ -171,9 +164,7 @@ def _resolve_key(get_setting: SettingGetter) -> tuple:
 
 
 def _base_url(get_setting: SettingGetter) -> str:
-    return str(
-        get_setting("voice.token_plan.base_url", DEFAULT_HOST) or DEFAULT_HOST
-    ).rstrip("/")
+    return ds_settings.tp_host(get_setting)
 
 
 def make_poster(get_setting: SettingGetter) -> Poster:
@@ -213,10 +204,10 @@ def make_getter() -> Getter:
 def _resolve(
     arg: Optional[str], get_setting: SettingGetter, key: str, default: str
 ) -> str:
-    """Precedence: host call argument > plugin settings > built-in default."""
+    """Precedence: host call argument > TP-lane setting (tp_X → X) > default."""
     if isinstance(arg, str) and arg.strip():
         return arg.strip()
-    value = get_setting(key, None)
+    value = ds_settings.lane_value(get_setting, key, None, tp=True)
     if isinstance(value, str) and value.strip():
         return value.strip()
     return default
@@ -260,10 +251,10 @@ class TokenPlanTTS(TTSProvider):
         return [{"id": v} for v in TP_TTS_VOICES]
 
     def default_voice(self) -> Optional[str]:
-        return str(self._get("voice.token_plan.tts.voice", DEFAULTS["voice.token_plan.tts.voice"]))
+        return str(ds_settings.lane_value(self._get, "voice.tts.voice", DEFAULTS["voice.tts.voice"], tp=True))
 
     def default_model(self) -> Optional[str]:
-        return str(self._get("voice.token_plan.tts.model", DEFAULTS["voice.token_plan.tts.model"]))
+        return str(ds_settings.lane_value(self._get, "voice.tts.model", DEFAULTS["voice.tts.model"], tp=True))
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
@@ -272,7 +263,7 @@ class TokenPlanTTS(TTSProvider):
             "tag": "Token Plan sk-sp- key",
             "env_vars": [
                 {
-                    "key": "TOKEN_PLAN_API_KEY",
+                    "key": "DASHSCOPE_TOKEN_PLAN_API_KEY",
                     "prompt": "Token Plan API key (sk-sp-...)",
                     "url": "https://platform.qianwenai.com/docs/token-plan/best-practices/speech-synthesis",
                 }
@@ -306,22 +297,24 @@ class TokenPlanTTS(TTSProvider):
     ) -> str:
         del extra  # unknown keys ignored by contract; speed has no doc slot
         resolved_model = _resolve(
-            model, self._get, "voice.token_plan.tts.model", DEFAULTS["voice.token_plan.tts.model"]
+            model, self._get, "voice.tts.model", DEFAULTS["voice.tts.model"]
         )
         resolved_voice = _resolve(
-            voice, self._get, "voice.token_plan.tts.voice", DEFAULTS["voice.token_plan.tts.voice"]
+            voice, self._get, "voice.tts.voice", DEFAULTS["voice.tts.voice"]
         )
         fmt = str(format or "mp3").strip().lower()
         service_format = _FORMAT_MAP.get(fmt, "mp3")
         try:
             sample_rate = int(
-                self._get(
-                    "voice.token_plan.tts.sample_rate",
-                    DEFAULTS["voice.token_plan.tts.sample_rate"],
+                ds_settings.lane_value(
+                    self._get,
+                    "voice.tts.sample_rate",
+                    DEFAULTS["voice.tts.sample_rate"],
+                    tp=True,
                 )
             )
         except (TypeError, ValueError):
-            sample_rate = DEFAULTS["voice.token_plan.tts.sample_rate"]
+            sample_rate = DEFAULTS["voice.tts.tp_sample_rate"]
         key, key_source = _resolve_key(self._get)
         logger.info(
             "dashscope-native token-plan voice: TTS bearer source %s", key_source
@@ -391,7 +384,7 @@ class TokenPlanSTT(TranscriptionProvider):
         ]
 
     def default_model(self) -> Optional[str]:
-        return str(self._get("voice.token_plan.stt.model", DEFAULTS["voice.token_plan.stt.model"]))
+        return str(ds_settings.lane_value(self._get, "voice.stt.model", DEFAULTS["voice.stt.model"], tp=True))
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
@@ -400,7 +393,7 @@ class TokenPlanSTT(TranscriptionProvider):
             "tag": "Token Plan sk-sp- key",
             "env_vars": [
                 {
-                    "key": "TOKEN_PLAN_API_KEY",
+                    "key": "DASHSCOPE_TOKEN_PLAN_API_KEY",
                     "prompt": "Token Plan API key (sk-sp-...)",
                     "url": "https://platform.qianwenai.com/docs/token-plan/best-practices/speech-recognition",
                 }
@@ -422,7 +415,7 @@ class TokenPlanSTT(TranscriptionProvider):
         del extra  # prompt/vocabulary hints: no doc slot on this lane
         try:
             resolved_model = _resolve(
-                model, self._get, "voice.token_plan.stt.model", DEFAULTS["voice.token_plan.stt.model"]
+                model, self._get, "voice.stt.model", DEFAULTS["voice.stt.model"]
             )
             source = str(file_path)
             if source.startswith(("http://", "https://")):
@@ -503,17 +496,10 @@ class TokenPlanSTT(TranscriptionProvider):
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-def _seed(ctx: Any) -> None:
-    """Per-key auto-fill: only keys absent from settings are written."""
-    for key, default in DEFAULTS.items():
-        if ctx.get_config(key, _MISSING) is _MISSING:
-            ctx.set_config(key, default)
-
-
 def register(ctx: Any) -> None:
-    _seed(ctx)
-    tts_on = bool(ctx.get_config("voice.token_plan.tts.enabled", False))
-    stt_on = bool(ctx.get_config("voice.token_plan.stt.enabled", False))
+    # seeding happens once in ds_settings.seed(ctx) at plugin entry
+    tts_on = bool(ctx.get_config("voice.tts.enabled_tp", True))
+    stt_on = bool(ctx.get_config("voice.stt.enabled_tp", True))
     getter: SettingGetter = lambda k, d=None: ctx.get_config(k, d)  # noqa: E731
     if tts_on:
         ctx.register_tts_provider(TokenPlanTTS(getter))

@@ -19,25 +19,25 @@ from .ds_uri import SCHEME, DashScopeUriError, parse_dashscope_uri
 
 logger = logging.getLogger("hermes.dashscope_native.profile")
 
-PROFILE_NAME = "dashscope-native"
+PROFILE_NAME = "dashscope"  # v0.5 命名统一（PROMPT.md 裁定②/§6.4）：旧名与旧 aliases 作废
 
 
 class DashScopeNativeProfile(ProviderProfile):
-    api_mode = "qwen_dashscope"
+    api_mode = "dashscope"
 
     def __init__(self):
         # ProviderProfile is a dataclass: un-annotated class attrs do NOT become
         # field defaults — pass everything explicitly (same as advanced plugin).
         super().__init__(
             name=PROFILE_NAME,
-            aliases=(PROFILE_NAME, "qwen-dashscope", "dashscope-native-api"),
+            aliases=(PROFILE_NAME,),  # v0.5：旧 aliases 不保留（§6.4）
             display_name="[NATIVE] Alibaba Bailian — DashScope native (metered key)",
             description=(
                 "Official dashscope SDK, native wire. base_url = "
                 "dashscope://<region>[@<workspace-id>] (metered/pay-as-you-go key; "
                 "Token Plan × native is undocumented — out of scope per O1)."
             ),
-            api_mode="qwen_dashscope",
+            api_mode="dashscope",
             env_vars=("DASHSCOPE_API_KEY",),
             base_url=SCHEME,  # prefix sentinel for _profile_for_base_url
             supports_streaming=True,

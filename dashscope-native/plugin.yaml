@@ -1,5 +1,6 @@
 name: dashscope-native
-version: 0.2.0
-description: "DashScope native-wire provider (api_mode: qwen_dashscope) via the official dashscope SDK, plus voice lanes: metered Qwen-TTS/ASR (provider 'dashscope') and Token Plan voice REST per official docs (provider 'dashscope-tp'). Zero core patches."
+version: 0.5.0
+description: "All Bailian (DashScope) planes in one plugin: native-wire chat (api_mode/profile 'dashscope', official dashscope SDK), voice TTS/STT metered ('dashscope') + Token Plan ('dashscope-tp') with tp_ per-lane overrides, image generation metered/TP ('dashscope'/'dashscope-tp', merged from t2i-bailian), EnhancedSearch/WebFetch MCP web ('dashscope', merged from web-dashscope). Shared base_url/key_env + tp_base_url/tp_key_env settings tree. Zero core patches."
 author: "Feather (翎羽)"
 kind: standalone
+provides_web_providers: true

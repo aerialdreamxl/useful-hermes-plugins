@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .ds_uri import parse_dashscope_uri
+from . import ds_settings
 
 from agent.tts_provider import TTSProvider
 from agent.transcription_provider import TranscriptionProvider
@@ -33,20 +34,10 @@ PROVIDER_NAME = "dashscope"
 MIN_SDK = (2, 0, 4)
 
 # ---------------------------------------------------------------------------
-# Settings (DIY 插件规范: per-key auto-fill, explicit values never overwritten)
+# Settings: v0.5 shared tree (ds_settings.DEFAULTS). Bare keys = metered lane;
+# TP lane overrides live in the tp_ twins and are read via ds_settings.lane_value.
 # ---------------------------------------------------------------------------
-DEFAULTS: Dict[str, Any] = {
-    "voice.base": "dashscope://cn-beijing",
-    "voice.api_key_env": "DASHSCOPE_API_KEY",
-    "voice.tts.enabled": False,
-    "voice.tts.model": "qwen3-tts-flash",
-    "voice.tts.voice": "Cherry",
-    "voice.tts.stream_pcm": True,
-    "voice.stt.enabled": False,
-    "voice.stt.model": "qwen3-asr-flash",
-}
-
-_MISSING = object()
+DEFAULTS = ds_settings.DEFAULTS
 
 # Official Qwen-TTS voice list snapshot (48 rows actually listed, help.aliyun.com
 # /zh/model-studio/qwen-tts-voice-list, fetched 2026-11-11; marketing copy says
@@ -106,7 +97,7 @@ def _guided_key_error(env_name: str) -> RuntimeError:
     return RuntimeError(
         f"dashscope-native voice: no API key. Set {env_name} to your METERED "
         "(pay-as-you-go) Bailian key (Token Plan keys are out of scope per "
-        "PROMPT.md O1), or point voice.api_key_env at the right variable."
+        "PROMPT.md O1), or point the top-level key_env at the right variable."
     )
 
 
@@ -127,11 +118,11 @@ def make_client_factory(get_setting: SettingGetter) -> ClientFactory:
             )
         import dashscope
 
-        base = str(get_setting("voice.base", DEFAULTS["voice.base"]) or "")
+        base = str(get_setting("base_url", DEFAULTS["base_url"]) or "")
         ref = parse_dashscope_uri(base)  # malformed → loud DashScopeUriError
-        assert ref is not None, "voice.base must use the dashscope:// grammar"
+        assert ref is not None, "base_url must use the dashscope:// grammar"
         env_name = str(
-            get_setting("voice.api_key_env", DEFAULTS["voice.api_key_env"]) or ""
+            get_setting("key_env", DEFAULTS["key_env"]) or ""
         )
         api_key = os.environ.get(env_name, "")
         if not api_key:
@@ -177,7 +168,7 @@ class DashScopeTTS(TTSProvider):
         """Local checks only (picker paints call this every frame)."""
         if importlib.util.find_spec("dashscope") is None:
             return False
-        env_name = str(self._get("voice.api_key_env", DEFAULTS["voice.api_key_env"]) or "")
+        env_name = str(self._get("key_env", DEFAULTS["key_env"]) or "")
         return bool(env_name and os.environ.get(env_name))
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -217,7 +208,11 @@ class DashScopeTTS(TTSProvider):
 
     @property
     def stream_sample_rate(self) -> Optional[int]:
-        return _PCM_STREAM_RATE if self.streams_pcm else None
+        # v0.5：可配采样率（voice.tts.sample_rate，官方流式样例 24000 为缺省）
+        try:
+            return int(self._get("voice.tts.sample_rate", _PCM_STREAM_RATE)) if self.streams_pcm else None
+        except (TypeError, ValueError):
+            return _PCM_STREAM_RATE if self.streams_pcm else None
 
     @property
     def voice_compatible(self) -> bool:
@@ -309,7 +304,7 @@ class DashScopeTTS(TTSProvider):
             if _is_qwen_family(resolved_model):
                 kwargs: Dict[str, Any] = {"format": "pcm" if fmt == "pcm" else fmt}
                 if fmt == "pcm":
-                    kwargs["sample_rate"] = _PCM_STREAM_RATE
+                    kwargs["sample_rate"] = self.stream_sample_rate or _PCM_STREAM_RATE
                 for chunk in client.audio.tts.http.stream(
                     text, model=resolved_model, voice=resolved_voice, **kwargs
                 ):
@@ -342,7 +337,7 @@ class DashScopeSTT(TranscriptionProvider):
     def is_available(self) -> bool:
         if importlib.util.find_spec("dashscope") is None:
             return False
-        env_name = str(self._get("voice.api_key_env", DEFAULTS["voice.api_key_env"]) or "")
+        env_name = str(self._get("key_env", DEFAULTS["key_env"]) or "")
         return bool(env_name and os.environ.get(env_name))
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -425,17 +420,10 @@ class DashScopeSTT(TranscriptionProvider):
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-def _seed(ctx: Any) -> None:
-    """Per-key auto-fill: only keys absent from settings are written."""
-    for key, default in DEFAULTS.items():
-        if ctx.get_config(key, _MISSING) is _MISSING:
-            ctx.set_config(key, default)
-
-
 def register(ctx: Any) -> None:
-    _seed(ctx)
-    tts_on = bool(ctx.get_config("voice.tts.enabled", False))
-    stt_on = bool(ctx.get_config("voice.stt.enabled", False))
+    # seeding happens once in ds_settings.seed(ctx) at plugin entry
+    tts_on = bool(ctx.get_config("voice.tts.enabled", True))
+    stt_on = bool(ctx.get_config("voice.stt.enabled", True))
     getter: SettingGetter = lambda k, d=None: ctx.get_config(k, d)  # noqa: E731
     if tts_on:
         ctx.register_tts_provider(DashScopeTTS(getter))
