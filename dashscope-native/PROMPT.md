@@ -128,8 +128,23 @@ plugins:
   过期重拉并经官方 writer 持久化回 `t2i.models`；false 时零网络、原样返回存量列表。
   拉取失败回落存量列表，不得炸注册/picker。**内置三模型快照已删除**（v0.5.1 BUG 修：
   任何变体都不得回退到硬编码三件套）。
-- 过滤图像族（id 含 image/wan/z-image，排除 -video）。样板字段 `display/strengths/price`
-  端点只给 id：display 本地美化，strengths/price 留空，**不编造**。
+- 过滤图像族（id 含 image/wan/z-image，排除 -video）。
+- **v0.5.2 定价/简介扒取（主人 2026-11-17 追加）**：models 端点只给 id；对缺
+  strengths/price 的条目从官方文档页 `help.aliyun.com/zh/model-studio/<slug>` 扒取
+  （slug=id 点换横线，实测 wan2.7-image→wan2-7-image 全目录可达）。简介=meta
+  description 截 80 字；定价只读第一个地域块（北京）的「图片生成」行，含 1K/2K 与
+  标准/思考档位，国际价严禁混入。带日期快照 id 404 时回退无日期基础页。扒不到留空
+  **不编造**；已扒到的条目刷新时保留不重扒。受 discover_models 同一开关管辖。
+- **v0.5.2 BUG4 裁定：删除 `t2i.model` 设置键**——模型选择唯一权威=系统级
+  `image_gen.model`（setup tools 写入、tools/image_generation_tool.py 每调用注入
+  kwargs["model"]）；default_model() 用核心基类语义（目录第一项）。generate 内
+  `or "wan2.7-image"` 仅作目录全空时的最后防线。
+- **v0.5.2 BUG3 根因在核心**：`hermes setup tools` 全程持一份 load_config 快照，
+  插件中途 `ctx.set_config` 原子落盘 t2i.models 后，流程收尾 `save_config(config)`
+  用旧快照整份写回把它抹掉（复现实锤：中途盘上 12 条→收尾 0 条）。修在
+  `hermes_cli/config.py`：save_config 新增 refresh_plugin_settings=True，全文档
+  保存前用磁盘 raw 的 plugins.entries.*.settings 深合并刷新快照同子树；
+  plugins_state.py 权威写路径显式传 False。核心补丁备份见 README。
 - 存量列表兼容手改：`t2i.models` 里写纯 id 字符串数组也认（自动包成条目）。
 
 ## 6. 功能面细则

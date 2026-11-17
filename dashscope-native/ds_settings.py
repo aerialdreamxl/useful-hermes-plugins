@@ -44,9 +44,11 @@ DEFAULTS: Dict[str, Any] = {
     # t2i (§6.1) — one provider class, two construction parameter sets.
     # models = the METERED upstream's full image-model catalog, shared by both
     # variants (owner ruling: TP users pick what their plan covers themselves).
+    # NO t2i.model key (owner ruling 2026-11-17 BUG4): the model choice lives in
+    # the system-level image_gen.model, written by `hermes setup tools` and
+    # injected per-call by tools/image_generation_tool.py.
     "t2i.enabled": True,
     "t2i.enabled_tp": True,
-    "t2i.model": "wan2.7-image",
     "t2i.discover_models": True,
     "t2i.models_ttl_s": 3600,
     "t2i.models": [],

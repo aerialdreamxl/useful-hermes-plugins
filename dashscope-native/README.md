@@ -56,10 +56,18 @@ Token Plan × 原生 chat 上游未文档化，不做（O1）。web 无 TP 变�
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `t2i.model` | `wan2.7-image` | 缺省模型（两变体共用；调用时 model 参数可覆盖） |
 | `t2i.discover_models` | `true` | 是否随上游刷新模型列表。false=零网络，原样用 `t2i.models` 存量 |
 | `t2i.models` | `[]`（首拉后自动填充） | **按量上游全部文生图模型**的共享目录，两变体返回同一份（TP 用户自己挑套餐覆盖的）。刷新经官方 writer 持久化回此键；可手改（纯 id 字符串数组也认）。无内置硬编码兜底 |
-| `t2i.models_ttl_s` | `3600` | 刷新间隔秒数。列表从按量 `{base}/compatible-mode/v1/models` 拉取、过滤图像族（video 排除）；端点只给 id，display 本地美化、strengths/price 留空不编造；拉取失败回落存量，绝不炸注册 |
+| `t2i.models_ttl_s` | `3600` | 刷新间隔秒数。列表从按量 `{base}/compatible-mode/v1/models` 拉取、过滤图像族（video 排除）；拉取失败回落存量，绝不炸注册 |
+
+**没有 `t2i.model` 键**（2026-11-17 裁定）：用哪个模型由系统级 `image_gen.model` 决定
+（`hermes setup tools` → Image Generation 里选），工具层每次调用注入；插件不再自持缺省模型。
+
+**定价与简介**（v0.5.2）：目录刷新时对缺定价/简介的条目，从官方文档页
+`help.aliyun.com/zh/model-studio/<id点换横线>` 扒取——简介取页面 meta description（截 80 字），
+定价只读**第一个地域块（北京）**的"图片生成"行（含 1K/2K、标准/思考档位），国际价绝不混入。
+带日期快照 id 自动回退到无日期基础页。扒不到就留空，不编造；已扒到的条目在后续刷新中保留不重扒。
+受 `discover_models` 同一开关管辖。
 
 ## 凭证与安全
 
@@ -82,16 +90,23 @@ Token Plan × 原生 chat 上游未文档化，不做（O1）。web 无 TP 变�
    `model.provider: dashscope` 解析到**原生线**（原 OpenAI-compatible）。这是命名统一
    裁定的直接后果（PROMPT.md §6.4），本机 `custom:dashscope-token-plan` 路由不受影响。
 
-## 核心补丁（v0.5.1，非插件文件）
+## 核心补丁（非插件文件，上游升级会冲掉需重放）
 
-`hermes-agent/hermes_cli/tools_config_providers.py`：补 STT 插件行注入缝（spec/partial/
-builder 三处对称条目）。原核心 STT picker 无插件注入口，导致 `hermes setup tools` 里
-TTS 可见百炼而 STT 不可见。备份：`Data/cache/scratch/tools_config_providers.py.bak-stt-picker`；
-核心仓 git 可回滚；**上游升级会冲掉，需重放**。
+1. **v0.5.1 STT picker 缝**：`hermes_cli/tools_config_providers.py` 补 STT 插件行注入
+   （spec/partial/builder 三处对称条目）。原核心 STT picker 无插件注入口，导致
+   `hermes setup tools` 里 TTS 可见百炼而 STT 不可见。
+   备份：`Data/cache/scratch/tools_config_providers.py.bak-stt-picker`。
+2. **v0.5.2 设置落盘防回退**：`hermes_cli/config.py` 的 `save_config` 新增
+   `refresh_plugin_settings`（默认 true）——全文档保存前用磁盘上的
+   `plugins.entries.*.settings` 刷新调用方快照里的同子树。根因：`hermes setup tools`
+   全程持一份 load_config 快照，插件中途经官方 writer 原子落盘的键（如 t2i.models）
+   会被流程收尾的 save_config 用旧快照整份写回、静默抹掉。
+   `plugins_state.py` 的权威写路径显式传 false 防止自我覆盖。
+   备份：`Data/cache/scratch/config.py.bak-leaf-authority`。
 
 ## 测试
 
-`tests/test_v05.py`：79 项验收（真实核心 ABC isinstance 闸、真实 transport/provider
+`tests/test_v05.py`：87 项验收（真实核心 ABC isinstance 闸、真实 transport/provider
 注册链、开关矩阵、tp_ 分车道、逐键补齐、SDK 缺失不连坐、通道审计、错误包络契约、
 共享目录/discover_models 冻结），含 live 探针（全量目录实拉 + 真实 MCP 搜索/抓取）。跑法：
 

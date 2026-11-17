@@ -250,8 +250,15 @@ def main():
             ids = [m["id"] for m in models]
             check(f"V6 live catalog {variant}: wan2.7-image present", "wan2.7-image" in ids, str(ids[:8]))
             check(f"V6 live catalog {variant}: no video models", not any("video" in i for i in ids), str(ids))
-            check(f"V6 live catalog {variant}: no invented price", all(m.get("price", "") == "" for m in models))
             check(f"V6 live catalog {variant}: size sane", 3 <= len(ids) <= 120, str(len(ids)))
+            # v0.5.2 enrichment: prices scraped from official doc pages (Beijing block only)
+            wan = next(m for m in models if m["id"] == "wan2.7-image")
+            check(f"V6 {variant}: wan2.7-image price scraped", "0.2" in wan.get("price", ""), wan.get("price", ""))
+            check(f"V6 {variant}: wan2.7-image intro scraped", bool(wan.get("strengths")), wan.get("strengths", ""))
+            check(f"V6 {variant}: no intl price leak", all("0.224826" not in m.get("price", "") for m in models))
+            check(f"V6 {variant}: enriched majority", sum(1 for m in models if m.get("price")) >= len(models) // 2,
+                  str([(m["id"], m.get("price", "")) for m in models]))
+            check(f"V6 {variant}: default_model = first catalog entry", p.default_model() == ids[0])
         # one real MCP search (cheap, metered)
         w = live_ctx.registered["web"][0]
         sr = w.search("阿里云百炼", limit=2)

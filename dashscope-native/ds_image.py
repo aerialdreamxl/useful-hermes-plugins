@@ -13,13 +13,25 @@ variants return that same list — TP users pick what their plan covers
 themselves. ``t2i.discover_models`` (default true) decides whether the list
 refreshes from {metered base}/compatible-mode/v1/models (probed 2026-11-17:
 182 ids upstream); refreshed lists are persisted back into settings via the
-official writer. False = use the stored list as-is, no network. The endpoint
-only gives ids — display is prettified locally, strengths/price stay empty
-(never invent). Failure falls back to the stored list; a fetch failure must
-never break registration or the picker.
+official writer. False = use the stored list as-is, no network. Failure falls
+back to the stored list; a fetch failure must never break registration or the
+picker.
+
+Enrichment (owner ask 2026-11-17): per-model price + intro are scraped from
+the official doc page help.aliyun.com/zh/model-studio/<slug> (slug = id with
+dots -> dashes; dated snapshots fall back to the undated base page). Only the
+FIRST region block (Beijing for cn bases) is read — never mix intl prices in.
+Scraped text is untrusted external content: length-capped, no invention; a
+page that 404s or parses empty leaves the fields blank. Refresh happens only
+when a catalog entry lacks enrichment, under the same discover_models gate.
+
+NO t2i.model settings key (owner ruling BUG4): the model choice is the
+system-level image_gen.model written by `hermes setup tools`; the tool layer
+injects it per call. default_model() = first catalog entry (core base class).
 """
 from typing import Any, Callable, Dict, List, Optional
 import os
+import re
 import time
 
 from agent.image_gen_provider import (
@@ -45,9 +57,83 @@ def _is_image_model(model_id: str) -> bool:
 
 def _prettify(model_id: str) -> str:
     # local display only: strip date suffixes, Title-Case words (no invention)
-    import re
     base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model_id)
     return (" ".join(w.capitalize() for w in base.replace("-", " ").replace(".", " ").split()))
+
+
+_DOC_HOST = "https://help.aliyun.com/zh/model-studio/"
+
+
+def _doc_slug(model_id: str) -> str:
+    # observed rule: dots -> dashes (wan2.7-image -> wan2-7-image)
+    return (model_id.replace(".", "-"))
+
+
+def _base_model_id(model_id: str) -> str:
+    # dated snapshot -> its undated base page (qwen-image-2.0-pro-2026-04-22 -> qwen-image-2.0-pro)
+    return (re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model_id))
+
+
+def _parse_doc_page(html: str) -> Dict[str, str]:
+    """Extract {strengths, price} from one official model doc page.
+
+    Untrusted external content: everything length-capped, nothing invented.
+    Only the FIRST region block after 模型价格 is read (Beijing on cn pages);
+    later blocks are intl prices and must never leak into the metered catalog.
+    """
+    out = {"strengths": "", "price": ""}
+    meta = re.search(r'<meta name="description" content="([^"]*)"', html)
+    if meta:
+        intro = meta.group(1).strip()
+        # doc boilerplate suffix, not model info
+        intro = re.sub(r"[-–—]?\s*(大模型服务平台百炼|阿里云帮助中心).*$", "", intro).strip()
+        out["strengths"] = intro[:80]
+    text = re.sub(r"<[^>]+>", "|", html)
+    text = re.sub(r"\|+", "|", text)
+    price_at = text.find("模型价格")
+    if price_at >= 0:
+        block = text[price_at:price_at + 1200]
+        # cut at the next region heading so only the first (Beijing) block survives
+        nxt = re.search(r"\|(新加坡|德国（法兰克福）|美国（弗吉尼亚）|日本（东京）|华北2（杭州）)\|", block)
+        if nxt:
+            block = block[:nxt.start()]
+        # rows like: [1K|]图片生成[（标准）]|0.25|每张 — keep tier/variant qualifiers
+        rows = re.findall(r"(?:(1K|2K|4K)\|)?(图片生成[^|]{0,12})\|([\d.,]+)\|(每张)", block)
+        parts = []
+        for tier, item, amount, unit in rows:
+            label = item.strip()
+            if tier:
+                label = tier + " " + label
+            parts.append(f"{label} ¥{amount}/{unit}")
+        # dedupe while keeping order (pages repeat the table for mobile layouts)
+        seen = set()
+        uniq = [p for p in parts if not (p in seen or seen.add(p))]
+        out["price"] = "; ".join(uniq)[:120]
+    return (out)
+
+
+def _fetch_doc_enrichment(model_id: str) -> Dict[str, str]:
+    """One official doc page per model; dated ids retry on the undated base page."""
+    import urllib.request
+
+    slugs = [_doc_slug(model_id)]
+    base_id = _base_model_id(model_id)
+    if base_id != model_id:
+        slugs.append(_doc_slug(base_id))
+    for slug in slugs:
+        try:
+            request = urllib.request.Request(
+                _DOC_HOST + slug, headers={"User-Agent": "Mozilla/5.0 (Hermes dashscope-native catalog)"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                html = (response.read() or b"").decode("utf-8", "replace")
+            if "404错误页" in html[:4000]:
+                continue
+            parsed = _parse_doc_page(html)
+            if parsed["strengths"] or parsed["price"]:
+                return (parsed)
+        except Exception:
+            continue  # enrichment is best-effort; never break the catalog
+    return ({"strengths": "", "price": ""})
 
 
 class BailianImageGenProvider(ImageGenProvider):
@@ -122,6 +208,23 @@ class BailianImageGenProvider(ImageGenProvider):
                 out.append({"id": mid, "display": _prettify(mid), "strengths": "", "price": ""})
         return (out or None)
 
+    def _enrich(self, models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fill missing strengths/price from official doc pages (bounded, sequential).
+
+        Runs only under discover_models=true and only for entries lacking BOTH
+        fields; enriched results are persisted by the caller. A doc-page failure
+        leaves the entry untouched — blank is honest, invented is not.
+        """
+        out = []
+        for entry in models:
+            entry = dict(entry)
+            if not entry.get("strengths") and not entry.get("price"):
+                info = _fetch_doc_enrichment(str(entry.get("id") or ""))
+                entry["strengths"] = info["strengths"]
+                entry["price"] = info["price"]
+            out.append(entry)
+        return (out)
+
     def list_models(self) -> List[Dict[str, Any]]:
         stored = self._stored_models()
         if not bool(self._get("t2i.discover_models", True)):
@@ -136,6 +239,14 @@ class BailianImageGenProvider(ImageGenProvider):
         try:
             live = self._fetch_live_models()
             if live:
+                # keep previously scraped enrichment for ids that survived the refresh
+                old = {m["id"]: m for m in stored}
+                for entry in live:
+                    prev = old.get(entry["id"])
+                    if prev and (prev.get("strengths") or prev.get("price")):
+                        entry["strengths"] = prev.get("strengths", "")
+                        entry["price"] = prev.get("price", "")
+                live = self._enrich(live)
                 self._cache = live
                 self._cache_at = now
                 if self._set is not None and live != stored:
@@ -150,8 +261,9 @@ class BailianImageGenProvider(ImageGenProvider):
             return (self._cache)  # last-good in-process value
         return (stored)
 
-    def default_model(self) -> Optional[str]:
-        return (str(self._get("t2i.model", ds_settings.DEFAULTS["t2i.model"]) or "wan2.7-image"))
+    # default_model(): inherited from CatalogProviderBase = first catalog entry.
+    # NO t2i.model settings key (owner BUG4): the effective model is the
+    # system-level image_gen.model, injected per call by the tool layer.
 
     def get_setup_schema(self) -> Dict[str, Any]:
         env_key = self._key_env()
