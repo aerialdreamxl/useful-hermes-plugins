@@ -41,11 +41,15 @@ DEFAULTS: Dict[str, Any] = {
     "voice.stt.enabled_tp": True,
     "voice.stt.model": "qwen3-asr-flash",
     "voice.stt.tp_model": "qwen-audio-3.0-asr-flash",
-    # t2i (§6.1) — one provider class, two construction parameter sets
+    # t2i (§6.1) — one provider class, two construction parameter sets.
+    # models = the METERED upstream's full image-model catalog, shared by both
+    # variants (owner ruling: TP users pick what their plan covers themselves).
     "t2i.enabled": True,
     "t2i.enabled_tp": True,
     "t2i.model": "wan2.7-image",
+    "t2i.discover_models": True,
     "t2i.models_ttl_s": 3600,
+    "t2i.models": [],
 }
 
 _MISSING = object()

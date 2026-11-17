@@ -251,7 +251,7 @@ def main():
             check(f"V6 live catalog {variant}: wan2.7-image present", "wan2.7-image" in ids, str(ids[:8]))
             check(f"V6 live catalog {variant}: no video models", not any("video" in i for i in ids), str(ids))
             check(f"V6 live catalog {variant}: no invented price", all(m.get("price", "") == "" for m in models))
-            check(f"V6 live catalog {variant}: size sane", 2 <= len(ids) <= 60, str(len(ids)))
+            check(f"V6 live catalog {variant}: size sane", 3 <= len(ids) <= 120, str(len(ids)))
         # one real MCP search (cheap, metered)
         w = live_ctx.registered["web"][0]
         sr = w.search("阿里云百炼", limit=2)
@@ -260,6 +260,23 @@ def main():
             rows = sr["data"]["web"]
             check("live web rows fenced F19", all(r["title"].startswith("[外部内容·不可信]") for r in rows))
             check("live web extract pure list", isinstance(w.extract([rows[0]["url"]]), list))
+
+        # v0.5.1: shared catalog — BOTH variants return the METERED full list
+        pm = next(x for x in live_ctx.registered["image"] if x.name == "dashscope")
+        pt = next(x for x in live_ctx.registered["image"] if x.name == "dashscope-tp")
+        lm, lt = pm.list_models(), pt.list_models()
+        check("v051 both variants same catalog", [m["id"] for m in lm] == [m["id"] for m in lt])
+        check("v051 catalog is full metered list (>3, not hardcoded trio)", len(lm) > 3, str(len(lm)))
+        check("v051 catalog persisted to settings", isinstance(live_ctx.get_config("t2i.models"), list)
+              and len(live_ctx.get_config("t2i.models")) == len(lm))
+        check("v051 includes non-trio models", any(m["id"] not in
+              ("wan2.7-image", "wan2.7-image-pro", "qwen-image-3.0-pro") for m in lm))
+        # discover_models=false freezes the stored list, zero network
+        frozen = FakeCtx({"t2i": {"discover_models": False,
+                                  "models": [{"id": "only-this-one", "display": "X", "strengths": "", "price": ""}]}})
+        pkg.register(frozen)
+        for p in frozen.registered["image"]:
+            check(f"v051 frozen list {p.name}", [m["id"] for m in p.list_models()] == ["only-this-one"])
 
     print()
     print(f"TOTAL: {len(PASS)} pass, {len(FAIL)} fail")

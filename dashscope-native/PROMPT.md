@@ -118,15 +118,19 @@ plugins:
 4. TP 侧 REST 直接用 `tp_base_url`（t2i TP 走 `{tp_base_url}/api/v1/services/...` 或
    compatible-mode，以官方文档为准；语音 TP 沿用现实现路径）。
 
-### 5.3 实时模型列表（主人 exp.yaml 批注的落实）
-- **已实测通道（2026-11-17）**：两变体 base 的 `/compatible-mode/v1/models` 均返回 id 清单
-  （按量 182 项含 wan2.7-image/-pro、qwen-image-3.0/-pro、z-image-turbo；TP 23 项含
-  wan2.7-image/-pro、qwen-image-3.0-pro、wan3.0-video）。TP key 直连 compatible-mode 即通。
-- `t2i.model_list` 运行时从**已启用变体各自**的 models 端点拉取，过滤图像族
-  （id 含 image/wan 的并集，前缀规则内置可配）。
-- 样板字段 `display/strengths/price` **models 端点给不了**（只有 id）：display 由 id 本地美化
-  （去日期后缀、大小写规则），strengths/price 留空 + 注释指向百炼控制台定价页；
-  **不编造**。缓存 TTL 与失败回退（用上次成功值或内置快照）实现时定，拉取失败不得炸注册。
+### 5.3 实时模型列表（v0.5.1 主人修订：单一共享目录）
+- **已实测通道（2026-11-17）**：按量 base 的 `/compatible-mode/v1/models` 返回 id 清单
+  （182 项含 wan2.7-image/-pro、qwen-image-3.0/-pro、z-image-turbo 等）。
+- **v0.5.1 裁定（覆盖 v0.5 的双变体各拉各的）**：`t2i.models` 设置键存**按量上游的
+  全部文生图模型列表**，**两个变体返回同一份**——TP 用户自己挑套餐用得着的。
+  刷新永远打按量端点（`key_env`），与变体无关。
+- `t2i.discover_models`（默认 true）决定是否随上游刷新：true 时按 `t2i.models_ttl_s`
+  过期重拉并经官方 writer 持久化回 `t2i.models`；false 时零网络、原样返回存量列表。
+  拉取失败回落存量列表，不得炸注册/picker。**内置三模型快照已删除**（v0.5.1 BUG 修：
+  任何变体都不得回退到硬编码三件套）。
+- 过滤图像族（id 含 image/wan/z-image，排除 -video）。样板字段 `display/strengths/price`
+  端点只给 id：display 本地美化，strengths/price 留空，**不编造**。
+- 存量列表兼容手改：`t2i.models` 里写纯 id 字符串数组也认（自动包成条目）。
 
 ## 6. 功能面细则
 
@@ -202,5 +206,11 @@ plugins:
   不可删（create_client 反壳缝挂其上）。
 - 2026-11-17：`/compatible-mode/v1/models` 两变体实测可直拉 id 清单，但无 display/价目字段；
   model_list 的 strengths/price 若上游不给就留空，禁止编造。
-- 2026-11-17：语音块 model/voice 两变体共享一组键存在跨车道模型名不互认风险（§4），
-  靠 provider 选择键收窄；真出事故再加覆盖键。
+- 2026-11-17（v0.5.1）：STT picker 不见百炼是**核心缺口**非插件 bug——
+  `hermes_cli/tools_config_providers.py` 的 `_PLUGIN_ROW_BUILDERS` 只登记了五类，
+  STT 无插件行注入口（桌面端 `web_server_config.py` 走另一条合并路径所以能选）。
+  已补对称 stt 条目（spec + partial + builder 三处，备份在
+  Data/cache/scratch/tools_config_providers.py.bak-stt-picker）；核心仓 git 可回滚。
+  上游 hermes-agent 升级会冲掉此补丁，届时需重放或推上游 FR。
+- 2026-11-17（v0.5.1）：t2i 目录从"每变体各拉各的+内置三件套兜底"改为"按量全量单目录
+  双变体共享 + discover_models 开关"，内置快照删除——兜底回退到硬编码三件套本身就是 bug。

@@ -7,11 +7,16 @@ endpoint" trick promoted to the built-in t2i.enabled_tp switch (owner ruling
 key only in the Authorization header, curl/subprocess/shell forbidden
 (the v1.1 fix: prompt apostrophe + shell=True = host RCE).
 
-Model catalog: live from {base}/compatible-mode/v1/models (§5.3, probed
-2026-11-17: metered 182 ids, TP 23 ids). The endpoint only gives ids —
-display is prettified locally, strengths/price stay empty (never invent).
-Cache TTL t2i.models_ttl_s; failure falls back to last-good then the
-built-in snapshot; a fetch failure must never break registration.
+Model catalog (owner ruling 2026-11-17, supersedes the per-variant fetch):
+``t2i.models`` holds the METERED upstream's FULL image-model list, and BOTH
+variants return that same list — TP users pick what their plan covers
+themselves. ``t2i.discover_models`` (default true) decides whether the list
+refreshes from {metered base}/compatible-mode/v1/models (probed 2026-11-17:
+182 ids upstream); refreshed lists are persisted back into settings via the
+official writer. False = use the stored list as-is, no network. The endpoint
+only gives ids — display is prettified locally, strengths/price stay empty
+(never invent). Failure falls back to the stored list; a fetch failure must
+never break registration or the picker.
 """
 from typing import Any, Callable, Dict, List, Optional
 import os
@@ -28,13 +33,6 @@ from agent.image_gen_provider import (
 from . import ds_settings
 
 SettingGetter = Callable[[str, Any], Any]
-
-# built-in snapshot (t2i-bailian v1.1 catalog) — last-resort fallback only
-_SNAPSHOT = [
-    {"id": "wan2.7-image", "display": "Wan 2.7 Image", "strengths": "", "price": ""},
-    {"id": "wan2.7-image-pro", "display": "Wan 2.7 Image (Pro)", "strengths": "", "price": ""},
-    {"id": "qwen-image-3.0-pro", "display": "Qwen Image 3 (Pro)", "strengths": "", "price": ""},
-]
 
 # id filter for the live catalog (§5.3): image families only. wan3.0-video is
 # a VIDEO model riding the same list — excluded by the -video suffix rule.
@@ -53,8 +51,10 @@ def _prettify(model_id: str) -> str:
 
 
 class BailianImageGenProvider(ImageGenProvider):
-    def __init__(self, get_setting: SettingGetter, *, tp: bool = False) -> None:
+    def __init__(self, get_setting: SettingGetter, *, tp: bool = False,
+                 set_setting: Optional[Callable[[str, Any], None]] = None) -> None:
         self._get = get_setting
+        self._set = set_setting  # official writer for persisting refreshed t2i.models
         self._tp = tp
         self._cache: Optional[List[Dict[str, Any]]] = None
         self._cache_at: float = 0.0
@@ -82,14 +82,30 @@ class BailianImageGenProvider(ImageGenProvider):
         env_name = self._key_env()
         return (bool(env_name and os.environ.get(env_name)))
 
+    def _stored_models(self) -> List[Dict[str, Any]]:
+        raw = self._get("t2i.models", [])
+        if not isinstance(raw, list):
+            return ([])
+        out = []
+        for item in raw:
+            if isinstance(item, dict) and item.get("id"):
+                out.append(item)
+            elif isinstance(item, str) and item.strip():
+                # tolerate a hand-edited plain id list in settings
+                out.append({"id": item.strip(), "display": _prettify(item.strip()), "strengths": "", "price": ""})
+        return (out)
+
     def _fetch_live_models(self) -> Optional[List[Dict[str, Any]]]:
+        # ALWAYS the metered upstream (owner ruling: one shared catalog, both
+        # variants return it; TP users pick what their plan covers).
         import json
         import urllib.request
 
-        api_key = os.environ.get(self._key_env()) or ""
+        env_name = str(self._get("key_env", ds_settings.DEFAULTS["key_env"]) or "")
+        api_key = os.environ.get(env_name) or ""
         if not api_key:
             return (None)
-        url = self._base_url() + "/compatible-mode/v1/models"
+        url = ds_settings.rest_host(self._get) + "/compatible-mode/v1/models"
         request = urllib.request.Request(
             url,
             headers={"Authorization": "Bearer " + api_key},
@@ -107,6 +123,9 @@ class BailianImageGenProvider(ImageGenProvider):
         return (out or None)
 
     def list_models(self) -> List[Dict[str, Any]]:
+        stored = self._stored_models()
+        if not bool(self._get("t2i.discover_models", True)):
+            return (stored)  # frozen list, zero network (owner switch)
         try:
             ttl = float(self._get("t2i.models_ttl_s", ds_settings.DEFAULTS["t2i.models_ttl_s"]))
         except (TypeError, ValueError):
@@ -119,12 +138,17 @@ class BailianImageGenProvider(ImageGenProvider):
             if live:
                 self._cache = live
                 self._cache_at = now
+                if self._set is not None and live != stored:
+                    try:
+                        self._set("t2i.models", live)  # persist via official writer
+                    except Exception:
+                        pass  # persistence failure must not break the picker
                 return (live)
         except Exception:
             pass  # fetch failure must never break the picker/registration
         if self._cache is not None:
-            return (self._cache)  # last-good value (§5.3 fallback)
-        return (list(_SNAPSHOT))
+            return (self._cache)  # last-good in-process value
+        return (stored)
 
     def default_model(self) -> Optional[str]:
         return (str(self._get("t2i.model", ds_settings.DEFAULTS["t2i.model"]) or "wan2.7-image"))
@@ -292,7 +316,8 @@ class BailianImageGenProvider(ImageGenProvider):
 def register(ctx) -> None:
     """Register each enabled variant (PROMPT.md §1 matrix)."""
     getter: SettingGetter = lambda k, d=None: ctx.get_config(k, d)  # noqa: E731
+    setter = lambda k, v: ctx.set_config(k, v)  # noqa: E731
     if bool(ctx.get_config("t2i.enabled", True)):
-        ctx.register_image_gen_provider(BailianImageGenProvider(getter, tp=False))
+        ctx.register_image_gen_provider(BailianImageGenProvider(getter, tp=False, set_setting=setter))
     if bool(ctx.get_config("t2i.enabled_tp", True)):
-        ctx.register_image_gen_provider(BailianImageGenProvider(getter, tp=True))
+        ctx.register_image_gen_provider(BailianImageGenProvider(getter, tp=True, set_setting=setter))
