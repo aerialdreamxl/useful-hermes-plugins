@@ -230,10 +230,21 @@ def main():
     img = next(p for p in ctx.registered["image"] if p.name == "dashscope")
     r = img.generate("", "square")
     check("t2i empty prompt invalid_input", r.get("error_type") == "invalid_input")
-    r = img.generate("cat", "square", image_url="http://x/y.png")
-    check("t2i reference image rejected loudly", "NOT ready" in str(r.get("error", "")))
+    # v0.5.3 §6.5.2: the blanket "NOT ready" rejection is GONE — refusal is now
+    # per-model (text-only family), edit families build the envelope instead.
+    r = img.generate("cat", "square", image_url="http://x/y.png", model="z-image-turbo")
+    check("t2i text-only family refuses refs with teaching copy",
+          r.get("success") is False and r.get("error_type") == "invalid_input"
+          and "does not support editing" in str(r.get("error", "")), str(r)[:160])
     web = ctx.registered["web"][0]
     check("web is_available no-network bool", isinstance(web.is_available(), bool))
+
+    # -- v0.5.3 §6.5 editing block (E1-E10; fully frozen, zero network) ------
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import edit_mode_block
+    tmpdir = os.path.join(os.environ.get("TMPDIR", r"D:/01-AI/Hermes-Agent/Data/cache/scratch"), "v053_tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    edit_mode_block.run(check, img, tmpdir)
 
     # -- live probes (keys read from .env in-process, never printed) ---------
     if os.environ.get("DSN_SKIP_LIVE") != "1" and os.path.exists(ENV_FILE):

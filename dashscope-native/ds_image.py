@@ -28,6 +28,19 @@ when a catalog entry lacks enrichment, under the same discover_models gate.
 NO t2i.model settings key (owner ruling BUG4): the model choice is the
 system-level image_gen.model written by `hermes setup tools`; the tool layer
 injects it per call. default_model() = first catalog entry (core base class).
+
+Reference images / editing (PROMPT.md §6.5, owner rulings 2026-11-18):
+capabilities() is advertised PER ACTIVE MODEL from a doc-verified static table
+(§6.5.1; fail-closed text-only for unknown families). The edit path reuses the
+same synchronous multimodal-generation endpoint — content = [image..., text]
+with exactly one text (official envelope). Inputs: http(s)/oss URLs and
+data:image URIs pass through untouched, local files are base64-encoded here;
+bad/oversized inputs fail loudly, never silently dropped, never lossily
+rescaled. Qwen editing families omit size (default follows the last input
+image); wan2.7 keeps the pixel map. Multi-image responses return EVERY url
+(image = first for compatibility, images/image_count in extra). Legacy async
+endpoint models (wan2.5-i2i etc.) stay text-only with a named refusal.
+Timeouts: 120s text-to-image, 240s editing, no auto-retry (retry = double bill).
 """
 from typing import Any, Callable, Dict, List, Optional
 import os
@@ -72,6 +85,86 @@ def _doc_slug(model_id: str) -> str:
 def _base_model_id(model_id: str) -> str:
     # dated snapshot -> its undated base page (qwen-image-2.0-pro-2026-04-22 -> qwen-image-2.0-pro)
     return (re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model_id))
+
+
+import logging
+
+_logger = logging.getLogger(__name__)
+
+# Edit-capability table (PROMPT.md §6.5.1; owner rulings 2026-11-18). Values are
+# doc-verified facts from the official API reference pages (re-checked 2026-11-18:
+# wan-image-generation-and-editing / qwen-image-edit-api / qwen-image-api):
+#   base id -> (max_reference_images, per-image byte cap, edit size policy,
+#               negative_prompt supported)
+# Families NOT listed stay text-only (fail-closed, matching the core schema gate).
+_EDIT_FAMILIES = {
+    "wan2.7-image-pro": (9, 20_000_000, "pixel_map", False),
+    "wan2.7-image": (9, 20_000_000, "pixel_map", False),
+    "qwen-image-3.0-pro": (3, 10_000_000, "follow_input", True),
+    "qwen-image-3.0": (3, 10_000_000, "follow_input", True),
+    "qwen-image-2.1-pro": (10, 10_000_000, "follow_input", False),
+    "qwen-image-2.1-turbo": (10, 10_000_000, "follow_input", False),
+    "qwen-image-2.0-pro": (3, 10_000_000, "follow_input", True),
+    "qwen-image-2.0": (3, 10_000_000, "follow_input", True),
+}
+
+
+def _edit_family(model_id: str):
+    # date snapshots fold into their base family; unknown ids -> None (text-only)
+    base = _base_model_id(str(model_id or "").strip().lower())
+    return (_EDIT_FAMILIES.get(base))
+
+
+def _system_image_model() -> str:
+    """System-level image_gen.model — the authority for capabilities() (§6.5.1).
+
+    Same file read the official image plugins do per picker paint (cheap, no
+    network); empty string when config is unreadable -> caller falls back."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        model = section.get("model") if isinstance(section, dict) else None
+        return (str(model).strip() if isinstance(model, str) else "")
+    except Exception:
+        return ("")
+
+
+def _normalize_image_source(src: str, cap_bytes: int) -> str:
+    """Coerce one reference-image input to what DashScope accepts, loudly.
+
+    http(s)/oss URLs and data: URIs pass through untouched (reachability and
+    payload validity are the upstream's call); a local path is read here and
+    inlined as a base64 data URI. Never lossily rescaled, never silently
+    dropped (§6.5.2): anything unreadable/oversized/non-image raises."""
+    import base64
+    import mimetypes
+
+    s = str(src).strip()
+    low = s.lower()
+    if low.startswith(("http://", "https://", "oss://")):
+        return (s)
+    if low.startswith("data:"):
+        if len(s) > cap_bytes:
+            raise ValueError(f"inline data URI exceeds {cap_bytes // 1_000_000}MB cap")
+        return (s)
+    path = s
+    if low.startswith("file://"):
+        path = s[7:]
+        if path.startswith("/") and len(path) > 2 and path[2] == ":":
+            path = path[1:]  # file:///D:/x -> D:/x
+    if not os.path.isfile(path):
+        raise ValueError(f"local reference image not found: {path!r}")
+    mime = mimetypes.guess_type(path)[0] or ""
+    if not mime.startswith("image/"):
+        raise ValueError(f"not a recognised image file (MIME={mime or 'unknown'}): {path!r}")
+    size = os.path.getsize(path)
+    if size > cap_bytes:
+        raise ValueError(f"image too large ({size} bytes > {cap_bytes} byte cap): {path!r}")
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    return ("data:" + mime + ";base64," + base64.b64encode(blob).decode("ascii"))
 
 
 def _parse_doc_page(html: str) -> Dict[str, str]:
@@ -281,8 +374,29 @@ class BailianImageGenProvider(ImageGenProvider):
         }
 
     def capabilities(self) -> Dict[str, Any]:
-        # text-only; reference images explicitly rejected below (v1.1 behavior kept)
+        # §6.5.1: advertised per ACTIVE model (system image_gen.model, same key
+        # the core schema gate reads). Fail-closed text-only for unknown ids.
+        # The picker repaints per frame: this is a local file read, no network.
+        model = _system_image_model() or self.default_model() or ""
+        fam = _edit_family(model)
+        if fam:
+            return {"modalities": ["text", "image"], "max_reference_images": fam[0]}
         return {"modalities": ["text"], "max_reference_images": 0}
+
+    def _timeout_error(self, model_id: str, prompt: str, aspect_ratio: str, timeout_s: int) -> Dict[str, Any]:
+        """§6.5.2 timeout envelope: loud, billing-aware, and the sync endpoint
+        hands back no task id — the caller must NOT auto-retry (retry = a
+        second per-image charge)."""
+        return error_response(
+            error=(f"DashScope timed out after {timeout_s}s. The request may still have "
+                   "completed and billed server-side; this synchronous endpoint returns no "
+                   "task handle, so this result cannot be recovered. Do not blindly retry."),
+            error_type="timeout",
+            provider=self.name,
+            model=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+        )
 
     def generate(
         self,
@@ -305,18 +419,40 @@ class BailianImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
-        if image_url != None or reference_image_urls != None:
+        # reference images are NOT a blanket rejection since v0.5.3 (§6.5.2):
+        # the model resolved below decides — edit families build an edit
+        # envelope, everything else gets a named refusal.
+
+        model_id = kwargs.get("model") or self.default_model() or "wan2.7-image"
+
+        # -- reference-image gating (§6.5.2) -------------------------------
+        from agent.image_gen_provider import normalize_reference_images
+
+        sources = normalize_reference_images([
+            c for c in ((image_url,) + tuple(reference_image_urls or ()))
+            if isinstance(c, str) and c.strip()])
+        fam = _edit_family(model_id)
+        if sources and not fam:
+            # old async-endpoint families and text-only ids: named refusal, zero network
+            hint = ("该模型走老异步端点，本插件不支持编辑"
+                    if re.match(r"^(wan2\.5-i2i|wanx2\.1-imageedit|wan2\.6)", str(model_id))
+                    else "该模型仅支持文生图")
             return error_response(
-                error="Reference image input is NOT ready for use",
+                error=(f"{model_id} does not support editing/reference images ({hint}). "
+                       "Remove the reference image(s) for text-to-image, or pick an editing "
+                       "model (wan2.7-image, qwen-image-3.0-pro, qwen-image-2.x) via "
+                       "`hermes setup tools` -> Image Generation."),
                 error_type="invalid_input",
                 provider=self.name,
+                model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
             )
-
-        model_id = kwargs.get("model") or self.default_model() or "wan2.7-image"
-        result_img_url = None
-        stdout_text = ""
+        max_refs, cap_bytes, size_policy, neg_ok = (fam if fam else (0, 0, "pixel_map", True))
+        if sources and len(sources) > max_refs:
+            _logger.warning("dashscope t2i: %d reference images for %s (max %d) — the extras are dropped",
+                            len(sources), model_id, max_refs)
+            sources = sources[:max_refs]
 
         try:
             # 纯 Python POST（继承 t2i v1.1 安全修复：curl 命令串 + shell=True 会让
@@ -333,14 +469,51 @@ class BailianImageGenProvider(ImageGenProvider):
             else:
                 size_text="1280*1280"
 
+            # §6.5.2 size policy: qwen edit families omit size (the upstream
+            # follows the last input image's ratio); wan2.7 keeps the pixel map;
+            # plain text-to-image always sends it.
+            content_items = []
+            if sources:
+                try:
+                    content_items = [{"image": _normalize_image_source(s, cap_bytes)} for s in sources]
+                except ValueError as exc:
+                    return error_response(
+                        error=f"Reference image rejected: {exc}",
+                        error_type="invalid_input",
+                        provider=self.name,
+                        model=model_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect_ratio,
+                    )
+                if size_policy == "follow_input":
+                    size_text = None
+            content_items.append({"text": prompt})  # exactly one text, LAST (official envelope)
+
             api_key=os.environ.get(self._key_env()) or ""
             base_url=self._base_url().rstrip("/")
+            parameters: Dict[str, Any] = {}
+            if size_text:
+                parameters["size"] = size_text
+            # owner ruling 2026-11-18: optional kwargs pass through when present
+            for kw in ("n", "seed", "watermark"):
+                val = kwargs.get(kw)
+                if kw == "watermark":
+                    if isinstance(val, bool):
+                        parameters[kw] = val
+                elif isinstance(val, int) and not isinstance(val, bool):
+                    parameters[kw] = val
+            neg = kwargs.get("negative_prompt")
+            if isinstance(neg, str) and neg.strip():
+                if neg_ok:
+                    parameters["negative_prompt"] = neg.strip()
+                else:
+                    _logger.info("dashscope t2i: %s does not support negative_prompt — dropped", model_id)
             payload={
                 "model": model_id,
                 "input": {
-                    "messages": [{"role": "user", "content": [{"text": prompt}]}]
+                    "messages": [{"role": "user", "content": content_items}]
                 },
-                "parameters": {"size": size_text},
+                "parameters": parameters,
             }
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8")
             request=urllib.request.Request(
@@ -352,9 +525,15 @@ class BailianImageGenProvider(ImageGenProvider):
                 },
                 method="POST",
             )
+            # §6.5.2: editing pays the price of refs (up to 9) in latency —
+            # 240s there, 120s unchanged for text-to-image. NO retry on timeout:
+            # a retry would double the per-image bill for an un-recoverable sync call.
+            _timeout = 240 if sources else 120
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                with urllib.request.urlopen(request, timeout=_timeout) as response:
                     stdout_text=(response.read() or b"").decode("utf-8", "replace")
+            except TimeoutError:
+                return self._timeout_error(model_id, prompt, aspect_ratio, _timeout)
             except urllib.error.HTTPError as exc:
                 detail=""
                 try:
@@ -370,8 +549,19 @@ class BailianImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                     aspect_ratio=aspect_ratio,
                 )
+            except urllib.error.URLError as exc:
+                # connect-phase timeouts surface wrapped in URLError(reason=TimeoutError)
+                if isinstance(getattr(exc, "reason", None), TimeoutError):
+                    return self._timeout_error(model_id, prompt, aspect_ratio, _timeout)
+                return error_response(
+                    error=f"Network error contacting DashScope: {exc.reason}",
+                    error_type="RuntimeError",
+                    provider=self.name,
+                    model=model_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                )
 
-            # 读取 output.choices[*].message.content[*].image 中的图片URL（v1.1 原逻辑）
             try:
                 resp = json.loads(stdout_text)
             except json.JSONDecodeError as exc:
@@ -384,15 +574,14 @@ class BailianImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect_ratio,
                 )
 
-            image_url_found = None
+            # 读取 output.choices[*].message.content[*].image 中的图片URL。
+            # v0.5.3 (§6.5.2, owner ruling 2026-11-18): 上游给几张收几张，一张不丢。
+            images_found: List[str] = []
             for choice in (resp.get("output") or {}).get("choices") or []:
                 for item in (choice.get("message") or {}).get("content") or []:
                     if isinstance(item, dict) and item.get("image"):
-                        image_url_found = str(item["image"])
-                        break
-                if image_url_found:
-                    break
-            if not image_url_found:
+                        images_found.append(str(item["image"]))
+            if not images_found:
                 from .ds_client import sanitize_upstream_error_body
                 return error_response(
                     error="No image URL in backend response: " + sanitize_upstream_error_body(stdout_text, 500),
@@ -403,16 +592,15 @@ class BailianImageGenProvider(ImageGenProvider):
                     aspect_ratio=aspect_ratio,
                 )
 
-            result_img_url = image_url_found
-
-            image = result_img_url
-
+            # image = first URL (every existing consumer reads that field);
+            # extra.images = the full list in upstream order (never truncated)
             return success_response(
-                image=image,
+                image=images_found[0],
                 model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
-                provider=self.name
+                provider=self.name,
+                extra={"images": images_found, "image_count": len(images_found)},
             )
         except Exception as exc:
             return error_response(

@@ -69,6 +69,19 @@ Token Plan × 原生 chat 上游未文档化，不做（O1）。web 无 TP 变�
 带日期快照 id 自动回退到无日期基础页。扒不到就留空，不编造；已扒到的条目在后续刷新中保留不重扒。
 受 `discover_models` 同一开关管辖。
 
+**参考图/图像编辑**（v0.5.3，PROMPT.md §6.5）：给 `image_generate` 传 `image_url`
+或 `reference_image_urls` 即进入编辑。能力按**当前所选模型**（系统级 `image_gen.model`）
+动态声明——wan2.7 系最多 9 张、qwen-image-3.0 系 3 张、qwen-image-2.1 系 10 张、
+qwen-image-2.0 系 3 张（均为官方文档实锤，未收录模型按纯文生图保守声明）。
+输入形态：公网 URL 直接透传、data URI 直接透传、本地文件读盘转 base64（不存在/超 10MB(wan 20MB)/
+非图像一律响亮报错，绝不悄悄丢图或降质）。**编辑画幅**：qwen 系不传 size（输出跟随最后一张
+输入图的比例，官方默认行为），wan2.7 沿用文生图同一套像素映射。**多图返回**：上游给几张
+返回几张，`image` 字段=第一张（兼容老消费方），完整列表在 `images`/`image_count`。
+超时：文生图 120s、编辑 240s；超时不自动重试（同步通道按张计费，重试=多收一份钱），
+错误里会写明结果无法找回。**不支持**：z-image-turbo、wan2.6/2.5/2.2/2.1 与老
+wanx2.1-imageedit 等模型收到参考图会被点名拒绝并提示换模型；bbox 框选编辑、组图模式、
+wan2.7 的异步提交+轮询通道本期未做（异步通道记为 v0.5.4 备选）。
+
 ## 凭证与安全
 
 - 两个环境变量走天下：`DASHSCOPE_API_KEY`（按量）+ `DASHSCOPE_TOKEN_PLAN_API_KEY`（TP）。
@@ -106,9 +119,9 @@ Token Plan × 原生 chat 上游未文档化，不做（O1）。web 无 TP 变�
 
 ## 测试
 
-`tests/test_v05.py`：87 项验收（真实核心 ABC isinstance 闸、真实 transport/provider
+`tests/test_v05.py` + `tests/edit_mode_block.py`：118 项验收（真实核心 ABC isinstance 闸、真实 transport/provider
 注册链、开关矩阵、tp_ 分车道、逐键补齐、SDK 缺失不连坐、通道审计、错误包络契约、
-共享目录/discover_models 冻结），含 live 探针（全量目录实拉 + 真实 MCP 搜索/抓取）。跑法：
+共享目录/discover_models 冻结、§6.5 编辑路径 E1-E10 全冻结面），含 live 探针（全量目录实拉 + 真实 MCP 搜索/抓取）。跑法：
 
 ```
 <Hermes venv python> tests/test_v05.py     # DSN_SKIP_LIVE=1 可跳过 live 段

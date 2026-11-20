@@ -150,8 +150,8 @@ plugins:
 ## 6. 功能面细则
 
 ### 6.1 t2i（并自 t2i-bailian，行为不变项 + TP 变体新增项）
-- 不变：画幅映射（landscape→1696*960、portrait→960*1696、其余→1280*1280）、text-only
-  声明、参考图明确拒绝、120s 超时。
+- 不变：画幅映射（landscape→1696*960、portrait→960*1696、其余→1280*1280）、120s 超时。
+  ~~text-only 声明、参考图明确拒绝~~ —— v0.5.3 起按 §6.5 放开（编辑能力按所选模型动态声明）。
 - **HTTP 通道硬性要求（主人 2026-11-17 重申）**：一切请求走 http 库直发（urllib，标准库），
   Key 只进 Authorization 头。curl/subprocess/shell **全面禁用**——t2i v1.1 已消灭
   "curl 命令串 + shell=True，prompt 一个撇号=宿主任意命令执行"的老写法（源码注释留有教训），
@@ -175,6 +175,98 @@ plugins:
   （原 compatible-mode）。本机 chat 走 `custom:dashscope-token-plan` 路由不受影响；
   models_catalog_static 映射连带变化照旧接受，勿当 bug 修。
 - 旧 aliases（`dashscope-native`、`qwen-dashscope`、`dashscope-native-api`）不保留。
+
+### 6.5 t2i 参考图/图像编辑（v0.5.3 需求书，主人 2026-11-17 发起，待裁定后动工）
+
+**目标**：`image_generate` 带上参考图就能编辑/融合/风格参考，不再被 provider 拒绝。
+核心工具层零补丁——`image_url`/`reference_image_urls` 参数本来就收，工具面按
+`capabilities()` 动态渲染（官方 openai 图像插件同款做法）。
+
+**6.5.1 能力声明（capabilities 动态化）**
+- 现读系统级 `image_gen.model`（官方 `plugins/image_gen/_common.py` 的
+  `load_image_gen_config()` 或直接 `hermes_cli.config.load_config`，与核心
+  `_active_image_capabilities` 的解析口径一致），按模型家族查能力表：
+  | 家族（前缀匹配，日期快照归基础家族） | modalities | max_reference_images | 单图上限 |
+  |---|---|---|---|
+  | wan2.7-image / wan2.7-image-pro | text+image | 9 | 20MB |
+  | qwen-image-3.0 / -pro | text+image | 3 | 10MB |
+  | qwen-image-2.1-pro / -turbo | text+image | 10 | 10MB |
+  | qwen-image-2.0 系（含快照） | text+image | 3 | 10MB |
+  | 其余（z-image-turbo、wan2.6/wan2.5/wan2.2/wan2.1、wanx2.1-imageedit、未收录 id） | text | 0 | — |
+  - 2026-11-18 实现日二次取证定稿：qwen-image-generation-and-editing-api-reference 页
+    明写「qwen-image-2.1系列支持传入1-10张图像，qwen-image-3.0系列支持传入1-3张图像」；
+    qwen-image-edit-api 页（实为 2.0 系文档）「包含1-3张图像」；wan 页「可传入0-9张图片」。
+    negative_prompt 仅 qwen-image-3.0/2.0 系支持（wan 页全文零命中；2.1 页明写仅3.0系，
+    但 2.0 的 edit 页列有此参数——按页各自收录）。n 范围：qwen 系 1-6、wan2.7 1-4（同步）。
+    老 `qwen-image-edit` 独立 id 未出现在 live 目录，不收录（fail-closed 自然兜住）。
+- 能力表是**官方文档实锤的静态事实**（2026-11-17 查证：wan-image-generation-and-editing-api-reference、
+  qwen-image-generation-and-editing-api-reference、qwen-image-edit-api、image-model 总表），
+  不是营销字段，允许内置；上游新增家族未收录时按 text-only 保守声明（fail-closed，与核心一致）。
+- capabilities() 每次调用现读配置（picker 每帧都调，禁网络、禁重 I/O）。
+
+**6.5.2 generate 编辑路径（同端点同信封）**
+- 端点不变：`{base}/api/v1/services/aigc/multimodal-generation/generation` 同步 POST。
+  官方编辑信封 = `content` 数组先放 N 个 `{"image": ...}` 再放**一个** `{"text": 指令}`
+  （多 text 或不传 text 都报错）。`image_url` 与 `reference_image_urls` 合并为有序列表
+  （image_url 在前），按能力表上限钳制，超出部分丢弃并在日志说明。
+- 输入形态三种，逐一处理：
+  1. `http(s)://` 公网 URL → 原样透传（不下载、不探测，URL 可达性由上游裁定）；
+  2. `data:image/...;base64,` → 原样透传（校验大小上限）；
+  3. 本地绝对路径（含 `file://`）→ 读盘 + mimetypes 猜 MIME + base64 data URI。
+     读盘失败/超大小/非图像 MIME → 响亮 invalid_input 错误，**绝不静默丢图**。
+- 不支持编辑的模型收到参考图 → 保留现拒绝语义但改教学文案：点名当前模型不支持编辑、
+  提示去 `hermes setup tools` → Image Generation 换编辑模型（对齐核心 FAL 路径的报错风格）。
+- **画幅策略（编辑模式，主人 2026-11-18 已裁）**：qwen 系不传 size（官方默认跟随
+  末张输入图比例），**除非模型要求特定尺寸**——能力表增设 `edit_size_policy` 列
+  （`follow_input` / `required:<尺寸>` / `pixel_map`），现查文档所有支持编辑的家族
+  均不强制尺寸；未来家族若强制，按表执行。wan2.7 沿用现有像素映射（2K 内）。
+  文生图路径画幅映射不变。此差异写入 README。
+- 可选参数顺带透传（kwargs 里出现才带）：`n`（qwen 系 1-6、wan2.7 同步 1-4，数值
+  原样透传不硬校验——上游超界会报 InvalidParameter）、`seed`、`negative_prompt`
+  （wan2.7 与 qwen-2.1 不支持，带了会被上游拒——按家族过滤）、`watermark`（默认不传）。
+  `prompt_extend` 不动（上游默认 true）；wan2.7 不支持 prompt_extend，不传。
+- **超时（主人 2026-11-18 裁定：适当延长，直至转后台异步）**：文生图 120s 不变；
+  编辑/多图 240s。~~上游无异步可转~~ **实现时取证修正（2026-11-18）**：wan2.7
+  其实有异步通道（`image-generation/generation` 提交 + `GET /api/v1/tasks/{task_id}`
+  轮询，页内「HTTP异步调用」节，`X-DashScope-Async: enable` 必带）；「仅同步」
+  只对 qwen-image 系成立。但「转后台异步」需要核心侧任务续跑机制（image_generate
+  工具没有，提交后无人 steer 回来），插件内自轮询=换个姿势阻塞等待，无增益。
+  故本期两条路都走同步长等待：到点响亮 timeout 错误，文案注明
+  「请求可能仍在服务端完成并计费；同步通道无任务句柄，本次结果无法找回」，
+  不静默重试（重试=二次计费）。wan2.7 异步通道记为 v0.5.4 备选（插件可自建
+  提交/查询两步工具实现真后台）。响应解析复用现逻辑
+  （output.choices[*].message.content[*].image）。
+- **多图输出（主人 2026-11-18 裁定）：上游给几张返回几张，不截断。**
+  核心契约是单 `image` 字段 + `extra` 透传（`success_response` 的 extra 键原样并进
+  结果、工具层不做裁剪），故交付形态：`image` = 第一张 URL（兼容现有消费方），
+  `extra={"images": [全部 URL 按上游顺序], "image_count": N}`。逐张遍历所有
+  choices 的所有 content 项收集 image，一张不丢；n 参数（qwen 系 1-6）照常透传，
+  上游实际返回数与 n 不符时以实际为准。零核心补丁。
+- 安全纪律不变：urllib 直发、Key 只进头、错误体 sanitize、本地路径只读不写。
+
+**6.5.3 明确不做（本期范围外，主人 2026-11-18 已裁 d 条）**
+- **老端点一律不支持**：wan2.5-i2i-preview / wanx2.1-imageedit / wan2.6-t2i 的异步
+  `image-generation/generation` 端点 + task 轮询不做；目录里这些模型保持 text-only，
+  收到参考图时教学式拒绝并点名「该模型走老异步端点，本插件不支持」。
+- bbox_list 交互式编辑、upscale、creative_controls 声明。
+- 参考图自动缩放/压缩（超限直接报错，不做有损处理——主人要原图质量时不许偷偷降质）。
+
+**6.5.4 验收（实现时逐条过）**
+- E1 capabilities 随 image_gen.model 切换：qwen-image-3.0-pro → 3 refs；wan2.7-image → 9；
+  z-image-turbo → text-only；未收录 id → text-only。
+- E2 编辑信封冻结测试：content = [image×N, text×1] 顺序与数量；多 text 构造不出来。
+- E3 本地文件 → data URI（MIME 正确）；不存在/超大小/非图像 → invalid_input 响亮报错。
+- E4 钳制：给 wan2.7 传 12 张 → 只发 9 张；给 qwen-3.0 传 5 张 → 只发 3 张。
+- E5 不支持编辑的模型 + 参考图 → 教学式拒绝，零网络。
+- E6 qwen 编辑不带 size、wan 编辑带像素 size；文生图画幅映射回归不变。
+- E7 negative_prompt 在 qwen-2.1 家族被过滤；seed/n 透传。
+- E7b 多图全量交付：冻结响应含 2 个 choice × 各 2 张 → images 列表 4 张按序、
+  image=第一张、image_count=4；单图响应 images=[该图]（形态恒定）。
+- E8 ~~live 探针~~ —— 主人 2026-11-18 裁定不做（「最好别」）。编辑路径以冻结响应
+  测试为准；首次真实使用即验收，出错按 upstream_error 原文透传排查。
+- E9 通道审计扩展：编辑路径同样零 curl/subprocess/shell。
+- E10 超时语义：编辑路径 240s、文生图 120s；超时错误文案含「可能已计费/无异步
+  查询口」警示；超时后零自动重试（冻结计时器断言只发一次请求）。
 
 ## 7. 目录结构与代码纪律
 
@@ -206,7 +298,16 @@ plugins:
 - V9 通道审计：全插件 grep 无 `curl`/`subprocess`/`shell=True` 触网路径（§6.1 硬性要求）。
 
 ## 待主人裁定项（实现前必须落定）
-1. §5.3：models 缓存 TTL / 失败回退策略（当前默认：上次成功值 → 内置快照兜底）。
+1. ~~§5.3：models 缓存 TTL / 失败回退策略~~ —— 已裁（v0.5.1：TTL 3600s，失败回落存量，无硬编码兜底）。
+2. ~~§6.5（v0.5.3 参考图）整体方案~~ —— 已裁（主人 2026-11-18）：
+   a. 编辑画幅 qwen 跟随输入图，除非模型强制尺寸（能力表 edit_size_policy 列）；
+   b. 超时适当延长（编辑 240s）；「转后台异步」上游不支持（wan2.7/qwen-image 页
+      明写仅同步），落地为响亮超时+计费警示+零重试，见 §6.5.2；
+   c. 多图：上游给几张返回几张（image=第一张 + extra.images 全量）；
+   d. 老异步端点不支持。
+3. ~~live 探针放行~~ —— 已裁：不做（「最好别」），冻结测试为准，首次真实使用即验收。
+4. **唯一遗留**：§6.5.2 的 240s 具体数值是助理建议（主人只说「适当延长」），
+   实现时若实测不够再调；不阻塞动工。
 
 ~~§4 语音分车道覆盖键~~ —— 已裁（2026-11-17：`tp_` 前缀覆盖键，回落规则见 §4）。
 
@@ -229,3 +330,15 @@ plugins:
   上游 hermes-agent 升级会冲掉此补丁，届时需重放或推上游 FR。
 - 2026-11-17（v0.5.1）：t2i 目录从"每变体各拉各的+内置三件套兜底"改为"按量全量单目录
   双变体共享 + discover_models 开关"，内置快照删除——兜底回退到硬编码三件套本身就是 bug。
+- 2026-11-18（v0.5.3 需求书）：多图交付契约取证——核心 `success_response` 只定义单
+  `image` 字段，但 `extra` 键 setdefault 并进结果、`_postprocess_image_generate_result`
+  只注解不裁剪，故 `extra.images` 全量列表可零核心补丁透传给模型；FAL 路径的
+  `images` 列表是另一套内部形态（dict 带 url/width/height），插件路径勿混用。
+- 2026-11-18（v0.5.3 实现日）：需求书曾据「不支持异步接口」一句判 wan2.7 无异步通道——
+  那句在 **Python SDK 节**，说的是 SDK 不封装异步；HTTP 层其实同步(multimodal-generation)
+  与异步(image-generation + GET /api/v1/tasks)两条都有。教训：读 API 文档按节归属读，
+  关键词命中要回看上下文标题，别把子节限定语当全页结论。本期仍走同步（转后台缺核心续跑
+  机制），异步通道记 v0.5.4 备选。
+- 2026-11-18（v0.5.3 实现日）：capabilities() 的口径=系统级 image_gen.model（与核心
+  _active_image_capabilities 的 _read_configured_image_model 同一把钥匙）；测试冻结面
+  用 monkeypatch ds_image._system_image_model 注入，勿改真实 config.yaml。
