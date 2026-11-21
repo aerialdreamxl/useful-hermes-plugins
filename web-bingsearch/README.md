@@ -58,7 +58,7 @@
 按 URL 抓原始 HTML 直接回 `raw_content`（伪装版：桌面指纹+伪装头+Bing Referer），不做正文解析。模型通常能自己啃 HTML，但 token 消耗比正经阅读器后端大。单个 URL 失败只标记该项 `error`，不整批失败。**返回纯列表**（包 success/data 外壳会炸掉 web_extract 消费端）。
 
 - **每个 URL 一个一次性子进程**（受 `subprocess_isolation` 管）：primp 持 GIL 卡住时父进程能硬超时击杀，一次慢 URL 不会冻住网关。代价是每 URL 多一次 python 冷启动（≈2.2s），批量的延迟随之线性上升。
-- **入口 URL 校验（SSRF 闸）**：只放行 `http/https`；host 取 `urlsplit().hostname`（挡 `https://evil@10.0.0.1/` 这类 userinfo 花招），loopback / 私网 / link-local / 保留段 / `localhost` 一律拒绝，只回该项 `error`、不起进程。确实要抓内网时设 `BING_ALLOW_PRIVATE_FETCH=1`。注意 primp 默认跟随 30x，重定向到内网仍会被跟随——这是本闸的已知边界。
+- **入口 URL 校验（SSRF 闸）**：只放行 `http/https`；scheme 检查不受环境放行变量影响；host 取 `urlsplit().hostname`，标准 IP 与 DNS 全部解析结果检查，无法解析的域名不因 DNS 失败而一律拒绝。loopback / 私网 / link-local / 保留段 / `localhost` / 短数字 IP 一律拒绝，确实要抓内网时设 `BING_ALLOW_PRIVATE_FETCH=1`。请求完成后还会复查 primp 返回的最终 URL，以覆盖重定向到受限地址的情况。
 
 ## 合法合规提示
 

@@ -8,7 +8,7 @@ import subprocess
 import time
 
 from ..common import config
-from ..common.util import err, ok
+from ..common.util import err, ok, safe_output_path
 
 TOOLSET = "android-utils"
 
@@ -65,7 +65,7 @@ def _adb(args: dict) -> str:
             if not cmd:
                 return err("shell 需要 'command'")
             if not _confirmed(args):
-                return err("shell 是高危操作（等于在设备上执行任意命令）：确认命令内容后传 confirm=true 再执行")
+                return err("shell 是高危操作（等于在设备上执行任意命令）：仅在用户明确指令下、确认命令内容后传 confirm=true 再执行（confirm 是模型自设参数，宿主不代审批）")
             r = _run(base + ["shell", cmd], timeout=timeout)
         elif action == "push":
             local, remote = args.get("local"), args.get("remote")
@@ -76,6 +76,10 @@ def _adb(args: dict) -> str:
             remote, local = args.get("remote"), args.get("local")
             if not remote or not local:
                 return err("pull 需要 'remote' 与 'local'")
+            local, path_error = safe_output_path(local, config.scratch_dir(), "pull local")
+            if path_error:
+                return err(path_error)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
             r = _run(base + ["pull", remote, local], timeout=timeout)
         elif action == "logcat":
             n = int(args.get("lines") or 200)
@@ -84,13 +88,19 @@ def _adb(args: dict) -> str:
             # 毫秒时间戳：同一秒连拍不再互相覆盖
             out = args.get("path") or os.path.join(
                 config.scratch_dir("android"), "adb_shot_%d.png" % int(time.time() * 1000))
+            out, path_error = safe_output_path(out, config.scratch_dir(), "screenshot path")
+            if path_error:
+                return err(path_error)
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             r = _run(base + ["exec-out", "screencap", "-p"], timeout=timeout)
             blob = r.stdout or b""
             if r.returncode != 0 or not blob.startswith(b"\x89PNG"):
                 return err("screencap 失败：%s" % _tail(r, 400))
-            with open(out, "wb") as f:
-                f.write(blob)
+            try:
+                with open(out, "xb") as f:
+                    f.write(blob)
+            except FileExistsError:
+                return err("screenshot path 已存在，拒绝覆盖")
             return ok({"action": "screenshot", "path": out,
                        "kb": round(len(blob) / 1024, 1)})
         elif action == "install":
@@ -98,14 +108,14 @@ def _adb(args: dict) -> str:
             if not apk:
                 return err("install 需要 'apk'")
             if not _confirmed(args):
-                return err("install 是高危操作（会覆盖安装/替换签名）：确认 apk 与设备后传 confirm=true 再执行")
+                return err("install 是高危操作（会覆盖安装/替换签名）：仅在用户明确指令下、确认 apk 与设备后传 confirm=true 再执行（confirm 是模型自设参数，宿主不代审批）")
             r = _run(base + ["install", "-r", apk], timeout=max(timeout, 300))
         elif action == "uninstall":
             pkg = args.get("package")
             if not pkg:
                 return err("uninstall 需要 'package'")
             if not _confirmed(args):
-                return err("uninstall 是高危操作（会连同应用数据一起删除，不可撤销）：确认包名与设备后传 confirm=true 再执行")
+                return err("uninstall 是高危操作（会连同应用数据一起删除，不可撤销）：仅在用户明确指令下、确认包名与设备后传 confirm=true 再执行（confirm 是模型自设参数，宿主不代审批）")
             r = _run(base + ["uninstall", pkg], timeout=timeout)
         elif action == "props":
             r = _run(base + ["shell", "getprop"], timeout=timeout)
@@ -116,7 +126,7 @@ def _adb(args: dict) -> str:
             if not cmd:
                 return err("%s 需要 'command'" % action)
             if not _confirmed(args):
-                return err("%s 是高危操作（启动/强停/改权限/卸载组件）：确认命令后传 confirm=true 再执行" % action)
+                return err("%s 是高危操作（启动/强停/改权限/卸载组件）：仅在用户明确指令下、确认命令后传 confirm=true 再执行（confirm 是模型自设参数，宿主不代审批）" % action)
             r = _run(base + ["shell", action, cmd], timeout=timeout)
         else:
             return err("action 不支持：" + action)
@@ -153,7 +163,7 @@ def _fastboot(args: dict) -> str:
             if not partition or not image:
                 return err("flash 需要 'partition' 与 'image'")
             if str(args.get("confirm")).lower() not in ("true", "1", "yes"):
-                return err("刷机是高危操作：确认目标分区与镜像后传 confirm=true 再执行")
+                return err("刷机是高危操作：仅在用户明确指令下、确认目标分区与镜像后传 confirm=true 再执行（confirm 是模型自设参数，宿主不代审批）")
             if not os.path.exists(image):
                 return err("镜像不存在：%s" % image)
             r = _run(base + ["flash", partition, image], timeout=max(timeout, 600))
@@ -165,7 +175,7 @@ def _fastboot(args: dict) -> str:
             if not cmd:
                 return err("oem 需要 'command'（如 unlock / device-info）")
             if str(args.get("confirm")).lower() not in ("true", "1", "yes"):
-                return err("oem 是高危操作：确认命令后传 confirm=true")
+                return err("oem 是高危操作：仅在用户明确指令下、确认命令后传 confirm=true（confirm 是模型自设参数，宿主不代审批）")
             r = _run(base + ["oem", cmd], timeout=timeout)
         else:
             return err("action 不支持：" + action)
@@ -184,12 +194,12 @@ _TOOLS = [
                    "description": "设备/命令/文件/日志/截图/安装"},
         "serial": {"type": "string", "description": "多设备时指定序列号"},
         "command": {"type": "string", "description": "shell/am/pm 的命令"},
-        "local": {"type": "string", "description": "push/pull 本地路径"},
+        "local": {"type": "string", "description": "push: 本地文件；pull: scratch 目录内本地路径（越界/已存在拒绝）"},
         "remote": {"type": "string", "description": "push/pull 设备路径"},
         "apk": {"type": "string", "description": "install: apk 路径"},
         "package": {"type": "string", "description": "uninstall: 包名"},
         "lines": {"type": "integer", "description": "logcat: 行数，默认 200"},
-        "path": {"type": "string", "description": "screenshot: 输出 PNG 路径"},
+        "path": {"type": "string", "description": "screenshot: 输出 PNG 路径（限 scratch 目录内，拒绝覆盖）"},
         "confirm": {"type": "boolean", "description": "shell/am/pm/install/uninstall 必须显式 true 才执行"},
         "timeout": {"type": "integer", "description": "超时秒数（默认 120）"},
     }, ["action"],

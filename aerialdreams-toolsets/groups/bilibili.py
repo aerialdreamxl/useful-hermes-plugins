@@ -16,7 +16,8 @@ import xml.etree.ElementTree as ET
 
 from ..common import config
 from ..common.util import (clean_title, dur_text, err, get_bytes, get_json,
-                           get_text, ok, resolve_bvid, wbi_sign)
+                           get_text, ok, resolve_bvid, safe_output_path,
+                           wbi_sign)
 
 TOOLSET = "bilibili"
 
@@ -218,12 +219,23 @@ def _subtitle(args: dict) -> str:
 # download (anonymous cap)
 # ---------------------------------------------------------------------------
 
-def _dest_path(args: dict, bvid: str, tag: str, ext: str = "flv") -> str:
+def _dest_path(args: dict, bvid: str, tag: str, ext: str = "flv") -> tuple:
     fn = args.get("filename")
-    if fn and os.path.isabs(fn):
-        os.makedirs(os.path.dirname(fn), exist_ok=True)
-        return fn
-    return os.path.join(config.scratch_dir("bili"), "%s_%s.%s" % (bvid, tag, ext))
+    path = fn or os.path.join(config.scratch_dir("bili"), "%s_%s.%s" % (bvid, tag, ext))
+    # allow_existing：缓存命中/force 重写都是 scratch 里自己的缓存文件；越界一律拒绝
+    path, error = safe_output_path(path, config.scratch_dir(), "filename", allow_existing=True)
+    if error:
+        return "", error
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path, ""
+
+
+def _fetch(url: str) -> tuple:
+    """get_bytes 带闸封装：越界/重定向拒绝时返回清晰错误，不抛给宿主。"""
+    try:
+        return get_bytes(url), ""
+    except ValueError as e:
+        return b"", "下载源被拒绝：%s" % e
 
 
 def _cache_hit(dest: str) -> bool:
@@ -289,12 +301,16 @@ def _download(args: dict) -> str:
         if audios:
             best = max(audios, key=lambda s: s.get("bandwidth", 0))
             url = best.get("base_url") or (best.get("backup_url") or [""])[0]
-            dest = _dest_path(args, bvid, "audio_a%s" % best.get("id", 0), "m4a")
+            dest, perr = _dest_path(args, bvid, "audio_a%s" % best.get("id", 0), "m4a")
+            if perr:
+                return err(perr)
             if _cache_hit(dest) and not args.get("force"):
                 return ok({"bvid": bvid, "title": _uf(title, head=True), "path": dest,
                            "size_mb": round(os.path.getsize(dest) / 1048576, 1),
                            "cached": True, "audio_only": True})
-            blob = get_bytes(url)
+            blob, ferr = _fetch(url)
+            if ferr:
+                return err(ferr)
             werr = _store(dest, blob)
             if werr:
                 return err(werr)
@@ -309,8 +325,12 @@ def _download(args: dict) -> str:
         if not durls:
             return err("anonymous audio-only unavailable; use bili_download then ffmpeg(extract_audio)")
         u = durls[0]
-        dest = _dest_path(args, bvid, "p1", "flv")
-        blob = get_bytes(u["url"])
+        dest, perr = _dest_path(args, bvid, "p1", "flv")
+        if perr:
+            return err(perr)
+        blob, ferr = _fetch(u["url"])
+        if ferr:
+            return err(ferr)
         werr = _store(dest, blob)
         if werr:
             return err(werr)
@@ -324,12 +344,16 @@ def _download(args: dict) -> str:
     actual_q = dd.get("quality")
     part_no = min(int(args.get("page_no") or 1), len(durls))
     u = durls[part_no - 1]
-    dest = _dest_path(args, bvid, "q%s_p%d" % (actual_q, part_no))
+    dest, perr = _dest_path(args, bvid, "q%s_p%d" % (actual_q, part_no))
+    if perr:
+        return err(perr)
     if _cache_hit(dest) and not args.get("force"):
         return ok({"bvid": bvid, "title": _uf(title, head=True), "path": dest,
                    "size_mb": round(os.path.getsize(dest) / 1048576, 1),
                    "quality": actual_q, "cached": True})
-    blob = get_bytes(u["url"])
+    blob, ferr = _fetch(u["url"])
+    if ferr:
+        return err(ferr)
     werr = _store(dest, blob)
     if werr:
         return err(werr)
@@ -509,7 +533,7 @@ _TOOLS = [
         "page_no": {"type": "integer", "description": "which stream part, default 1"},
         "audio_only": {"type": "boolean", "description": "download the audio track only (dash); falls back to the muxed stream"},
         "force": {"type": "boolean", "description": "re-download even if cached"},
-        "filename": {"type": "string", "description": "absolute path override"},
+        "filename": {"type": "string", "description": "output override (must stay inside the scratch dir; existing cache files may be rewritten)"},
     }, [],
      "Download one video part to a local file (scratch dir), returns path. Anonymous quality is capped; use bili_download_hd after login for 1080P+."),
     ("bili_user_info", _user_info, {

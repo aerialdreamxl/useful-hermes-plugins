@@ -61,6 +61,16 @@ def tagUntrustedTitle(text):
         return(s)
     return(_UNTRUSTED_TAG+s)
 
+
+def tagUntrustedError(exc: BaseException, *, kind: str = "MCPError") -> str:
+    """统一净化 MCP/上游错误，保留类型但不把原始模板标记直接送入模型。"""
+    from .ds_client import sanitize_exception_text
+
+    text = sanitize_exception_text(exc)
+    if text.startswith("[上游错误·不可信]"):
+        return text
+    return f"[上游错误·不可信] ({kind}): {text[:800]}"
+
 class DashScopeWebSearchProvider(WebSearchProvider):
     """Routes web_search/web_extract to Aliyun Bailian EnhancedSearch/WebFetch MCP."""
 
@@ -201,7 +211,7 @@ class DashScopeWebSearchProvider(WebSearchProvider):
                     })
                 idx = idx + 1
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": tagUntrustedError(e, kind="MCPWebSearchError")}
 
         return {
             "success": True,
@@ -230,7 +240,7 @@ class DashScopeWebSearchProvider(WebSearchProvider):
                 dat["title"]=tagUntrustedTitle(heading or host)
             except Exception as e:
                 # 单个 URL 失败只标记该项 error，其他 URL 照常返回（不整批失败）
-                dat["error"]=str(e)
+                dat["error"]=tagUntrustedError(e, kind="MCPWebFetchError")
             respDat.append(dat)
 
         return respDat

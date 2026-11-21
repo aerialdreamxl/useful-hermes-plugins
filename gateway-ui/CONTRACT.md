@@ -496,14 +496,16 @@ pending 全量快照（present 登记/注销时重写）：
 - `allowed_choices` ⊆ {once, session, always, deny}（smart-DENY owner override 收缩为
   once/deny）；`digest` 由宿主绑定（含 session_key 的 canonical sha256）。
 
-### 11.2 approval_resp.json（worker 单写者，宿主只读；atomic）
+### 11.2 审批决定回传：本地 IPC（approval_ipc.py；替代旧 approval_resp.json）
 ```
-{"entries": [{"request_id": str, "digest": str, "choice": str, "clicked_ts": float}]}
+{"request_id": str, "digest": str, "choice": str, "token": str, "spawn_token": str}
 ```
-- worker 按钮点击追加条目；**按当前 req 快照修剪陈旧条目**（host 已消费=离开 req 的
-  rid 不再保留）。宿主只读不重写 → 消除跨进程读改写竞态。
-- 宿主 present 轮询（0.25s）取本 request_id 的 choice → `request.respond(choice)`
-  造 ApprovalDecision（request_id/digest 宿主绑定，插件不回显不改算）。
+- worker 按钮点击 → 命名管道/AF_UNIX 一次性发送；**审批决定不落共享目录**——
+  旧 approval_resp.json 任何同用户进程都能伪造放行（审计 D1，已根除）。
+- 握手 token 由 Supervisor 经 spawn stdin 单传，不进 tray_meta.json、不进总线。
+- 宿主 `_receive_ipc` 五重校验（client PID=租约 pid + 租约新鲜 + token + spawn_token
+  + digest），过验入内存决定表，present 轮询（0.25s）一次性消费 →
+  `request.respond(choice)` 造 ApprovalDecision（request_id/digest 宿主绑定，插件不改算）。
 - choice 映射：永远放行=always / 会话放行=session / 单次放行=once / 拒绝=deny。
   choice ∉ allowed_choices → 宿主 `_validate_decision` 判 invalid fail-closed。
 

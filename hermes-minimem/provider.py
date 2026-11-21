@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -78,6 +79,17 @@ KINDS = ("preference", "fact", "insight", "identity", "task", "relation")
 # Built-in memory target -> minimem kind. ``user`` reads as identity/preference, ``memory``
 # as environment facts; the distinction only drives the stored enum, never retrieval.
 _KIND_BY_TARGET = {"user": "preference", "memory": "fact"}
+
+
+def _coerce_importance(value: Any, default: float = 0.5) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(value):
+        return default
+    return max(0.0, min(1.0, value))
+
 
 _WRITE_DEBOUNCE_S = 5.0
 _WRITE_BATCH = 20
@@ -336,6 +348,7 @@ class MinimemProvider(MemoryProvider):
         # mirror writes (on_memory_write) are debounced and batched
         self._pending: List[Dict[str, Any]] = []
         self._pending_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_stop = threading.Event()
         self._writer_wake = threading.Event()
@@ -748,6 +761,7 @@ class MinimemProvider(MemoryProvider):
         if not text:
             return {"ok": False, "error": "text is empty"}
         kind = kind if kind in KINDS else "fact"
+        imp = _coerce_importance(imp)
         result = self._embed_document(text)
         if result is None:
             return {
@@ -923,14 +937,10 @@ class MinimemProvider(MemoryProvider):
             if not text:
                 continue
             kind = rec.get("kind") if rec.get("kind") in KINDS else default_kind
-            try:
-                imp = float(rec.get("importance", 0.5))
-            except (TypeError, ValueError):
-                imp = 0.5
             source = dict(rec.get("source") or {})
             source.setdefault("origin", source_origin)
             source["imported_by"] = source_origin
-            prepared.append((text[:MAX_TEXT], kind, max(0.0, min(1.0, imp)), source))
+            prepared.append((text[:MAX_TEXT], kind, _coerce_importance(rec.get("importance", 0.5)), source))
         summary = {"ok": True, "total": len(prepared), "imported": 0, "skipped_dupe": 0, "errors": 0}
         batch = max(1, int(batch))
         for start in range(0, len(prepared), batch):
@@ -1158,8 +1168,13 @@ class MinimemProvider(MemoryProvider):
 
         The pop and the item hand-off happen in ONE lock acquisition: taking a reference
         under the lock and popping under a second one let the writer thread and an explicit
-        force-flush grab the same item, which inserted the same mirror row twice.
+        force-flush grab the same item, which inserted the same mirror row twice. The flush
+        lock also keeps two callers from applying later items ahead of a failed earlier one.
         """
+        with self._flush_lock:
+            self._flush_pending_locked(force=force)
+
+    def _flush_pending_locked(self, force: bool = False) -> None:
         applied = 0
         while True:
             with self._pending_lock:
@@ -1176,7 +1191,7 @@ class MinimemProvider(MemoryProvider):
                     self._pending.insert(0, item)  # retry this one later, keep the order
                 break  # never re-pop the same failing item in one pass (would spin forever)
             applied += 1
-            if applied >= _WRITE_BATCH:
+            if not force and applied >= _WRITE_BATCH:
                 break
         if applied:
             self._last_write_at = time.time()
@@ -1298,7 +1313,7 @@ class MinimemProvider(MemoryProvider):
                 result = self.remember(
                     str(args.get("text") or ""),
                     kind=str(args.get("kind") or "fact"),
-                    imp=float(args.get("importance", 0.5) or 0.5),
+                    imp=_coerce_importance(args.get("importance", 0.5)),
                     source={
                         "origin": "tool",
                         "session_id": kwargs.get("session_id") or self._session_id,
@@ -1359,7 +1374,7 @@ class MinimemProvider(MemoryProvider):
                 vec=vec,
                 vec_model=self._settings.model if result is not None else None,
                 vec_dim=len(vec) if result is not None else None,
-                imp=float(importance) if importance is not None else None,
+                imp=_coerce_importance(importance) if importance is not None else None,
                 sparse=result.sparse if self._settings.uses_model_sparse else None,
                 sparse_model=self._settings.sparse_model if self._settings.uses_model_sparse else None,
                 backend=self._settings.backend if result is not None else None,

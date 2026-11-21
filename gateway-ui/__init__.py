@@ -623,6 +623,8 @@ def register(ctx) -> None:
         home=_home(), repo=_repo(), version_fn=_version,
         pet_cfg_fn=_pet_runtime, tray_enabled_fn=_tray_enabled,
         index_url_fn=lambda: _s("package_index_url"),
+        approval_meta_fn=approval_host.worker_meta,
+        approval_handshake_fn=approval_host.worker_handshake,
         logger=getattr(ctx, "logger", None), vlog=_vlog, stop_event=_STOP)
     threading.Thread(target=_consumer, args=(_STOP,), name="gui-bus", daemon=True).start()
     threading.Thread(target=_update_checker, args=(_STOP,), name="gui-update", daemon=True).start()
@@ -650,6 +652,8 @@ def register(ctx) -> None:
 
 def _shutdown(*a) -> None:
     _STOP.set()
+    with contextlib.suppress(Exception):
+        approval_host.shutdown()
     if _SUP is not None:
         with contextlib.suppress(Exception):
             _SUP.shutdown()

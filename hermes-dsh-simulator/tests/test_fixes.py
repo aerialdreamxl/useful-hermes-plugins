@@ -298,9 +298,9 @@ def test_store_ttl(tmp: str) -> None:
     check("F14 8-day entry dropped", "stale_session" not in keys, str(keys))
     check("F14 30-day created entry dropped", "created_stale" not in keys, str(keys))
     check("F14 fresh entry kept", "fresh_session" in keys, str(keys))
-    check("F14 undated entry kept (fail open)", "undated_session" in keys, str(keys))
+    check("F14 undated entry dropped (no timestamp = expired)", "undated_session" not in keys, str(keys))
     armed = state.hydrate()
-    check("F14 hydrate arms only live sessions", armed == 2, "armed=%s" % armed)
+    check("F14 hydrate arms only live sessions", armed == 1, "armed=%s" % armed)
     check("F14 hydrate skipped the stale mode", registry.get_mode("stale_session") is None)
     check("F14 hydrate armed the fresh mode", registry.get_mode("fresh_session") == "minimal")
 

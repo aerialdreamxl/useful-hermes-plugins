@@ -41,7 +41,19 @@ logger = logging.getLogger("plugin.hermes-dsh-simulator")
 
 OUR_TOOL_NAMES = ("bash", "str_replace_editor")
 
+# The pair silently forwards onto these host tools (see forward.py). Injecting
+# it into an agent whose whole surface lacks them would expand a session the
+# user disabled the terminal/file toolsets for, so the pair stays out there.
+_FORWARD_HOST_TOOLS = ("terminal", "read_file", "write_file", "patch")
+
 _ctx_ref = [None]
+_warned: set = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _warned:
+        _warned.add(key)
+        logger.warning("hermes-dsh-simulator: " + message)
 
 
 def bind_ctx(ctx) -> None:
@@ -129,10 +141,36 @@ def _def_name(entry) -> str:
 # the mutations
 # ---------------------------------------------------------------------------
 
+def _surface_allows_injection(agent, have: set) -> bool:
+    """Whether this agent's active surface may host the forwarded pair.
+
+    ``have`` is the live tool-def name set. When the surface is known (a
+    non-empty list), at least one host tool the pair forwards onto must be
+    present: a session whose terminal/file toolsets are disabled must not
+    gain a ``bash`` that resurrects them behind the user's back. An empty or
+    unreadable list is not trusted as "all disabled" (it can be a half-built
+    agent), so those callers keep the previous behaviour and only warn.
+    """
+    if not have:
+        return True
+    if any(name in have for name in _FORWARD_HOST_TOOLS):
+        return True
+    _warn_once(
+        "surface:%s" % (getattr(agent, "session_id", "") or "unknown"),
+        "minimal mode: live agent has none of the host tools the DSH pair "
+        "forwards onto (%s) — the terminal/file surface looks disabled, "
+        "not injecting" % ", ".join(_FORWARD_HOST_TOOLS),
+    )
+    return False
+
+
 def _inject(agent) -> bool:
     """Append missing wire defs + names to one live agent (idempotent)."""
     tools = getattr(agent, "tools", None)
     if not isinstance(tools, list):
+        _warn_once("notools:%s" % (getattr(agent, "session_id", "") or "unknown"),
+                   "minimal mode: live agent tools list is unreadable — "
+                   "active tool surface unknown; injecting nothing (fail open)")
         return False
     schemas = (C.active_bash_schema(), C.editor_schema())
     lock = _tools_lock()
@@ -145,6 +183,12 @@ def _inject(agent) -> bool:
             locked = False
     try:
         have = {_def_name(t) for t in tools if isinstance(t, dict)}
+        if not have:
+            _warn_once("emptysurface:%s" % (getattr(agent, "session_id", "") or "unknown"),
+                       "minimal mode: live agent tool list is empty — active tool "
+                       "surface unknown; keeping previous inject-anyway behaviour")
+        if not _surface_allows_injection(agent, have):
+            return False
         changed = False
         for schema in schemas:
             name = str(schema.get("name") or "")

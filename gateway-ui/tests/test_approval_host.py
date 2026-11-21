@@ -3,8 +3,9 @@
 
 用真 ApprovalRequest（hermes_cli.approval_transport）验 digest/respond 绑定；
 present 跑真线程，短 timeout（6s→自终止线 1s）+ 快 poll。全部 scratch 总线，
-绝不碰真实总线/config。覆盖：pending 登记/注销、req 快照白名单、resp 消费、
-invalid/no_response fail-closed 矩阵、worker 死、cancel、stop、withdrawn。
+绝不碰真实总线/config。覆盖：pending 登记/注销、req 快照白名单、**IPC 决定消费**、
+伪造 token/digest/重放拒绝、invalid/no_response fail-closed 矩阵、worker 死、
+cancel、stop、withdrawn。审批决定不再经 approval_resp.json（同用户可伪造）。
 """
 import json
 import os
@@ -54,22 +55,32 @@ def make_req(timeout=6.0, surface="transport:gateway-ui", command="rm -rf /x"):
 
 def fresh_lease():
     p = BUS / "tray_lease.json"
-    p.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    p.write_text(json.dumps({"pid": os.getpid(), "spawn_token": "t-spawn"}),
+                 encoding="utf-8")
     now = time.time()
     os.utime(p, (now, now))
 
 
-def write_resp(rid, digest, choice):
-    p = BUS / "approval_resp.json"
-    entries = []
-    if p.is_file():
-        try:
-            entries = json.loads(p.read_text(encoding="utf-8")).get("entries") or []
-        except Exception:
-            entries = []
-    entries.append({"request_id": rid, "digest": digest, "choice": choice,
-                    "clicked_ts": time.time()})
-    p.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+def send_resp(rid, digest, choice, token=None, spawn="t-spawn"):
+    """单次 IPC 送达，回服务端 ack dict（等同 worker 弹窗点击）。"""
+    payload = {"request_id": rid, "digest": digest, "choice": choice,
+               "token": ah._IPC_TOKEN if token is None else token,
+               "spawn_token": spawn}
+    try:
+        return ah.approval_ipc.ApprovalResponseClient.send(ah._IPC_ENDPOINT, payload,
+                                                            timeout=2.0)
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__}
+
+
+def write_resp(rid, digest, choice, wait_s=2.5):
+    """重试到 pending 登记为止（present 线程先跑起来才有意义）。"""
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if send_resp(rid, digest, choice).get("ok"):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def run_present(req, resp=None, resp_delay=0.0, worker=True, stop=False, cancel=False):
@@ -79,8 +90,6 @@ def run_present(req, resp=None, resp_delay=0.0, worker=True, stop=False, cancel=
         fresh_lease()
     if stop:
         ah._STOP.set()
-    if resp is not None and resp_delay <= 0:
-        write_resp(req.request_id, req.digest, resp)
     box = {}
     def target():
         t0 = time.time()
@@ -88,9 +97,10 @@ def run_present(req, resp=None, resp_delay=0.0, worker=True, stop=False, cancel=
         box["dt"] = time.time() - t0
     th = threading.Thread(target=target, daemon=True)
     th.start()
-    if resp is not None and resp_delay > 0:
-        time.sleep(resp_delay)
-        write_resp(req.request_id, req.digest, resp)
+    if resp is not None:
+        if resp_delay > 0:
+            time.sleep(resp_delay)
+        box["delivered"] = write_resp(req.request_id, req.digest, resp)
     if cancel:
         time.sleep(0.1)
         ah.cancel_session("agent:ns:desktop:dm:12345")
@@ -109,6 +119,9 @@ ck("bridge: fast return on pre-written resp (<2s)", dt < 2)
 ck("bridge: pending drained to 0", ah.pending_count() == 0)
 reqf = json.loads((BUS / "approval_req.json").read_text(encoding="utf-8"))
 ck("bridge: req snapshot emptied after consume", reqf.get("requests") == [])
+ck("bridge: decision never touched a shared file",
+   not (BUS / "approval_resp.json").exists())
+ck("bridge: response memory drained", not ah._RESPONSES)
 wd = (BUS / "approval_withdrawn.jsonl").read_text(encoding="utf-8").strip().splitlines()
 ck("bridge: withdrawn appended", len(wd) == 1)
 ck("bridge: withdrawn reason completed", json.loads(wd[0]).get("reason") == "completed")
@@ -153,6 +166,41 @@ th.join(timeout=10)
 req = make_req()
 d, _ = run_present(req, resp="bogus")
 ck("failclosed: invalid choice -> no_response", getattr(d, "choice", None) == "no_response")
+
+# ---- 伪造矩阵：同用户进程能读 req 快照，但拿不到 stdin 握手 ----
+req = make_req(timeout=30)
+clean(); fresh_lease()
+th = threading.Thread(target=lambda: ah.present(req), daemon=True); th.start()
+time.sleep(0.2)
+ack = send_resp(req.request_id, req.digest, "once", token="guessed-token")
+ck("spoof: foreign token rejected", not ack.get("ok"))
+ack = send_resp(req.request_id, "digest-forged", "once")
+ck("spoof: wrong digest rejected", not ack.get("ok"))
+ack = send_resp(req.request_id, req.digest, "once", spawn="stale-spawn")
+ck("spoof: stale spawn_token rejected", not ack.get("ok"))
+ck("spoof: nothing consumed", not ah._RESPONSES and ah.pending_count() == 1)
+ack = send_resp(req.request_id, req.digest, "once")
+ck("legit: accepted once", bool(ack.get("ok")))
+ack = send_resp(req.request_id, req.digest, "once")
+ck("replay: second send rejected", not ack.get("ok"))
+th.join(timeout=10)
+ck("spoof: decision unaffected by rejects", ah.pending_count() == 0)
+
+# 旧共享文件即使被外部进程伪造也绝不生效（present 运行中预埋，
+# 旧实现 0.05s 一轮询就会把 always 读走；新实现必须无动于衷直到超时）
+req = make_req(timeout=6.0)   # 自终止线 ~1s
+clean(); fresh_lease()
+box = {}
+th = threading.Thread(target=lambda: box.update(d=ah.present(req)), daemon=True)
+th.start()
+time.sleep(0.2)
+(BUS / "approval_resp.json").write_text(json.dumps({"entries": [
+    {"request_id": req.request_id, "digest": req.digest, "choice": "always"}]}),
+    encoding="utf-8")
+time.sleep(0.4)   # 两拍轮询：旧代码此时早已消费
+ck("spoof: planted file not consumed", not ah._RESPONSES)
+th.join(timeout=10)
+ck("spoof: planted approval_resp.json ignored", getattr(box.get("d"), "choice", None) == "no_response")
 
 # worker 死（无 tray_lease）→ no_response 快速
 req = make_req()
@@ -215,6 +263,7 @@ for rq in reqs:
 for t in threads:
     t.join(timeout=10)
 ck("concurrent: all drained", ah.pending_count() == 0)
+ck("concurrent: no leftover memory", not ah._RESPONSES)
 
 # ==================================== hint 上限 / cancel 无匹配 ====
 clean()

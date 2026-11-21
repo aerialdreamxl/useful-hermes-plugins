@@ -316,17 +316,24 @@ class ParkRegistry:
     def release(self, key: str) -> bool:
         with self._lock:
             park = self._parks.get(key)
-        if park is None:
-            return False
-        park["event"].set()
-        return True
+            if park is None:
+                return False
+            # Wake the exact registered park while holding the same lock as
+            # register().  Setting the event after releasing the lock allowed
+            # a new API boundary to replace the entry in that window; /unhold
+            # then reported success while the new park remained blocked.
+            park["event"].set()
+            return True
 
     def has_parked(self, key: str) -> bool:
         with self._lock:
             return key in self._parks
 
-    def clear(self, key: str) -> None:
+    def clear(self, key: str, ev: Optional[threading.Event] = None) -> None:
         with self._lock:
+            park = self._parks.get(key)
+            if park is None or (ev is not None and park.get("event") is not ev):
+                return
             self._parks.pop(key, None)
 
     def parked_keys(self) -> Tuple[str, ...]:
@@ -438,7 +445,7 @@ def make_park_middleware(state: Dict[str, dict], lock: threading.RLock,
                 if time.monotonic() > deadline:
                     outcome = "ttl"
                     break
-            PARKS.clear(key)
+            PARKS.clear(key, ev)
             # Any wake drains the freeze: unhold/ttl hand the request to the
             # provider NOW (the snapshot is consumed by definition), interrupt
             # lets core's own partial-history path persist the dying turn.

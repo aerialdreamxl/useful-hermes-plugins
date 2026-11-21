@@ -21,6 +21,50 @@ HEADERS = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
 TIMEOUT = 25
 
 
+def safe_output_path(path: str, roots, label: str = "输出路径",
+                     allow_existing: bool = False) -> tuple:
+    """Constrain a write target to ``roots`` (realpath); refuse existing
+    files unless ``allow_existing`` (scratch cache rewrite)."""
+    if not path:
+        return "", "%s 不能为空" % label
+    candidate = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+    allowed = False
+    for root in roots if isinstance(roots, (list, tuple, set)) else [roots]:
+        base = os.path.realpath(os.path.abspath(str(root)))
+        try:
+            if os.path.commonpath([candidate, base]) == base and candidate != base:
+                allowed = True
+                break
+        except ValueError:
+            pass
+    if not allowed:
+        return "", "%s 必须位于 scratch 目录内" % label
+    if os.path.lexists(candidate) and not allow_existing:
+        return "", "%s 已存在，拒绝覆盖" % label
+    return candidate, ""
+
+
+def safe_input_path(path: str, roots, label: str = "source") -> tuple:
+    """Return an existing regular file constrained to one of ``roots``."""
+    if not path:
+        return "", "%s 不能为空" % label
+    candidate = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+    allowed = False
+    for root in roots if isinstance(roots, (list, tuple, set)) else [roots]:
+        base = os.path.realpath(os.path.abspath(str(root)))
+        try:
+            if os.path.commonpath([candidate, base]) == base and candidate != base:
+                allowed = True
+                break
+        except ValueError:
+            pass
+    if not allowed:
+        return "", "%s 本地路径必须位于 scratch 或 plugin-data 目录内" % label
+    if not os.path.isfile(candidate):
+        return "", "%s 本地路径不是可读的普通文件" % label
+    return candidate, ""
+
+
 def ok(data: dict) -> str:
     return json.dumps({"ok": True, **data}, ensure_ascii=False)
 
@@ -31,6 +75,32 @@ def err(msg: Any) -> str:
 
 def _merge(headers: Optional[dict]) -> dict:
     return dict(HEADERS, **(headers or {}))
+
+
+_BILI_DOWNLOAD_HOSTS = ("bilibili.com", "bilivideo.com", "bilivideo.cn", "hdslb.com")
+
+
+def validate_bili_download_url(url: str) -> str:
+    """Return an error for a non-Bilibili HTTPS download URL."""
+    try:
+        parsed = urllib.parse.urlparse(str(url))
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return "B站下载 URL 无效"
+    if parsed.scheme.lower() != "https" or not host:
+        return "B站下载 URL 必须使用 HTTPS"
+    if port not in (None, 443):
+        return "B站下载 URL 端口不受允许"
+    if not any(host == suffix or host.endswith("." + suffix)
+               for suffix in _BILI_DOWNLOAD_HOSTS):
+        return "B站下载 URL host 不在允许名单"
+    return ""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def get_json(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT) -> Any:
@@ -60,11 +130,23 @@ def get_text(url: str, headers: Optional[dict] = None, timeout: int = TIMEOUT) -
 
 
 def get_bytes(url: str, headers: Optional[dict] = None, timeout: int = 120) -> bytes:
+    url_error = validate_bili_download_url(url)
+    if url_error:
+        raise ValueError(url_error)
     hdrs = _merge(headers)
     hdrs.setdefault("Referer", "https://www.bilibili.com/video/")
     req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            final_error = validate_bili_download_url(r.geturl())
+            if final_error:
+                raise ValueError("B站下载响应 URL 不在允许名单")
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            raise ValueError("B站下载拒绝跟随重定向")
+        raise
 
 
 def post_form(url: str, data: dict, headers: Optional[dict] = None,

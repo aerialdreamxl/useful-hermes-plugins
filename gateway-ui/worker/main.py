@@ -32,6 +32,7 @@ from pathlib import Path
 
 # python -I 隐含 -P：脚本目录不进 sys.path。显式 insert 后平级导入。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 META = {}
 STATE = {"data": None, "ts": 0.0}
@@ -44,6 +45,7 @@ PET = {"win": None, "cfg": {}, "cfg_mtime": 0.0, "menu": None,
        "approval_mgr": None, "approval_cfg": {}}
 LIFECYCLE_PENDING = {"until": 0.0}
 OWNER_ALIVE = True
+APPROVAL_HANDSHAKE = ""
 
 # 事件反应收口：三事件反应管线（宿主 notice → NoticeTracker → 桌宠动作+托盘闪动）。
 # notices 纯 stdlib 无 Qt，顶部导入安全；TRAY_FLASH 在 _main_inner 建好托盘后赋值。
@@ -577,7 +579,7 @@ def _sync_bubble():
 
 # ------------------------------------------------------- approval popup ----
 # 审批弹窗 R28：宿主 approval_req.json 驱动，approval.popup_enabled 门控。
-# 点击注入 approval decision（写 approval_resp.json），零 settings_req（A2）。
+# 点击注入 approval decision（本地 IPC 送达，不落共享文件），零 settings_req（A2）。
 def _approval_enabled() -> bool:
     """审批弹窗门控：approval.popup_enabled 缺省 false（DIY 修改类默认关）。"""
     return bool(PET.get("approval_cfg", {}).get("popup_enabled", False))
@@ -773,6 +775,20 @@ def main():
 def _main_inner():
     global tray, TRAY_ICON
     trace("meta ok")
+    global APPROVAL_HANDSHAKE
+    try:
+        # Supervisor writes the one-time approval handshake immediately after
+        # spawning. Read it before Qt starts so the first real popup cannot
+        # race the stdin watcher and lose a valid click.
+        line = sys.stdin.readline()
+        if line == "":
+            trace("approval handshake missing")
+            return
+        APPROVAL_HANDSHAKE = line.strip()
+        META["approval_handshake"] = APPROVAL_HANDSHAKE
+    except Exception as exc:
+        trace(f"approval handshake read failed: {type(exc).__name__}")
+        return
     decision = lease_self_check()
     trace(f"lease check -> {decision}")
     if decision == "yield":
@@ -833,7 +849,8 @@ def _main_inner():
     def _watch_stdin():
         try:
             while True:
-                if sys.stdin.readline() == "":
+                line = sys.stdin.readline()
+                if line == "":
                     _die("stdin EOF")
         except Exception:
             _die("stdin error")

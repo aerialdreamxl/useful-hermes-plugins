@@ -14,6 +14,7 @@ import json
 import os
 import re
 import socket
+import stat
 import sys
 import time
 import zipfile
@@ -26,8 +27,18 @@ from pathlib import Path
 SECRET_EXCLUDES = [
     "/.env", "/.env.*",                     # 根级环境变量（含 .env.local/.env.production 变体）
     "/config.yaml",                         # 主配置（含各类 key 与绝对路径）
-    ".advanced-custom-providers.json",      # 自定义 provider（明文 API key）
+    "/auth.json", "/auth.lock",             # 根级 Hermes 凭据池及其锁
+    "/.copilot_jwt.json", "/.anthropic_oauth.json",  # OAuth/JWT 凭据
+    "/shared/nous_auth.json", "/shared/nous_auth.lock",  # 共享 OAuth 凭据
+    "/webapp/", "/browser-profile/", "/cache/gateway-ui/.bus_token",  # Webapp/browser/bus 凭据
+    "/mcp-tokens/", "/vault/", "/pairing/",  # token/vault/配对凭据目录
+    "/platforms/pairing/", "/whatsapp/session/", "/platforms/whatsapp/session/",
+    "/matrix/store/", "/platforms/matrix/store/",
     "credential*.json", "credential*.txt",  # 凭据文件
+    "*.credentials.json", "*.token", "*.tokens", "*.cookie", "*.cookies",
+    "*.session", "*.sessions", "*.session.json", "*.sessions.json",
+    "google_token.json", "google_client_secret.json", "google_oauth_pending.json",
+    ".advanced-custom-providers.json",      # 自定义 provider（明文 API key）
     "*.db", "*.db-wal", "*.db-shm",          # SQLite 主库与旁车（记忆库/看板/状态）
     "*.sqlite*",                            # 同一族的其它.sqlite/.sqlite3/-wal/-shm
 ]
@@ -167,6 +178,10 @@ def _rel(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    return os.path.islink(path) or getattr(os.path, "isjunction", lambda _: False)(path)
+
+
 def collect(home: Path, bl: Blacklist, out_path: Path):
     """遍历 home，黑名单剪枝。返回 (files, skipped_dirs, total_bytes)。"""
     files, skipped = [], []
@@ -177,7 +192,7 @@ def collect(home: Path, bl: Blacklist, out_path: Path):
         keep_dirs = []
         for name in dirnames:
             sub = d / name
-            if os.path.islink(sub) or getattr(os.path, "isjunction", lambda _: False)(sub):
+            if _is_link_or_junction(sub):
                 skipped.append(_rel(sub, home) + "/ (链接,跳过)")
                 continue
             rel = _rel(sub, home)
@@ -191,6 +206,9 @@ def collect(home: Path, bl: Blacklist, out_path: Path):
             rel = _rel(f, home)
             if bl.excluded(rel, False):
                 continue
+            if _is_link_or_junction(f):
+                skipped.append(rel + " (链接,跳过)")
+                continue
             if out_resolved is not None:
                 try:
                     if f.resolve() == out_resolved:
@@ -198,7 +216,11 @@ def collect(home: Path, bl: Blacklist, out_path: Path):
                 except OSError:
                     pass
             try:
-                total += f.stat().st_size
+                st = os.lstat(f)
+                if stat.S_ISLNK(st.st_mode) or _is_link_or_junction(f):
+                    skipped.append(rel + " (链接,跳过)")
+                    continue
+                total += st.st_size
                 files.append(f)
             except OSError:
                 skipped.append(rel + " (stat 失败)")
@@ -237,15 +259,15 @@ def package_main(args) -> int:
     if args.no_default_excludes:
         print("[hermes-pack] --no-default-excludes：只用你的规则，密钥/配置/记忆库不再自动排除。")
     elif args.include_secrets:
-        print("[hermes-pack] 警告：--include-secrets 已生效，.env / config.yaml / *.db 将明文进包，传播前请自行评估。")
+        print("[hermes-pack] 警告：--include-secrets 已生效，.env / config.yaml / auth.json / OAuth-JWT / token-session 凭据 / *.db 将明文进包，传播前请自行评估。")
     else:
-        print("[hermes-pack] 密钥/配置/记忆库（.env、config.yaml、credential*.json、*.db）已排除；确需打包加 --include-secrets。")
+        print("[hermes-pack] 密钥/配置/记忆库（.env、config.yaml、auth.json、OAuth-JWT、token-session 凭据、credential*.json、*.db）已排除；确需打包加 --include-secrets。")
 
     out_path = Path(args.output).expanduser()
     if not out_path.is_absolute():
         out_path = Path.cwd() / out_path
-    if out_path.suffix.lower() != ".zip":
-        out_path = out_path.with_suffix(".zip")
+    if not out_path.name.lower().endswith(".zip"):
+        out_path = out_path.with_name(out_path.name + ".zip")
 
     running, why = gateway_running(home)
     if running and not args.force and not args.dry_run:
@@ -295,6 +317,8 @@ def package_main(args) -> int:
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "file_count": len(files), "raw_bytes": total_bytes,
         "gateway_was_running": bool(running),
+        "include_secrets": bool(args.include_secrets),
+        "no_default_excludes": bool(args.no_default_excludes),
     }
     written = 0
     vanished = 0
@@ -303,6 +327,12 @@ def package_main(args) -> int:
         zf.writestr("_hermes-pack-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for f in files:
             try:
+                st = os.lstat(f)
+                if stat.S_ISLNK(st.st_mode) or _is_link_or_junction(f):
+                    vanished += 1
+                    if vanished <= 10:
+                        print(f"  [跳过] {f.name}: 链接（写入前复查）")
+                    continue
                 zf.write(f, _rel(f, home))
             except (FileNotFoundError, zipfile.BadZipFile) as exc:
                 # 扫描与写入之间文件消失/被重写（临时件轮换、SQLite checkpoint）。

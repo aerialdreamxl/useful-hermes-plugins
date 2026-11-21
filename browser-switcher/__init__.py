@@ -222,11 +222,11 @@ _LOCAL_V6 = (ipaddress.ip_network("fc00::/7"),)
 
 
 def _cdp_host_is_local(host: str) -> bool:
-    """只看字面：localhost / loopback / RFC1918 / ULA / link-local（不做 DNS 解析）。"""
+    """只看字面：localhost / loopback / RFC1918 / ULA / link-local。"""
     h = (host or "").strip().rstrip(".").lower()
     if not h:
         return False
-    if h == "localhost":
+    if h == "localhost" or h.endswith(".localhost"):
         return True
     try:
         ip = ipaddress.ip_address(h.split("%")[0])
@@ -243,15 +243,19 @@ def _cdp_host_is_local(host: str) -> bool:
 
 
 def _check_cdp_endpoint(url: str) -> None:
-    """F3：cdp 后端的主机白名单 —— 默认只许本机/私网，公网端点会让整个浏览器工具面
-    指向外部端点。确需远程时显式开 BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1。"""
+    """F3：先验 scheme，再验 CDP 主机白名单；远程需显式开关。"""
     allow = (os.environ.get("BROWSER_SWITCHER_ALLOW_REMOTE_CDP") or "").strip().lower()
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+        scheme = (parts.scheme or "").lower()
+        host = parts.hostname or ""
+        if scheme not in ("ws", "wss", "http", "https") or not host:
+            raise RuntimeError("CDP URL 需以 ws://、wss://、http:// 或 https:// 开头并包含主机")
+        port = parts.port
+    except ValueError as e:
+        raise RuntimeError("CDP URL 端口无效") from e
     if allow in ("1", "true", "yes"):
         return
-    try:
-        host = urllib.parse.urlsplit(url).hostname or ""
-    except Exception:
-        host = ""
     if _cdp_host_is_local(host):
         return
     raise RuntimeError(
@@ -259,6 +263,26 @@ def _check_cdp_endpoint(url: str) -> None:
         "RFC1918 私网、IPv6 ULA fc00::/7、link-local）。若确需连远程端点，先设 "
         "BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1。"
     )
+
+
+def _redact_cdp_url(url: str) -> str:
+    """status/返回文案只保留 scheme、host、port，不暴露 path 中的 GUID。"""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        host = parts.hostname or "?"
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{host}{port}"
+    except Exception:
+        return "<invalid-cdp>"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """发现请求禁自动跟随重定向：3xx 直接抛，绝不先访问重定向目标再判。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _discover_cdp_ws(url: str) -> str:
@@ -271,14 +295,24 @@ def _discover_cdp_ws(url: str) -> str:
     if url.startswith(("ws://", "wss://")):
         return url
     version_url = url.rstrip("/") + "/json/version"
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(version_url, timeout=6.0) as resp:
+        with opener.open(version_url, timeout=6.0) as resp:
+            if str(resp.geturl()) != version_url:
+                raise RuntimeError("CDP 发现请求被重定向（已拒绝）")
             info = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            raise RuntimeError(f"CDP 端点 {url} /json/version 返回重定向（已拒绝跟随）") from e
+        raise RuntimeError(f"CDP 端点 {url} /json/version 发现失败: {e}") from e
     except Exception as e:
         raise RuntimeError(f"CDP 端点 {url} /json/version 发现失败: {e}") from e
     ws = str(info.get("webSocketDebuggerUrl") or "")
     if not ws:
         raise RuntimeError(f"CDP 端点 {url} 未返回 webSocketDebuggerUrl（Chromium 136+ 需带 --remote-allow-origins 重启浏览器）")
+    _check_cdp_endpoint(ws)
+    if urllib.parse.urlsplit(ws).scheme.lower() not in ("ws", "wss"):
+        raise RuntimeError("CDP discovery returned a non-websocket URL")
     return ws
 
 
@@ -323,6 +357,7 @@ def _apply(desired: Dict[str, Any]) -> str:
         new_cdp, shard_pid = "", ""
     elif provider == "shardx":
         started = _shardx_start(desired["extra"] or _shardx_default_name() or "", headless=desired.get("headless", True))
+        _check_cdp_endpoint(started["cdp"])
         new_cdp, shard_pid = started["cdp"], started["profile_id"]
     elif provider == "cdp":
         _check_cdp_endpoint(desired["extra"] or "")
@@ -362,7 +397,7 @@ def _apply(desired: Dict[str, Any]) -> str:
         return "已切回内建 Headless Chromium（default）。"
     if provider == "shardx":
         return f"已挂载 ShardX 指纹浏览器（profile: {desired['extra'] or _shardx_default_name()}，headless={desired.get('headless', True)}），CDP 握手正常。"
-    return f"已挂载外部 CDP 端点（{new_cdp.split('/devtools/')[0]}…）。"
+    return f"已挂载外部 CDP 端点（{_redact_cdp_url(new_cdp)}）。"
 
 
 def _status_line() -> str:
@@ -373,7 +408,7 @@ def _status_line() -> str:
             extra = f" profile={_shardx_default_name() or '?'}"
         elif provider == "cdp":
             cdp = (_attached or {}).get("cdp", "")
-            extra = f" url={cdp[:60]}{'…' if len(cdp) > 60 else ''}"
+            extra = f" url={_redact_cdp_url(cdp)}"
     # 健康探测是 4s 的网络调用，放锁外（否则 /browserswitch 与 middleware 互堵）
     health = ""
     if provider == "shardx":

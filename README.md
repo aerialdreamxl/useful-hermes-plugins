@@ -25,8 +25,8 @@ Windows 与 Linux 实测过；macOS 理论上没有平台相关问题，但没�
 
 ## 后端类
 - **[web-bingsearch](web-bingsearch/README.md)**: 一次将Microsoft Bing搜索的RSS Feed转化为Hermes Agent搜索后端的尝试，不过有些失败。零Key零成本，但 Bing 的反爬蜜罐只能治标，建议当兜底而不是主力。
-- **[web-dashscope](web-dashscope/README.md)**: 将阿里云百炼平台提供的增强网页搜索工具和网页爬取工具MCP直接连接到Hermes Agent搜索后端，推荐使用。纯标准库手搓 MCP 协议，无需安装 mcp SDK；抓网页直接回 Markdown 正文而不是原始 HTML，省 token。
-- **[t2i-bailian](t2i-bailian/README.md)**: 将阿里云百炼平台上面提供的文生图模型以文生图后端的形式接入Hermes Agent，亲测Token Plan可用。
+- ~~**[web-dashscope](_archived-plugins-dont-use/web-dashscope/README.md)**: 将阿里云百炼平台提供的增强网页搜索工具和网页爬取工具MCP直接连接到Hermes Agent搜索后端，推荐使用。纯标准库手搓 MCP 协议，无需安装 mcp SDK；抓网页直接回 Markdown 正文而不是原始 HTML，省 token。~~**已废弃，功能并入 dashscope-native（web 搜索/正文提取通道）。**
+- ~~**[t2i-bailian](_archived-plugins-dont-use/t2i-bailian/README.md)**: 将阿里云百炼平台上面提供的文生图模型以文生图后端的形式接入Hermes Agent，亲测Token Plan可用。~~**已废弃，功能并入 dashscope-native（按量后端名 dashscope，Token Plan 名 dashscope-tp）。**
 
 ## 改善类
 - **[smart-terminal-cwd](smart-terminal-cwd/README.md)**: 可按系统、按会话类型配置终端默认目录的插件，在一定程度上改善 Hermes Agent 默认目录设置不清晰的问题。
@@ -82,3 +82,5 @@ Windows 与 Linux 实测过；macOS 理论上没有平台相关问题，但没�
 - DeepSeek-V4.1-Flash
 - DeepSeek-V4.1-Flash-1017
 - GLM-5.3
+- GPT-6.2-Sol
+- GPT-6.2-Astra

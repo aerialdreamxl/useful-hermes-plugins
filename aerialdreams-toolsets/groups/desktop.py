@@ -11,7 +11,7 @@ import sys
 import time
 
 from ..common import config
-from ..common.util import err, ok
+from ..common.util import err, ok, safe_output_path
 
 TOOLSET = "desktop-utils"
 _PS_SHOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -119,6 +119,9 @@ def _screenshot(args: dict) -> str:
     # 毫秒时间戳：同一秒连拍不再静默覆盖
     out = args.get("path") or os.path.join(
         config.scratch_dir("shots"), "shot_%s_%d.png" % (target, int(time.time() * 1000)))
+    out, path_error = safe_output_path(out, config.scratch_dir(), "screenshot path")
+    if path_error:
+        return err(path_error)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     x = int(args.get("x") or 0)
     y = int(args.get("y") or 0)
@@ -141,6 +144,11 @@ def _screenshot(args: dict) -> str:
         ps_err = (r.stderr or b"").decode("utf-8", "replace")[-300:]
     except Exception as e:
         ps_err = "%s: %s" % (type(e).__name__, str(e)[:200])
+    try:
+        if os.path.exists(out):
+            os.remove(out)
+    except OSError:
+        return err("screenshot 失败：输出路径在重试前无法清理")
     # Fallback: Pillow 在一次性子进程里截——父进程绝不设 DPI awareness（进程级且不可逆）。
     try:
         if target == "region":
@@ -171,7 +179,7 @@ _TOOLS = [
         "y": {"type": "integer", "description": "region: 左上 y"},
         "width": {"type": "integer", "description": "region: 宽"},
         "height": {"type": "integer", "description": "region: 高"},
-        "path": {"type": "string", "description": "输出 PNG 路径（默认 scratch）"},
+        "path": {"type": "string", "description": "输出 PNG 路径（默认 scratch；限 scratch 目录内，拒绝覆盖）"},
     }, [],
      "截屏到 PNG（full/region/window），返回路径供 vision_analyze。仅显式调用时动作。"),
 ]

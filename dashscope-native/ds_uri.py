@@ -7,6 +7,7 @@ dashscope URLs raise with the grammar printed, never fall through silently.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Optional
 
 SCHEME = "dashscope://"
@@ -49,9 +50,11 @@ def parse_dashscope_uri(base_url: str) -> Optional[DashScopeRef]:
     raw = str(base_url or "").strip()
     if not raw.lower().startswith(SCHEME):
         return None
-    body = raw[len(SCHEME):].strip().strip("/")
+    body = raw[len(SCHEME):].strip().rstrip("/")
     if not body:
-        raise DashScopeUriError(f"empty dashscope reference — {_USAGE}")
+        raise DashScopeUriError(f"empty dashscope reference in {raw!r} — {_USAGE}")
+    if "/" in body or "\\" in body:
+        raise DashScopeUriError(f"path segments not allowed in dashscope reference {raw!r} — {_USAGE}")
     if body.count("@") > 1:
         raise DashScopeUriError(f"multiple '@' in dashscope reference {raw!r} — {_USAGE}")
     region_part, _, workspace_part = body.partition("@")
@@ -61,6 +64,8 @@ def parse_dashscope_uri(base_url: str) -> Optional[DashScopeRef]:
         raise DashScopeUriError(f"missing region in {raw!r} — {_USAGE}")
     if region not in VALID_REGIONS:
         raise DashScopeUriError(f"unknown region {region!r} in {raw!r} — {_USAGE}")
-    if workspace is not None and any(c.isspace() for c in workspace):
-        raise DashScopeUriError(f"workspace id contains whitespace in {raw!r} — {_USAGE}")
+    if workspace is not None and (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", workspace)
+            or workspace.startswith("-") or workspace.endswith("-")):
+        raise DashScopeUriError(f"invalid workspace id in {raw!r} — {_USAGE}")
     return DashScopeRef(region=region, workspace=workspace)

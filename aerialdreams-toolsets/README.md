@@ -10,7 +10,7 @@ Hermes 个人工具箱：**一个插件包，五个工具套组**（32 个工具
 | `desktop-utils` | 2 | `clipboard` 读写、`screenshot`（full/region/window，PowerShell 截屏，无第三方依赖） |
 | `android-utils` | 2 | `androidadb`（devices/shell/push/pull/logcat/screenshot/install/uninstall/props/am/pm）、`androidfb`（devices/flash/reboot/oem） |
 
-五组默认全部注册；设置里可逐组关闭。`bilibili_unsafe` 的每个工具描述都带 `【需登录】`，写操作要求用户明确指令。
+`bilibili` / `multimedia-utils` / `desktop-utils` 默认注册；`bilibili_unsafe` 与 `android-utils` 两个高风险组**默认关闭**（schema 默认 false，代码里也有同款兜底），要用在设置里显式打开。`bilibili_unsafe` 的每个工具描述都带 `【需登录】`，写操作要求用户明确指令。
 
 ## 安装
 
@@ -43,10 +43,10 @@ hermes tools            # 应看到 5 行：🔌 Bilibili / Bilibili_unsafe / Mu
 | key | 默认 | 说明 |
 |---|---|---|
 | `group_bilibili_enabled` | true | 匿名组 |
-| `group_bilibili_unsafe_enabled` | true | 账号组 |
+| `group_bilibili_unsafe_enabled` | false | 账号组（高风险，默认关） |
 | `group_multimedia_enabled` | true | ffmpeg/ASR/Omni |
 | `group_desktop_enabled` | true | 剪贴板/截屏 |
-| `group_android_enabled` | true | adb/fastboot |
+| `group_android_enabled` | false | adb/fastboot（高风险，默认关） |
 | `multimedia_api_key_env` | `DASHSCOPE_API_KEY` | 百炼 Key 的环境变量名 |
 | `multimedia_base_url` | `https://dashscope.aliyuncs.com` | 百炼端点 |
 | `asr_sync_model` | `qwen3-asr-flash` | 短音频同步 |
@@ -58,7 +58,7 @@ hermes tools            # 应看到 5 行：🔌 Bilibili / Bilibili_unsafe / Mu
 | `omni_max_file_mb` | 7.4 | Base64 后需 <10MB，原始文件目标 |
 
 环境变量 `DASHSCOPE_API_KEY` 按你的环境设置即可（插件从环境变量或 `$HERMES_HOME/.env` 读取）。凭据（B 站登录）落在
-`$HERMES_HOME/plugins-data/aerialdreams-toolsets/credential.json`（原子写，0600）。
+`$HERMES_HOME/plugins-data/aerialdreams-toolsets/credential.json`（原子写）。落盘后尽力 `chmod 0600`：POSIX 下生效；Windows 上 `os.chmod` 只影响只读位、不等同权限隔离，实际隔离靠该文件位于当前用户目录的 NTFS ACL（同用户进程仍可读）。
 
 ## 用法示例
 
@@ -73,10 +73,10 @@ bili_login_check()                       # 轮询到 done 后凭据落盘
 bili_download_hd(bvid="BV...", quality=80)
 ffmpeg(action="probe", input="D:/x.mp4")
 ffmpeg(action="trim", input="D:/x.mp4", start=10, duration=30)
-dashscope_asr(action="transcribe", source="D:/a.mp3")                 # 同步
-dashscope_asr(action="transcribe", source="D:/long.mp3", timestamps=True)  # 异步
+dashscope_asr(action="transcribe", source="<scratch>/a.mp3")            # 同步（本地 source 限 scratch/plugin-data）
+dashscope_asr(action="transcribe", source="<scratch>/long.mp3", timestamps=True)  # 异步
 dashscope_asr(action="result", task_id="...")                          # 取结果
-dashscope_qwenomni_analysis(source="D:/v.mp4", prompt="这段视频讲了什么？")
+dashscope_qwenomni_analysis(source="<scratch>/v.mp4", prompt="这段视频讲了什么？")
 clipboard(action="read")
 screenshot(target="window")
 androidadb(action="devices")
@@ -95,6 +95,8 @@ androidfb(action="devices")
 - **截屏**：PowerShell + `System.Drawing` 实现（`common/screenshot.ps1`），DPI-aware，无需 Pillow；Pillow 仅作兜底。
 - **二维码**：内置 Nayuki `qrcodegen`（MIT）+ 纯 stdlib PNG 编码器（`common/qr.py`），所以在 `python -I` 隔离解释器里也能生成二维码，不依赖 `qrcode`/Pillow。
 - **adb/fastboot**：优先 `AERIALDREAMS_ADB` / `AERIALDREAMS_FASTBOOT` 环境变量，其次 PATH。`flash` / `oem`（fastboot）与 `shell` / `am` / `pm` / `install` / `uninstall`（adb）必须显式 `confirm=true`——这些动作要么不可逆、要么等于在设备上执行任意命令，模型被注入文本忽悠时不能一键执行。
+- **confirm 的诚实边界**：`confirm` 是模型自设参数，宿主不代审批——它挡的是"顺手误触"，挡不住被说服的模型；真正的闸门是 `group_android_enabled` 默认关（不打开组，这些工具根本不注册）与"仅在用户明确指令下执行"的纪律。
+- **输出/输入路径边界**：`bili_download(filename)`、`ffmpeg(output)`、`screenshot(path)`、`androidadb(pull local / screenshot path)` 一律钳制在 `$HERMES_HOME/cache/scratch/aerialdreams/` 的 realpath 范围内，越界直接报错；写路径默认拒绝覆盖已存在文件（bili_download 例外：允许重写 scratch 内自己的缓存）。`dashscope_asr / dashscope_qwenomni_analysis` 的本地 `source` 必须位于 scratch 或 plugin-data 的 realpath 范围内，且过媒体扩展名/MIME 与大小硬校验（base64 路径 10MB 上限），`~/.ssh`、`.env` 这类任意路径不会被读入 base64 或上传；http(s) URL 与 data URI（≤10MB 校验）行为保留。ffmpeg 的 `input/video/audio/subtitle` 保留任意本地路径工作流，但强制媒体扩展名/MIME + 2GB 大小校验。B 站流媒体下载 URL 走 HTTPS + host 白名单（bilibili.com / bilivideo.com(.cn) / hdslb.com），且不跟随重定向。
 - **不可信文本围栏**：B 站的标题、简介、UP 签名、评论、弹幕、字幕一律包进 ```` ```untrusted ```` 围栏并在首个字段前加一行固定警示（`[外部内容·不可信]`），内容里自带的连续反引号会被打断，防止"用代码块越狱"。字段层级与键名不变，`bvid`/`cid`/`author`/用户名等标识字段不围栏（下游过滤要能直接比较）。风险承认：UP 名/用户名仍是不围栏的窄通道，属刻意取舍。
 - **截屏**：PowerShell + `System.Drawing` 走主路径；Pillow 兜底改在**一次性子进程**里跑并设 Per-Monitor-V2 DPI——以前是父进程直接调 `SetProcessDpiAwareness`，那会把整个 Hermes 进程的 DPI 模式永久改掉，影响同进程里所有 GUI 代码。
 - **ffmpeg**：需要 PATH 上有 `ffmpeg`/`ffprobe`（以本机 PATH 为准）。

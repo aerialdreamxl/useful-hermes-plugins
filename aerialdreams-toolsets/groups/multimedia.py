@@ -17,7 +17,8 @@ import uuid
 
 from ..common import config
 from ..common import ffmpeg as ff
-from ..common.util import err, get_json, ok, post_json
+from ..common.util import (err, get_json, ok, post_json, safe_input_path,
+                           safe_output_path)
 
 TOOLSET = "multimedia-utils"
 
@@ -28,13 +29,102 @@ TOOLSET = "multimedia-utils"
 _FF_ACTIONS = {"probe", "convert", "trim", "mux", "extract_audio",
                "extract_frames", "thumbnail", "burn_subtitle", "gif"}
 
+_MEDIA_EXTS = {".aac", ".avi", ".flac", ".flv", ".m2ts", ".m4a", ".mka",
+               ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".ogg",
+               ".opus", ".ts", ".wav", ".webm", ".wma", ".wmv", ".3gp",
+               ".3g2"}
+_SUBTITLE_EXTS = {".ass", ".srt", ".ssa", ".vtt"}
+_LOCAL_MAX_BYTES = 100 * 1024 * 1024
+_FF_MAX_BYTES = 2 * 1024 * 1024 * 1024  # ffmpeg 不落内存，给工作流留余量
+_DATA_URI_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _local_roots() -> list:
+    return [config.scratch_dir(), config.plugin_data_dir()]
+
+
+def _media_file(path: str, label: str = "input", subtitle: bool = False,
+                max_bytes: int = _LOCAL_MAX_BYTES) -> tuple:
+    """Hard size + media extension/MIME gate on a local file."""
+    if not path:
+        return "", "%s 不能为空" % label
+    candidate = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+    if not os.path.isfile(candidate):
+        return "", "%s 需要存在的本地文件" % label
+    try:
+        size = os.path.getsize(candidate)
+    except OSError:
+        return "", "%s 本地文件不可读" % label
+    if size > max_bytes:
+        return "", "%s 本地文件超过 %dMB 上限" % (label, max_bytes // 1048576)
+    ext = os.path.splitext(candidate)[1].lower()
+    mime = _guess_mime(candidate)
+    if subtitle:
+        valid = ext in _SUBTITLE_EXTS
+    else:
+        valid = ext in _MEDIA_EXTS or mime.startswith(("audio/", "video/"))
+    if not valid:
+        return "", "%s 必须是音频/视频文件（按 MIME 或扩展名校验）" % label
+    return candidate, ""
+
+
+def _local_media(path: str, label: str = "source", subtitle: bool = False) -> tuple:
+    """ffmpeg 输入：媒体扩展名 + 大小硬校验（不落目录圈，保持既有转码工作流）。"""
+    return _media_file(path, label, subtitle, max_bytes=_FF_MAX_BYTES)
+
+
+def _data_uri_error(source: str) -> str:
+    try:
+        header, payload = source.split(",", 1)
+    except ValueError:
+        return "data URI 格式无效"
+    if not header.lower().startswith("data:"):
+        return "data URI 格式无效"
+    mime = header[5:].split(";", 1)[0].strip().lower()
+    if not mime.startswith(("audio/", "video/")):
+        return "data URI 必须是音频/视频 MIME"
+    if ";base64" in header.lower():
+        if ((len(payload) * 3) // 4) > _DATA_URI_MAX_BYTES:
+            return "data URI 超过 10MB 上限"
+        try:
+            raw_size = len(base64.b64decode(payload, validate=True))
+        except Exception:
+            return "data URI base64 无效"
+    else:
+        if len(payload) > _DATA_URI_MAX_BYTES:
+            return "data URI 超过 10MB 上限"
+        try:
+            raw_size = len(urllib.parse.unquote_to_bytes(payload))
+        except Exception:
+            return "data URI 编码无效"
+    return "data URI 超过 10MB 上限" if raw_size > _DATA_URI_MAX_BYTES else ""
+
+
+def _source(src: str, label: str = "source") -> tuple:
+    lower = src.lower()
+    if lower.startswith(("http://", "https://")):
+        return False, src, ""
+    if lower.startswith("data:"):
+        error = _data_uri_error(src)
+        return False, src, error
+    # 本地 source 会整读进 base64 / _upload_temp：圈死在 scratch/plugin-data 的
+    # realpath 范围内，挡掉 ~/.ssh、.env 这类任意路径外泄。
+    candidate, error = safe_input_path(src, _local_roots(), label)
+    if error:
+        return False, "", error
+    local, error = _media_file(candidate, label)
+    return bool(local), local, error
+
 
 def _out_path(args: dict, stem: str, ext: str) -> str:
     fn = args.get("output") or args.get("filename")
-    if fn:
-        os.makedirs(os.path.dirname(os.path.abspath(fn)), exist_ok=True)
-        return fn
-    return os.path.join(config.scratch_dir("media"), "%s_%s.%s" % (stem, int(time.time() * 1000), ext))
+    path = fn or os.path.join(config.scratch_dir("media"),
+                              "%s_%s.%s" % (stem, int(time.time() * 1000), ext))
+    path, error = safe_output_path(path, config.scratch_dir(), "输出路径")
+    if error:
+        raise ValueError(error)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def _stem(path: str) -> str:
@@ -46,14 +136,38 @@ def _ffmpeg(args: dict) -> str:
     if action not in _FF_ACTIONS:
         return err("action 只能是 " + ", ".join(sorted(_FF_ACTIONS)))
     inp = (args.get("input") or "").strip()
-    if action != "probe" and action != "mux" and not inp:
-        return err("需要 'input'")
+    video = ""
+    audio = ""
+    sub = ""
+    if action == "mux":
+        video = (args.get("video") or inp or "").strip()
+        audio = (args.get("audio") or "").strip()
+        if not video or not audio:
+            return err("mux 需要 'video' 与 'audio'")
+        video, error = _local_media(video, "video")
+        if error:
+            return err(error)
+        audio, error = _local_media(audio, "audio")
+        if error:
+            return err(error)
+        inp = video
+    else:
+        if not inp:
+            return err("需要 'input'")
+        inp, error = _local_media(inp, "input")
+        if error:
+            return err(error)
+    if action == "burn_subtitle":
+        sub = (args.get("subtitle") or "").strip()
+        if not sub:
+            return err("burn_subtitle 需要 'subtitle'（srt/ass 路径）")
+        sub, error = _local_media(sub, "subtitle", subtitle=True)
+        if error:
+            return err(error)
     if not ff.have_ffmpeg():
         return err("未找到 ffmpeg（PATH 或 AERIALDREAMS_FFMPEG）")
     try:
         if action == "probe":
-            if not inp or not os.path.exists(inp):
-                return err("probe 需要存在的本地文件")
             info = ff.probe(inp)
             fmt = info.get("format") or {}
             streams = [{"index": s.get("index"), "type": s.get("codec_type"),
@@ -68,52 +182,49 @@ def _ffmpeg(args: dict) -> str:
                        "format": fmt.get("format_name"), "streams": streams})
         if action == "convert":
             out = _out_path(args, _stem(inp), (args.get("format") or "mp4").lstrip("."))
-            r = ff.run(["-y", "-i", inp, "-c:v", "libx264", "-preset", "veryfast",
+            r = ff.run(["-n", "-i", inp, "-c:v", "libx264", "-preset", "veryfast",
                         "-c:a", "aac", "-b:a", "128k", out])
         elif action == "trim":
             start = float(args.get("start") or 0)
             dur = float(args.get("duration") or 0)
             out = _out_path(args, _stem(inp), os.path.splitext(inp)[1].lstrip(".") or "mp4")
-            cmd = ["-y", "-ss", str(start)]
+            cmd = ["-n", "-ss", str(start)]
             if dur > 0:
                 cmd += ["-t", str(dur)]
             cmd += ["-i", inp, "-c", "copy", out]
             r = ff.run(cmd)
         elif action == "mux":
-            video = args.get("video") or inp
-            audio = args.get("audio") or ""
-            if not video or not audio:
-                return err("mux 需要 'video' 与 'audio'")
             out = _out_path(args, _stem(video), "mp4")
-            r = ff.run(["-y", "-i", video, "-i", audio, "-c", "copy", out])
+            r = ff.run(["-n", "-i", video, "-i", audio, "-c", "copy", out])
         elif action == "extract_audio":
             fmt = (args.get("format") or "mp3").lstrip(".")
             out = _out_path(args, _stem(inp) + "_audio", fmt)
             if fmt == "m4a":
-                r = ff.run(["-y", "-i", inp, "-vn", "-c:a", "aac", "-b:a", "192k", out])
+                r = ff.run(["-n", "-i", inp, "-vn", "-c:a", "aac", "-b:a", "192k", out])
             else:
-                r = ff.run(["-y", "-i", inp, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out])
+                r = ff.run(["-n", "-i", inp, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out])
         elif action == "extract_frames":
             fps = float(args.get("fps") or 0)
             count = int(args.get("count") or 0)
-            outdir = args.get("output") or config.scratch_dir("frames", _stem(inp))
+            outdir = args.get("output") or os.path.join(
+                config.scratch_dir("frames"), "%s_%d" % (_stem(inp), int(time.time() * 1000)))
+            outdir, error = safe_output_path(outdir, config.scratch_dir(), "输出目录")
+            if error:
+                return err(error)
             os.makedirs(outdir, exist_ok=True)
             pattern = os.path.join(outdir, "frame_%04d.jpg")
-            cmd = ["-y", "-i", inp]
+            cmd = ["-n", "-i", inp]
             cmd += (["-vf", "fps=%s" % fps] if fps > 0 else ["-vframes", str(count or 12)])
             cmd += [pattern]
             r = ff.run(cmd)
         elif action == "thumbnail":
             t = float(args.get("time") or 0)
             out = _out_path(args, _stem(inp) + "_thumb", "jpg")
-            r = ff.run(["-y", "-ss", str(t), "-i", inp, "-vframes", "1", out])
+            r = ff.run(["-n", "-ss", str(t), "-i", inp, "-vframes", "1", out])
         elif action == "burn_subtitle":
-            sub = args.get("subtitle") or ""
-            if not sub:
-                return err("burn_subtitle 需要 'subtitle'（srt/ass 路径）")
             out = _out_path(args, _stem(inp) + "_sub", "mp4")
             esc = sub.replace("\\", "/").replace(":", "\\:")
-            r = ff.run(["-y", "-i", inp, "-vf", "subtitles='%s'" % esc,
+            r = ff.run(["-n", "-i", inp, "-vf", "subtitles='%s'" % esc,
                         "-c:v", "libx264", "-preset", "veryfast", "-c:a", "copy", out])
         else:  # gif
             start = float(args.get("start") or 0)
@@ -121,7 +232,7 @@ def _ffmpeg(args: dict) -> str:
             fps = float(args.get("fps") or 10)
             width = int(args.get("width") or 480)
             out = _out_path(args, _stem(inp) + "_gif", "gif")
-            r = ff.run(["-y", "-ss", str(start), "-t", str(dur), "-i", inp,
+            r = ff.run(["-n", "-ss", str(start), "-t", str(dur), "-i", inp,
                         "-vf", "fps=%s,scale=%d:-1:flags=lanczos" % (fps, width), out])
         if r.returncode != 0:
             tail = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
@@ -172,6 +283,14 @@ def _guess_mime(path: str) -> str:
 
 def _b64_data_uri(path: str) -> str:
     mime = _guess_mime(path)
+    if not (mime.startswith("audio/") or mime.startswith("video/")):
+        raise ValueError("本地媒体 MIME 不是音频/视频")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        raise ValueError("本地媒体文件不可读")
+    if size > _DATA_URI_MAX_BYTES:
+        raise ValueError("本地媒体超过 10MB Base64 上限")
     with open(path, "rb") as f:
         blob = f.read()
     return "data:%s;base64,%s" % (mime, base64.b64encode(blob).decode("ascii"))
@@ -356,7 +475,7 @@ def _asr_sync(path_or_url: str, language: str, prompt: str = "") -> dict:
     answer 400 "dedicated task asr does not support this input" (verified).
     """
     model = config.cfg("multimedia.asr.sync_model", "qwen3-asr-flash")
-    data = _b64_data_uri(path_or_url) if os.path.exists(path_or_url) else path_or_url
+    data = _b64_data_uri(path_or_url) if os.path.isfile(path_or_url) else path_or_url
     part = {"type": "input_audio", "input_audio": {"data": data}}
     payload = {"model": model,
                "messages": [{"role": "user", "content": [part]}],
@@ -373,7 +492,7 @@ def _asr_sync(path_or_url: str, language: str, prompt: str = "") -> dict:
 
 def _asr_submit(src: str, language: str, diarization: bool) -> dict:
     model = config.cfg("multimedia.asr.async_model", "qwen-audio-3.1-asr-flash-filetrans")
-    if os.path.exists(src):
+    if os.path.isfile(src):
         url = _upload_temp(src, model)
         extra = {"X-DashScope-OssResourceResolve": "enable"}
     else:
@@ -496,7 +615,9 @@ def _asr(args: dict) -> str:
     if not wait_seconds:
         wait_seconds = int(config.cfg("multimedia.asr.wait_seconds", 300))
     try:
-        local = os.path.exists(src)
+        local, src, source_error = _source(src)
+        if source_error:
+            return err(source_error)
         size = os.path.getsize(src) if local else 0
         # small local file + no timestamps -> sync flash (fast, cheap)
         if local and not timestamps and size <= 7 * 1024 * 1024:
@@ -562,15 +683,16 @@ def _compress_to_limit(path: str, limit_mb: float) -> tuple:
         dur = max(ff.duration_seconds(current), 0.1)
         target_bits = limit * 8 * 0.88
         vbr = max(int(target_bits / dur) - 64000, 120000)
-        out = os.path.join(outdir, "%s_comp%d.mp4" % (stem, attempt))
+        token = "%d_%s" % (int(time.time() * 1000), uuid.uuid4().hex[:8])
+        out = os.path.join(outdir, "%s_comp%d_%s.mp4" % (stem, attempt, token))
         if kind == "video":
-            r = ff.run(["-y", "-i", current, "-vf", "scale=-2:480",
+            r = ff.run(["-n", "-i", current, "-vf", "scale=-2:480",
                         "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(vbr),
                         "-maxrate", str(int(vbr * 1.3)), "-bufsize", str(int(vbr * 2)),
                         "-c:a", "aac", "-b:a", "64k", out])
         else:
-            out = os.path.join(outdir, "%s_comp%d.mp3" % (stem, attempt))
-            r = ff.run(["-y", "-i", current, "-vn", "-c:a", "libmp3lame",
+            out = os.path.join(outdir, "%s_comp%d_%s.mp3" % (stem, attempt, token))
+            r = ff.run(["-n", "-i", current, "-vn", "-c:a", "libmp3lame",
                         "-b:a", "48k", out])
         if r.returncode != 0 or not os.path.exists(out):
             note = "压缩失败，使用原文件"
@@ -583,12 +705,12 @@ def _compress_to_limit(path: str, limit_mb: float) -> tuple:
         # still too big -> cut at the limit boundary
         ratio = limit / float(size)
         cut = max(1.0, dur * ratio * 0.92)
-        cut_out = os.path.join(outdir, "%s_cut%d%s" % (stem, attempt,
+        cut_out = os.path.join(outdir, "%s_cut%d_%s%s" % (stem, attempt, token,
                                                         ".mp4" if kind == "video" else ".mp3"))
         if kind == "video":
-            r = ff.run(["-y", "-t", str(cut), "-i", current, "-c", "copy", cut_out])
+            r = ff.run(["-n", "-t", str(cut), "-i", current, "-c", "copy", cut_out])
         else:
-            r = ff.run(["-y", "-t", str(cut), "-i", current, "-c", "copy", cut_out])
+            r = ff.run(["-n", "-t", str(cut), "-i", current, "-c", "copy", cut_out])
         if r.returncode != 0 or not os.path.exists(cut_out):
             break
         note = "已截断到约 %.1f 秒（%gMB 上限）" % (cut, limit_mb)
@@ -610,7 +732,10 @@ def _omni(args: dict) -> str:
     truncated = 0.0
     note = ""
     try:
-        if os.path.exists(src):
+        local, src, source_error = _source(src)
+        if source_error:
+            return err(source_error)
+        if local:
             kind = _media_kind(src)
             work, truncated, note = _compress_to_limit(src, max_mb)
             data = _b64_data_uri(work)
@@ -662,7 +787,7 @@ _TOOLS = [
                             "extract_frames", "thumbnail", "burn_subtitle", "gif"],
                    "description": "probe=元数据; convert=转码; trim=裁剪; mux=音视频合并; extract_audio=提取音轨; extract_frames=抽帧; thumbnail=封面; burn_subtitle=烧字幕; gif=转GIF"},
         "input": {"type": "string", "description": "输入文件绝对路径"},
-        "output": {"type": "string", "description": "输出路径（可选，默认 scratch）"},
+        "output": {"type": "string", "description": "输出路径（可选；限 scratch 目录内，拒绝覆盖已存在文件）"},
         "video": {"type": "string", "description": "mux: 视频文件"},
         "audio": {"type": "string", "description": "mux: 音频文件"},
         "subtitle": {"type": "string", "description": "burn_subtitle: srt/ass 路径"},
@@ -678,7 +803,7 @@ _TOOLS = [
     ("dashscope_asr", _asr, {
         "action": {"type": "string", "enum": ["transcribe", "status", "result"],
                    "description": "transcribe=提交转写; status=查任务; result=取结果"},
-        "source": {"type": "string", "description": "本地路径或 http(s) URL"},
+        "source": {"type": "string", "description": "scratch/plugin-data 内本地路径、http(s) URL 或 data URI（≤10MB）"},
         "task_id": {"type": "string", "description": "status/result: 任务 id"},
         "language": {"type": "string", "description": "zh/en/ja/...（可选）"},
         "timestamps": {"type": "boolean", "description": "要时间戳（走 filetrans 异步）"},
@@ -687,7 +812,7 @@ _TOOLS = [
     }, ["action"],
      "DashScope 语音转写：短音频同步（qwen3-asr-flash），长音频/要时间戳走 filetrans 异步；等待超时会返回 task_id 并在完成后 steer 回会话。"),
     ("dashscope_qwenomni_analysis", _omni, {
-        "source": {"type": "string", "description": "本地音视频路径或 http(s) URL"},
+        "source": {"type": "string", "description": "scratch/plugin-data 内本地音视频、http(s) URL 或 data URI（≤10MB）"},
         "prompt": {"type": "string", "description": "自定义分析提示词（必填）"},
         "model": {"type": "string", "description": "Qwen-Omni 模型名，默认 qwen3.8-omni-flash"},
         "kind": {"type": "string", "enum": ["audio", "video"], "description": "URL 来源时显式指定媒体类型"},

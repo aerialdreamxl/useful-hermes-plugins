@@ -66,7 +66,8 @@ class Supervisor:
     def __init__(self, *, bus_dir: Path, worker_path: Path, home: Path, repo: Path,
                  version_fn, pet_cfg_fn, tray_enabled_fn, index_url_fn,
                  env_python_fn=None, spawn_fn=None, logger=None, vlog=None,
-                 stop_event=None, tick_s: float = 1.0):
+                 stop_event=None, tick_s: float = 1.0,
+                 approval_meta_fn=None, approval_handshake_fn=None):
         self.bus_dir = Path(bus_dir)
         self.worker_path = Path(worker_path)
         self.home = Path(home)
@@ -81,6 +82,8 @@ class Supervisor:
         self.vlog = vlog or (lambda msg: None)
         self.stop_event = stop_event
         self.tick_s = tick_s
+        self.approval_meta_fn = approval_meta_fn or (lambda: {})
+        self.approval_handshake_fn = approval_handshake_fn or (lambda: "")
         self.worker = None
         self.spawn_token = None
         self.fails = 0
@@ -143,6 +146,7 @@ class Supervisor:
             "restart_cmd": [sys.executable, "-m", "hermes_cli.main", "gateway", "restart"],
             "stop_cmd": [sys.executable, "-m", "hermes_cli.main", "gateway", "stop"],
             "cwd": str(self.repo),
+            "approval": self.approval_meta_fn(),
             "env": {**{k: v for k, v in os.environ.items() if k in keep},
                     "PYTHONPATH": str(self.repo)},
         }
@@ -158,10 +162,23 @@ class Supervisor:
                 keep = err_log.read_bytes()[-500_000:]
                 err_log.write_bytes(keep)
         fh = open(err_log, "ab")
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             [str(pyexe), "-I", "-X", "utf8=1", str(self.worker_path),
              "--meta", str(meta_path)],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=fh)
+        try:
+            if proc.stdin is None:
+                raise RuntimeError("worker stdin unavailable")
+            proc.stdin.write((self.approval_handshake_fn() + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except Exception:
+            with contextlib.suppress(Exception):
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            raise
+        return proc
 
     # ------------------------------------------------------------ 判活 ----
     def _heartbeat_ok(self, now: float) -> bool:

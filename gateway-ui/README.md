@@ -195,7 +195,7 @@ Fluent 设置窗口）/ 设置(VSCode) / 重启 / 退出。
 
 **机制**（官方 approval transport 正门，CONTRACT §11）：宿主注册 transport（惰性），
 审批到达 → present 在宿主 daemon 线程写 `approval_req.json`（脱敏命令/说明/四 choice）
-→ worker 弹窗 → 点击写 `approval_resp.json` → present 取回 `request.respond(choice)`
+→ worker 弹窗 → 点击经本地 IPC 送达（命名管道/unix socket，验 client PID+握手 token+digest+一次性消费）→ present 取回 `request.respond(choice)`；审批决定不再写 `approval_resp.json`（同用户进程伪造该文件=伪造放行，已根除；旧文件即使被预埋宿主也不读）
 注入 decision。policy/allowlist 持久化/YOLO 跳过全归宿主；digest 宿主绑定，插件不改算。
 
 **fail-closed**：worker 崩/没开开关/超时（timeout-5s 自终止）/turn 打断 → 一律 deny，
@@ -323,7 +323,7 @@ side-env python（`<HERMES_HOME>/environments/gateway-ui-qt/gen-*/venv/Scripts/p
 - test_bubble_wire.py — 余额气泡收口接缝：门控三态/toggle/跟随/无锚必收/零 settings_req/balance 块进 worker/sync_pet 接 on_click/托盘左键改绑同款+托盘锚定（34 断言）
 - test_bubble_focus.py — 气泡聚焦增强：气泡聚焦钉住演 review 行/reaction 仍最高优先/解除恢复游走/main 接缝置位/零 settings_req（21 断言）
 - test_approval_popup.py — 审批弹窗窗体+管理器（R28-3/4）：纯函数几何/倒计时/自绘盾牌/四按钮固定序+allowed_choices 置灰/样例零总线写/Esc 无效/req 驱动/门控/堆叠折叠角标/withdrawn 收窗/resp 修剪/answered 防重建（53 断言）
-- test_approval_wire.py — 审批弹窗 main 收口接缝：reload 收 approval 块/门控/管理器单例/sync req 驱动/样例钩子/点击写 approval_resp 而非 settings_req（A2）/tick 纳入审批同步（20 断言）
+- test_approval_wire.py — 审批弹窗 main 收口接缝：reload 收 approval 块/门控/管理器单例/sync req 驱动/样例钩子/点击经 IPC 送达、零 approval_resp 零 settings_req（A2）/tick 纳入审批同步（20 断言）
 - test_approval_cards.py — 审批弹窗设置页卡组+关于页通道（R28/R29）：三开关请求映射/样例钩子零请求/钩子未注入报错/缺键角标/程序化刷新不回写/ack 回滚/审批通道五态（未接管/仅本机+交还/仅本机⚠缺fallback/全接管/未启用⚠）/takeover 开关回滚（35 断言）
 
 测试纪律：测试根目录由 `HERMES_HOME` 环境变量解析（`tests/_env.py`，未设置即拒绝运行）；

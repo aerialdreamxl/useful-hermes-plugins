@@ -34,7 +34,7 @@ plugins:
 
 Agent 侧对应 `browser_switch` 工具（`provider` + `arg` + `headless` 参数），描述里写明了三档语义，模型会在你要求"换个浏览器/用我开着的窗口"时自行调用。
 
-切换是**会话作用域**的：状态纯内存、进程生命周期，新会话默认回到 `default`。每次 `browser_*` 工具派发前插件会做一次漂移检测（本会话想要的 ≠ 进程实际挂的 → 先换端点、重启 daemon，再放行工具调用），所以并发多会话各用各的后端不会互相踩到"忘了切回来"。
+切换状态是进程内的目标状态，但底层 CDP 环境变量/daemon 仍为进程级；并发多会话时可能 last-writer-wins，不能宣称已解决进程级隔离。
 
 ## ShardX 档的配置
 
@@ -48,7 +48,7 @@ Agent 侧对应 `browser_switch` 工具（`provider` + `arg` + `headless` 参数
 
 `cdp` 档与 `default` 档零配置。没有 ShardX 的用户完全不受影响——只是少一档。
 
-`cdp` 档的主机白名单（防模型被网页文本忽悠着把浏览器会话指到外部端点）：只放行 `localhost` / `127.0.0.0/8` / `::1` / `169.254/16` / `fe80::/10` / RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA `fc00::/7`。公网 IP、任何域名（含局域网单标签主机名、Tailscale `100.64/10`）一律拒绝，错误信息里会点名开关 `BROWSER_SWITCHER_ALLOW_REMOTE_CDP=1`——确实要连远端调试端口时由你显式开。校验发生在 `urlopen` 之前，且即使 `_discover_cdp_ws` 被替换，`_apply` 的 cdp 分支也会再拦一次。
+`cdp` 档的主机白名单（防模型被网页文本忽悠着把浏览器会话指到外部端点）：只放行 `localhost` / `127.0.0.0/8` / `::1` / `169.254/16` / `fe80::/10` / RFC1918（`10/8`、`172.16/12`、`192.168/16`）/ ULA `fc00::/7`。公网 IP、任何域名（含局域网单标签主机名、Tailscale `100.64/10`）一律拒绝；HTTP discovery 的最终 websocket URL 与 ShardX 返回的 CDP URL 都会再次检查 scheme/host。status/切换返回只显示 scheme、host、port，不显示 websocket path/GUID。
 
 ## 机制要点（为什么不用改核心）
 

@@ -9,8 +9,10 @@ present) 注册（惰性，须用户配 security.approval.transport: gateway-ui 
 职责：
 - 进程内 pending 表登记/注销（R28-5 await 状态权威源，表寿命=真实等待窗口）；
 - 写 approval_req.json（pending 全量快照，宿主单写者）；
-- 读 approval_resp.json（worker 单写者，宿主只读——消费=注销 pending+req 快照移除，
-  worker 下次写入按 req 快照修剪陈旧条目，消除跨进程读改写竞态）；
+- 经本地 IPC（approval_ipc.py，命名管道/AF_UNIX）收 worker 审批决定——五重校验
+  （client PID=租约 pid、租约新鲜、stdin 单传握手 token、spawn_token、宿主 digest）
+  过验入内存表，present 轮询一次性消费；审批决定**不落共享文件**（旧
+  approval_resp.json 同用户进程可伪造放行，结构性缺陷，已根除）；
 - 自终止线 timeout-5s / worker 死（tray_lease mtime 陈旧）/ 被取消 / 宿主 stop
   → 返回 no_response decision（choice 不在 allowed_choices → 宿主判 invalid
   fail-closed deny，归因 transport_invalid，**不冒充用户拒绝**）；
@@ -27,11 +29,13 @@ force=True），原样透传零再加工。字段白名单：绝无消息正文/
 from __future__ import annotations
 
 import json
+import hmac
 import threading
 import time
 from pathlib import Path
 
-from .bus import read_json, write_json
+from . import approval_ipc
+from .bus import write_json
 from .statemachine import NOTICE_PLATFORMS  # R29 本地判定双保险（desktop/tui/cli）
 
 # 自终止线 = 宿主 timeout - 5s（抢在宿主 deadline 前返回 no_response，归因 invalid
@@ -49,6 +53,10 @@ _REQ_SEQ = 0
 _BUS_DIR: Path | None = None
 _STOP = None
 _LOGGER = None
+_IPC_SERVER = None
+_IPC_ENDPOINT = ""
+_IPC_TOKEN = ""
+_RESPONSES: dict = {}       # request_id -> choice，宿主消费一次即删除
 # R29 平台分流：present 读 approval 块（platform_takeover 等）的宿主侧配置探针
 # （register 注入 cfg_fn；读不到按默认——不接管——处理，安全侧）。
 _PRESENT_CFG_FN = None
@@ -99,6 +107,13 @@ def init(bus_dir, stop_event=None, logger=None, cfg_fn=None) -> None:
     """register() 调用：绑定总线目录/stop/日志/approval 块读探针，清空上一轮残留。
     cfg_fn 供 R29 分流现读 platform_takeover（每次 present 现读，设置页改完即生效）。"""
     global _BUS_DIR, _STOP, _LOGGER, _PRESENT_CFG_FN
+    global _IPC_SERVER, _IPC_ENDPOINT, _IPC_TOKEN
+    if _IPC_SERVER is not None:
+        try:
+            _IPC_SERVER.close()
+        except Exception:
+            pass
+        _IPC_SERVER = None
     _BUS_DIR = Path(bus_dir)
     _STOP = stop_event
     _LOGGER = logger
@@ -106,6 +121,43 @@ def init(bus_dir, stop_event=None, logger=None, cfg_fn=None) -> None:
     with _LOCK:
         _PENDING.clear()
         _SESSION_HINTS.clear()
+        _RESPONSES.clear()
+    try:
+        _IPC_ENDPOINT = approval_ipc.new_endpoint(_BUS_DIR)
+        _IPC_TOKEN = approval_ipc.new_handshake()
+        _IPC_SERVER = approval_ipc.ApprovalResponseServer(
+            _IPC_ENDPOINT, _receive_ipc, logger=logger)
+        _IPC_SERVER.start()
+    except Exception as exc:
+        _IPC_ENDPOINT = ""
+        _IPC_TOKEN = ""
+        _log(f"approval IPC unavailable (fail-closed): {type(exc).__name__}")
+
+
+def shutdown() -> None:
+    """停止本轮 IPC 监听；旧 worker 的响应不再进入新一轮宿主。"""
+    global _IPC_SERVER, _IPC_ENDPOINT, _IPC_TOKEN
+    server = _IPC_SERVER
+    _IPC_SERVER = None
+    _IPC_ENDPOINT = ""
+    _IPC_TOKEN = ""
+    with _LOCK:
+        _RESPONSES.clear()
+    if server is not None:
+        try:
+            server.close()
+        except Exception:
+            pass
+
+
+def worker_meta() -> dict:
+    """给 side-env worker 的公开端点；握手 token 只走 Supervisor 的 stdin。"""
+    return {"approval_endpoint": _IPC_ENDPOINT} if _IPC_ENDPOINT else {}
+
+
+def worker_handshake() -> str:
+    """返回当前 worker 启动握手；调用方只能通过 stdin 传递。"""
+    return _IPC_TOKEN
 
 
 # ------------------------------------------------------------ 权威源 ----
@@ -186,20 +238,53 @@ def _append_withdrawn(rid: str, reason: str) -> None:
         pass
 
 
-def _read_resp_choice(rid: str):
-    """只读 approval_resp.json，取本 request_id 的 choice（宿主不重写该文件）。"""
+def _worker_identity():
+    """读取当前租约的真实 worker PID 和 spawn token。"""
     if _BUS_DIR is None:
-        return None
+        return 0, ""
     try:
-        data = read_json(_BUS_DIR / "approval_resp.json", None)
-        if not isinstance(data, dict):
-            return None
-        for e in data.get("entries") or []:
-            if isinstance(e, dict) and str(e.get("request_id")) == rid:
-                return str(e.get("choice") or "")
+        p = _BUS_DIR / "tray_lease.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return int(data.get("pid") or 0), str(data.get("spawn_token") or "")
     except Exception:
-        pass
-    return None
+        return 0, ""
+
+
+def _receive_ipc(payload: dict, peer_pid: int) -> dict:
+    """验收 side-env 的一次审批决定；失败全部拒绝且不改变 pending。"""
+    if not isinstance(payload, dict):
+        return {"ok": False}
+    rid = str(payload.get("request_id") or "")
+    digest = str(payload.get("digest") or "")
+    choice = str(payload.get("choice") or "")
+    token = str(payload.get("token") or "")
+    sent_spawn = str(payload.get("spawn_token") or "")
+    with _LOCK:
+        entry = _PENDING.get(rid)
+        if entry is None:
+            return {"ok": False}
+        expected_pid, expected_spawn = _worker_identity()
+        request = entry["request"]
+        if not peer_pid or peer_pid != expected_pid or not _worker_alive():
+            return {"ok": False}
+        if not _IPC_TOKEN or not hmac.compare_digest(token, _IPC_TOKEN):
+            return {"ok": False}
+        if not hmac.compare_digest(sent_spawn, expected_spawn):
+            return {"ok": False}
+        if not hmac.compare_digest(digest, str(request.digest or "")):
+            return {"ok": False}
+        if choice not in tuple(request.allowed_choices):
+            return {"ok": False}
+        if rid in _RESPONSES:
+            return {"ok": False}
+        _RESPONSES[rid] = choice
+    return {"ok": True}
+
+
+def _read_resp_choice(rid: str):
+    """一次性消费内存中的 IPC 决定；不再读取 approval_resp.json。"""
+    with _LOCK:
+        return _RESPONSES.pop(rid, None)
 
 
 def _worker_alive() -> bool:

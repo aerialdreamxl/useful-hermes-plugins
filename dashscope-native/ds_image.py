@@ -205,6 +205,10 @@ def _parse_doc_page(html: str) -> Dict[str, str]:
     return (out)
 
 
+_ENRICH_MAX_ITEMS = 24
+_ENRICH_DEADLINE_S = 45.0
+
+
 def _fetch_doc_enrichment(model_id: str) -> Dict[str, str]:
     """One official doc page per model; dated ids retry on the undated base page."""
     import urllib.request
@@ -302,16 +306,18 @@ class BailianImageGenProvider(ImageGenProvider):
         return (out or None)
 
     def _enrich(self, models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fill missing strengths/price from official doc pages (bounded, sequential).
+        """Fill strengths/price from official doc pages with bounded work.
 
         Runs only under discover_models=true and only for entries lacking BOTH
         fields; enriched results are persisted by the caller. A doc-page failure
         leaves the entry untouched — blank is honest, invented is not.
         """
         out = []
-        for entry in models:
+        deadline = time.monotonic() + _ENRICH_DEADLINE_S
+        for index, entry in enumerate(models):
             entry = dict(entry)
-            if not entry.get("strengths") and not entry.get("price"):
+            if index < _ENRICH_MAX_ITEMS and time.monotonic() < deadline \
+                    and not entry.get("strengths") and not entry.get("price"):
                 info = _fetch_doc_enrichment(str(entry.get("id") or ""))
                 entry["strengths"] = info["strengths"]
                 entry["price"] = info["price"]

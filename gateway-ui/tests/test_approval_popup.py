@@ -14,6 +14,7 @@ from pathlib import Path
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "worker"))
+sys.path.insert(0, str(HERE.parent))   # approval_ipc（宿主侧包根）
 sys.path.insert(0, str(HERE))
 from _env import scratch  # noqa: E402
 BUS = scratch("gui28-approval-popup")
@@ -37,6 +38,17 @@ def ck(name, ok):
 def clean():
     for f in BUS.glob("approval_*"):
         f.unlink(missing_ok=True)
+    SENT.clear()
+
+
+# IPC 替身：真窗点击不得写共享目录，只能发本地 IPC
+SENT = []
+def _fake_send(endpoint, payload, timeout=1.5):
+    SENT.append({"endpoint": endpoint, "payload": payload})
+    return {"ok": True}
+
+
+ap.ApprovalResponseClient = type("R", (), {"send": staticmethod(_fake_send)})
 
 
 def make_req(rid="r1", choices=("once", "session", "always", "deny"), expires=None):
@@ -157,11 +169,13 @@ mgr._on_choice("r1", "d-r1", "once")
 app.processEvents()
 ck("mgr: choice removes popup", "r1" not in mgr.popups)
 ck("mgr: answered marked", "r1" in mgr._answered)
-resp = json.loads((BUS / "approval_resp.json").read_text(encoding="utf-8"))
-ck("mgr: resp written", len(resp["entries"]) == 1)
-ck("mgr: resp choice once", resp["entries"][0]["choice"] == "once")
-ck("mgr: resp digest echoed", resp["entries"][0]["digest"] == "d-r1")
-ck("mgr: resp request_id", resp["entries"][0]["request_id"] == "r1")
+ck("mgr: resp never touches shared dir", not (BUS / "approval_resp.json").exists())
+ck("mgr: resp sent over IPC once", len(SENT) == 1)
+p = SENT[0]["payload"]
+ck("mgr: ipc choice once", p["choice"] == "once")
+ck("mgr: ipc digest echoed", p["digest"] == "d-r1")
+ck("mgr: ipc request_id", p["request_id"] == "r1")
+ck("mgr: ipc carries handshake fields", "token" in p and "spawn_token" in p)
 # host 未消费前 sync 不重建（answered 防重建）
 mgr.sync()
 ck("mgr: answered prevents rebuild", "r1" not in mgr.popups)
@@ -180,9 +194,9 @@ mgr._on_choice("r1", "d-r1", "once")     # resp 含 r1
 write_req([make_req("r2")])               # host 消费 r1（离开 req）
 mgr.sync()
 mgr._on_choice("r2", "d-r2", "deny")     # 写 r2 时修剪 r1
-resp = json.loads((BUS / "approval_resp.json").read_text(encoding="utf-8"))
-ids = {e["request_id"] for e in resp["entries"]}
-ck("mgr: stale resp pruned", ids == {"r2"})
+ids = [s["payload"]["request_id"] for s in SENT]
+ck("mgr: each click sends exactly its own request", ids == ["r1", "r2"])
+ck("mgr: shared resp file still absent", not (BUS / "approval_resp.json").exists())
 
 # withdrawn 收窗
 clean()

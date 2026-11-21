@@ -190,13 +190,20 @@ def _freezes_path() -> str:
 
 
 def _atomic_json(path: str, data: dict) -> bool:
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=_dir(), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, path)
+        tmp = None
         return True
     except Exception as exc:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         logger.warning("paperhermes: atomic json write failed for %s (%s)", path, exc)
         return False
 
@@ -328,6 +335,7 @@ def _load_freezes() -> None:
 
 def _persist_freezes() -> bool:
     """原子写全部快照。首请求修改载荷前必须先落盘成功（13.2 步骤4）。"""
+    tmp = None
     try:
         payload = {"version": engine.SNAPSHOT_VERSION,
                    "sessions": dict(_snapshots)}
@@ -335,8 +343,14 @@ def _persist_freezes() -> bool:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, _freezes_path())
+        tmp = None
         return True
     except Exception as exc:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         logger.warning("paperhermes: freeze persist failed (%s)", exc)
         return False
 
@@ -356,12 +370,19 @@ def _load_hints() -> dict:
 
 
 def _save_hints(hints: dict) -> None:
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=_dir(), suffix=".hints")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(hints, f, ensure_ascii=False)
         os.replace(tmp, _hints_path())
+        tmp = None
     except Exception as exc:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         logger.debug("paperhermes: hints save failed: %s", exc)
 
 
@@ -560,6 +581,11 @@ def _spill(snap: dict, sid: str, tool_name: str, text: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     omitted = len(text) - head - tail
+    # v0.5.5 卫生：spill 载荷可能含敏感输出，落盘后尽力收紧 0600（失败只当没发生）。
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return engine.spill_render(text[:head], text[-tail:] if tail else "", omitted, path)
 
 

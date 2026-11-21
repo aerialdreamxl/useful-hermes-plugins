@@ -30,7 +30,7 @@ hermes package out.zip --include-secrets   # 连 .env/config.yaml/credential/*.d
 - **不吃掉自己**：输出文件在 home 内也会自动跳过。
 - **链接与 junction 跳过**：不跟随符号链接/目录联接打包（防环、防越界）。
 - **包内清单**：zip 根部有 `_hermes-pack-manifest.json`，记录来源 home、主机名、文件数、原始字节、打包时 gateway 是否在跑——新机恢复时先看它。
-- **敏感面默认不进包**：`.env`、`.env.*`、`config.yaml`（仅根级）、credential/advanced-providers 凭据、`*.db` 及其 `-wal`/`-shm` 旁文件、`*.sqlite*` 默认被排除，启动时会把这条规则打印出来。要整库同迁：`--include-secrets`；只想救回数据库而仍排除密钥：在 `--exclude-file` 里写 `!*.db` / `!*.db-wal`（否定规则后匹配优先）。
+- **敏感面默认不进包**：`.env`、`.env.*`、`config.yaml`、根级 `auth.json`/`auth.lock`、共享 OAuth 凭据、OAuth/JWT 凭据、`mcp-tokens/`/`vault/`/`pairing/` 等 token/session 凭据目录、Webapp/browser 凭据、credential/advanced-providers 凭据、凭据后缀的 `*.token`/`*.session`/`*.cookie` 文件、`*.db` 及其 `-wal`/`-shm` 旁文件、`*.sqlite*` 默认被排除，启动时会把这条规则打印出来；普通模型缓存和历史文件不会因名称含 `token`/`session` 就被整类误杀。要整库同迁：`--include-secrets`；只想救回数据库而仍排除密钥：在 `--exclude-file` 里写 `!*.db` / `!*.db-wal`（否定规则后匹配优先）。
 - **拒绝覆盖是原子的**：写盘前用独占创建占位，同目标二跑必被拒，不会在长时间扫描后被静默覆盖。
 - **`*.db-wal` / `*.db-shm` 跟着主库一起排除**：它们必须与主库同迁才有意义，只带旁车文件等于丢写入——所以要么 `--include-secrets` 整组带上，要么用 `!` 规则把 `*.db` 与 `*.db-wal` 一起救回。
 
@@ -45,13 +45,13 @@ hermes package out.zip --include-secrets   # 连 .env/config.yaml/credential/*.d
 | `*.lock` | 任意深度的文件名 glob |
 | `!<pattern>` | 否定规则，放行前面误杀的 |
 
-内置黑名单按四类组织：①可再生大件（`hermes-agent/` 源码树、`installs/`、`tools/`、`cache/`、venv、gateway 服务目录——通常是体积大头）②运行时状态目录（logs、telemetry、locks、各类缓存 json、会话暂存）③死物快照（`state-snapshots/`、`backups/`、`*.bak*`、`*.orig`、`*.tmp`）④敏感面（`SECRET_EXCLUDES`：`.env`/`.env.*`/根级 `config.yaml`/`credential*.json|txt`/`.advanced-custom-providers.json`/`*.db`/`*.db-wal`/`*.db-shm`/`*.sqlite*`；`--include-secrets` 只摘掉这一组）。清单以 `pack_engine.py` 的 `DEFAULT_EXCLUDES` 为准，一眼能审。
+内置黑名单按四类组织：①可再生大件（`hermes-agent/` 源码树、`installs/`、`tools/`、`cache/`、venv、gateway 服务目录——通常是体积大头）②运行时状态目录（logs、telemetry、locks、各类缓存 json、会话暂存）③死物快照（`state-snapshots/`、`backups/`、`*.bak*`、`*.orig`、`*.tmp`）④敏感面（`SECRET_EXCLUDES`：`.env`/`.env.*`/根级 `config.yaml`/`auth.json`/`auth.lock`/共享 OAuth/OAuth-JWT/credential 文件与 token/session 凭据目录/`webapp`/`browser-profile`/`.advanced-custom-providers.json`/`*.db`/`*.db-wal`/`*.db-shm`/`*.sqlite*`；`--include-secrets` 只摘掉这一组）。普通模型缓存和历史文件不按名称含 `token`/`session` 整类排除。清单以 `pack_engine.py` 的 `DEFAULT_EXCLUDES` 为准，一眼能审。
 
 ## 新机恢复
 
-解压到新的 `$HERMES_HOME`，装 Hermes 本体（pip/uv 都行），启动。可再生部分会自动重建；插件、技能、会话库、`SOUL.md` 等随包到位。**`config.yaml`、`.env`、记忆库默认不在包里**：恢复后要自己补配置与密钥；要连记忆库一起搬，用 `--include-secrets` 重打一次（或用 `!` 规则只救数据库）。
+解压到新的 `$HERMES_HOME`，装 Hermes 本体（pip/uv 都行），启动。可再生部分会自动重建；插件、技能、会话库、`SOUL.md` 等随包到位。**`config.yaml`、`.env`、`auth.json`、共享 OAuth/OAuth-JWT 凭据、token/session 凭据目录、记忆库默认不在包里**：恢复后要自己补配置与密钥；要连记忆库一起搬，用 `--include-secrets` 重打一次（或用 `!` 规则只救数据库）。
 
 ## 已知局限
 
 - 黑名单是按 Hermes 典型数据布局盘点的（2026-10 实测盘点产物），如果你的 home 里有别的实例级大件（比如自己塞的数据集），用 `--exclude-file` 追加，或先用 `--dry-run` 的清单确认体积构成。
-- 打包不做跨机密钥轮换：敏感面（`.env` 里的 Key、`config.yaml`、记忆库）默认不进包；显式 `--include-secrets` 时它们原样进 zip，而 zip 本身不加密，**保管好它**。
+- 打包不做跨机密钥轮换：敏感面（`.env` 里的 Key、`config.yaml`、`auth.json`、共享 OAuth/OAuth-JWT、token/session 凭据、记忆库）默认不进包；显式 `--include-secrets` 时它们原样进 zip，而 zip 本身不加密，**保管好它**。

@@ -915,7 +915,7 @@ list_active_subagents` import 链连通；全量 28 套件 fail=0。
 - **R28-2 present_fn 桥接**（宿主 daemon 线程内，阻塞合法）：
   1. 登记进程内 pending 表 `{request_id: RequestEntry}`（R28-5 权威源）；
   2. 写总线 `approval_req.json`（清单见 §12.3），worker 侧 watcher 读入；
-  3. 轮询 `approval_resp.json`（0.25s），命中同 `request_id` 条目即取回并原子消费
+  3. 轮询内存决定表（0.25s），worker 经本地 IPC 送达（client PID=当前租约 pid + stdin 握手 token + spawn_token + 宿主 digest 五重校验，命中即一次性消费）
      （读走即删该条）；
   4. 自终止线 = `request.timeout_seconds - 5s`：到点未获决策则返回一个 choice 写
      `"no_response"` 的 decision → 宿主判 `invalid` fail-closed deny，**归因
@@ -935,10 +935,13 @@ list_active_subagents` import 链连通；全量 28 套件 fail=0。
   `choice ∉ allowed_choices` 的按钮置灰禁用（smart-DENY 收缩自动落位），拒绝恒在。
   并发多条：每 request 一窗，纵向堆叠（最近者占主位，>4 条时旧位折叠为计数角标）；
   单窗点击即滑出，其余上移补位。Esc/点窗外**无效**（审批面不响应弃焦，超时归宿主判）。
-- **R28-4 信号注入**：按钮点击 → 写 `approval_resp.json` 追加条目
-  `{request_id, digest, choice}`（tmp+rename 原子），choice 映射：永远放行=always、
-  会话放行=session、单次放行=once、拒绝=deny。worker 只回显 req 里原样带来的
-  request_id/digest 对，语义转换零加工。
+- **R28-4 信号注入（IPC 化，审计修复轮）**：按钮点击 → 经 `approval_ipc.py` 本地
+  IPC（Windows 命名管道 / AF_UNIX socket）发送 `{request_id, digest, choice, token,
+  spawn_token}`。宿主 `_receive_ipc` 五重校验：client PID=当前租约 pid、租约新鲜、
+  握手 token（spawn 后经 stdin 单传、不落盘）、spawn_token、digest，全过才入内存
+  决定表且一次性消费（重复/伪造一律拒）。choice 映射不变：永远放行=always、
+  会话放行=session、单次放行=once、拒绝=deny。**审批决定绝不写共享目录**——
+  旧 approval_resp.json 同用户可伪造放行（结构性缺陷，已根除）。
 - **R28-5 await_input 状态稳定化（主人点名根治"乱跳"）**：
   - 现状病根：等待人类输入靠 notice 瞬时事件（闪 6s 即灭），等待期灯态回绿，
     与"人还没答"矛盾；事件到达序与 TTL 交叠造成跳变。
@@ -969,8 +972,7 @@ list_active_subagents` import 链连通；全量 28 套件 fail=0。
   session_key(≤16), pattern_key, allowed_choices, timeout_seconds, expires_ts}]}`。
   字段全白名单——command/description 为宿主**已强制脱敏**副本，本插件零再加工零
   原文落盘；密钥字面量脱敏断言沿用 §10 管线。
-- `approval_resp.json`（worker 写，宿主消费即清；atomic）：
-  `{entries:[{request_id, digest, choice, clicked_ts}]}`。
+- 审批决定回传：本地 IPC（approval_ipc.py），不落共享文件（见 R28-4）。
 - `approval_withdrawn.jsonl`（宿主追加，worker 消费）：`{request_id, reason, ts}`，
   reason ∈ withdrawn/completed/expired；worker 据此收窗（防"宿主已判、弹窗还挂着"）。
 - 三文件均入 `<HERMES_HOME>/cache/gateway-ui/`，签名去重与 mtime 纪律沿用 §5。

@@ -121,13 +121,13 @@ def _entry_stamp(entry: dict):
 def _expired(entry, now: float) -> bool:
     """True when the entry is older than ``SESSION_TTL_DAYS``.
 
-    An entry with no usable timestamp is kept: this module fails open, and
-    dropping a live takeover over a formatting hiccup is the worse failure.
+    An entry with no usable timestamp is also expired: a takeover we cannot age
+    must not be revived across restarts, so hydrate refuses it.
     """
     if not isinstance(entry, dict):
-        return False
+        return True
     stamp = _entry_stamp(entry)
-    return stamp is not None and (now - stamp) > SESSION_TTL_DAYS * 86400
+    return stamp is None or (now - stamp) > SESSION_TTL_DAYS * 86400
 
 
 def _load_uncached(path: Path):

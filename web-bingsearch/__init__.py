@@ -329,46 +329,75 @@ def crawlBing2RawHtmlSearch(queue: str, fingerprint: str = None, stealth: bool =
 
 def crawlUrlRawHtmlStealth(url: str):
     """伪装版抓任意 URL（extract 用）：桌面指纹 + 伪装头 + Bing Referer。
-    只编码非安全字符，保留 :/?#&= 结构字符（同 v1.0 crawlUrlRawHtml）。"""
+    F18：primp 默认会自己跟随重定向——实测确认"检查最终 URL"发生在请求已经
+    打到重定向目标之后，等于先访问再拒。改成手动逐跳：每跳先过闸门再发下一跳。"""
     import primp
-    from urllib.parse import quote
-    client=primp.Client(impersonate=pickNextDesktopFingerprint(), timeout=30)
+    from urllib.parse import quote, urljoin
+    client=primp.Client(impersonate=pickNextDesktopFingerprint(), timeout=30, follow_redirects=False)
     headers=makeStealthHeaders()
     headers["Referer"]="https://cn.bing.com/"
     headers["Cookie"]="MUID="+makeFakeMUID()
-    resp=client.get(quote(url, safe=":/?#&=@%+~!$'()*,"), headers=headers)
-    rawHtml=resp.text
-    return(rawHtml)
+    current=url
+    for _hop in range(6):
+        reason=checkExtractUrlAllowed(current)
+        if(reason is not None):
+            raise RuntimeError("blocked url: "+reason)
+        resp=client.get(quote(current, safe=":/?#&=@%+~!$'()*,"), headers=headers)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location=resp.headers.get("location") or ""
+            if(not location):
+                raise RuntimeError("redirect without a Location header")
+            current=urljoin(current, location)
+            continue
+        return(resp.text)
+    raise RuntimeError("too many redirects (possible redirect loop)")
 
 def isPrivateFetchHost(host: str):
-    """内网/环回/保留段判定（F18 SSRF 探测面）：IP 字面量走标准库 ipaddress，
-    localhost 一族直接拒。域名不在本函数处理（解析到内网 IP 的域名挡不住，见 README 风险段）。
+    """内网/环回/保留段判定（F18 SSRF 探测面）。
+    数字 host 必须是标准、完整 IP；无法由 ipaddress 解析的数字形态一律拒绝。
+    域名会检查 getaddrinfo 的所有结果；解析失败不等于私网，避免误杀所有公网域名。
     返回 True=不许抓。"""
     import ipaddress
-    h=(host or "").strip().lower()
+    import re
+    import socket
+    h=(host or "").strip().lower().rstrip(".")
     if(h.startswith("[") and h.endswith("]")):
-        h=h[1:-1]  # urlsplit 已剥 IPv6 括号，这里兜一层手写调用
-    h=h.split("%")[0]  # IPv6 zone id（fe80::1%eth0）
+        h=h[1:-1]
+    h=h.split("%")[0]
     if(not h):
         return(True)
     if(h == "localhost" or h.endswith(".localhost")):
         return(True)
-    try:
-        ip=ipaddress.ip_address(h)
-    except ValueError:
-        return(False)  # 不是 IP 字面量：域名放行，交给 DNS/网络层
+    is_numeric=bool(re.fullmatch(r"[0-9.]+", h)) or bool(re.fullmatch(r"0[xX][0-9a-fA-F]+", h))
+    if(is_numeric):
+        try:
+            ip=ipaddress.ip_address(h)
+        except ValueError:
+            return(True)
+    else:
+        try:
+            ip=ipaddress.ip_address(h)
+        except ValueError:
+            try:
+                infos=socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                return(False)
+            resolved=set()
+            for item in infos:
+                addr=(item[4][0] if item and len(item) > 4 and item[4] else "")
+                if(addr):
+                    resolved.add(str(addr).split("%", 1)[0])
+            if(not resolved):
+                return(False)
+            return(any(isPrivateFetchHost(str(addr)) for addr in resolved))
     return(
         ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
         or ip.is_multicast or ip.is_unspecified
     )
 
 def checkExtractUrlAllowed(url: str):
-    """extract 入口 URL 校验（F18）：只放行 http/https，IP 字面量不得落内网/保留段。
-    模型可控 URL 直接喂 primp 等于给 SSRF 探测面——错误消息里写明放行开关。
-    环境变量 BING_ALLOW_PRIVATE_FETCH=1 放行内网（自家 NAS / 内网 wiki 场景）。
-    返回 None=放行，否则返回错误串。"""
-    if(os.environ.get("BING_ALLOW_PRIVATE_FETCH") == "1"):
-        return(None)
+    """extract 入口 URL 校验（F18）：scheme 先行，只放行 http/https。
+    BING_ALLOW_PRIVATE_FETCH=1 只豁免私网/解析检查，绝不豁免 scheme 或 host 语法。"""
     from urllib.parse import urlsplit
     raw=str(url or "").strip()
     if(not raw):
@@ -383,7 +412,7 @@ def checkExtractUrlAllowed(url: str):
     host=parts.hostname or ""
     if(not host):
         return("blocked url: no host in %r" % raw)
-    if(isPrivateFetchHost(host)):
+    if(os.environ.get("BING_ALLOW_PRIVATE_FETCH") != "1" and isPrivateFetchHost(host)):
         return("blocked private/loopback host %r (SSRF guard; set BING_ALLOW_PRIVATE_FETCH=1 to allow)" % host)
     return(None)
 
@@ -756,6 +785,23 @@ def _terminateAndReap(proc):
     except Exception:
         pass
 
+def _workerEnvironment():
+    """构造最小 worker 环境：只传运行所需的路径、代理、编码与临时目录。"""
+    import os
+    keep_exact=(
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC",
+        "PYTHONPATH", "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMP", "TEMP", "TMPDIR",
+        # v1.4 验收闸旗标（非密钥）：子进程 main() 与父进程要按同一开关判 test_hook
+        "HERMES_BING_ALLOW_TEST_HOOKS",
+        # SSRF 闸的纯开关（非密钥）：子进程复查最终 URL 时要与父进程同一豁免口径
+        "BING_ALLOW_PRIVATE_FETCH",
+    )
+    env={key: value for key, value in os.environ.items() if key in keep_exact}
+    return(env)
+
 def _spawnSearchWorker(env: dict):
     """起 _search_worker.py 子进程。Windows CREATE_NEW_PROCESS_GROUP / Unix start_new_session。
     stderr=DEVNULL：话痨子进程会把只读 stdout 的 drain 堵死（官方注释）。"""
@@ -824,7 +870,7 @@ def _runWorkerBounded(request: dict, timeoutSecs: int, label: str = "search"):
     import time
     global _lastWorkerProc
     secs=max(1, int(timeoutSecs))  # 0 秒 = 每次立刻超时，钳到 1
-    env=dict(os.environ)
+    env=_workerEnvironment()
     proc=_spawnSearchWorker(env)
     _lastWorkerProc=proc
     pool=cf.ThreadPoolExecutor(max_workers=1)

@@ -2,8 +2,8 @@
 """test_approval_wire.py — 审批弹窗 main 收口接缝（PROMPT §12.4 断言 6/7，side-env offscreen）。
 
 reload_settings 收 approval 块；_approval_enabled 门控；_ensure_approval_mgr 单例；
-_sync_approval req 驱动；_show_sample_approval 样例；真窗点击写 approval_resp 而非
-settings_req（A2）。全部 scratch 总线，绝不碰真实总线/config。
+_sync_approval req 驱动；_show_sample_approval 样例；真窗点击经 IPC 送达而非
+写共享 approval_resp / settings_req（A2）。全部 scratch 总线，绝不碰真实总线/config。
 """
 import json
 import os
@@ -18,6 +18,19 @@ sys.path.insert(0, str(HERE))
 from _env import scratch  # noqa: E402
 BUS = scratch("gui28-approval-wire")
 BUS.mkdir(parents=True, exist_ok=True)
+
+# IPC 替身：approval_popup 里的 from approval_ipc import ... 命中此处（main 测试专用，
+# 真 IPC 往返由 test_approval_host 覆盖）。记录每次点击载荷。
+SENT = []
+class _FakeClient:
+    @staticmethod
+    def send(endpoint, payload, timeout=1.5):
+        SENT.append({"endpoint": endpoint, "payload": payload})
+        return {"ok": True}
+import types as _types
+_fake_mod = _types.ModuleType("approval_ipc")
+_fake_mod.ApprovalResponseClient = _FakeClient
+sys.modules["approval_ipc"] = _fake_mod
 
 import main as m  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -40,6 +53,7 @@ def reset(approval_cfg=None):
         f.unlink(missing_ok=True)
     for f in BUS.glob("settings_req.json*"):
         f.unlink(missing_ok=True)
+    SENT.clear()
 
 
 def write_view(approval):
@@ -102,10 +116,9 @@ mgr = m.PET["approval_mgr"]
 win = mgr.popups["r1"]
 win.buttons["once"].click()
 app.processEvents()
-ck("A2: click writes approval_resp", (BUS / "approval_resp.json").exists())
+ck("A2: click never writes approval_resp", not (BUS / "approval_resp.json").exists())
 ck("A2: click ZERO settings_req", not (BUS / "settings_req.json").exists())
-resp = json.loads((BUS / "approval_resp.json").read_text(encoding="utf-8"))
-ck("A2: resp choice once", resp["entries"][0]["choice"] == "once")
+ck("A2: click sent via IPC", len(SENT) == 1 and SENT[0]["payload"]["choice"] == "once")
 
 # ==================================== 样例钩子 ====
 reset({"popup_enabled": False})   # 门控关也能弹样例

@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import ipaddress
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -51,6 +53,8 @@ DEFAULT_HOST = "https://token-plan.cn-beijing.maas.aliyuncs.com"  # v0.5: owner 
 TTS_PATH = "/api/v1/services/audio/tts/SpeechSynthesizer"
 ASR_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
 TIMEOUT_S = 300  # docs script timeout
+AUDIO_DOWNLOAD_MAX_BYTES = 50_000_000
+AUDIO_DOWNLOAD_MAX_REDIRECTS = 3
 FALLBACK_KEY_ENV = "ANTHROPIC_AUTH_TOKEN"  # docs script fallback env name
 # F20：ANTHROPIC_AUTH_TOKEN 是 Anthropic 侧凭证，不是 Token Plan 凭证。
 # 默认**不**拿它给 Token Plan 网关做 Bearer（凭证跨服务复用）；只有显式设
@@ -188,15 +192,69 @@ def make_poster(get_setting: SettingGetter) -> Poster:
     return post
 
 
+def _check_audio_url_allowed(url: str) -> bool:
+    """只允许 http(s) 且不落字面私网/环回/保留地址。"""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url or "").strip())
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            return False
+        host = parts.hostname.rstrip(".").lower()
+        if host == "localhost" or host.endswith(".localhost"):
+            return False
+        # 先按 IP 字面量判（含 IPv6：urlsplit 已剥括号）；解析不了的再看形态
+        try:
+            ip = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            # 数字形态（含 0x 十六进制/混写：inet_aton 系解析器会把它折成 IP，
+            # ipaddress 不吃就无法验证——一律拒，不给 OS 解析器留后门）；
+            # 带冒号的残 IPv6 同理拒绝。域名照常放行（可达性由上游网关判）。
+            if re.fullmatch(r"[0-9.]+", host) or re.search(r"0x[0-9a-f]*", host) or ":" in host:
+                return False
+            return True
+        return not (
+            ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified
+        )
+    except Exception:
+        return False
+
+
+def _bounded_audio_download(url: str) -> bytes:
+    httpx = _require_httpx()
+    current = str(url or "").strip()
+    for _ in range(AUDIO_DOWNLOAD_MAX_REDIRECTS + 1):
+        if not _check_audio_url_allowed(current):
+            raise RuntimeError("audio download URL rejected by scheme/host policy")
+        resp = httpx.get(current, timeout=TIMEOUT_S, follow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location") or ""
+            if not location:
+                raise RuntimeError("audio download redirect has no location")
+            from urllib.parse import urljoin
+            current = urljoin(current, location)
+            continue
+        if resp.status_code >= 400:
+            raise RuntimeError(f"audio download failed: {resp.status_code}")
+        content_length = resp.headers.get("content-length")
+        try:
+            if content_length and int(content_length) > AUDIO_DOWNLOAD_MAX_BYTES:
+                raise RuntimeError("audio download exceeds size limit")
+        except ValueError:
+            pass
+        data = resp.content
+        if len(data) > AUDIO_DOWNLOAD_MAX_BYTES:
+            raise RuntimeError("audio download exceeds size limit")
+        return data
+    raise RuntimeError("audio download exceeded redirect limit")
+
+
 def make_getter() -> Getter:
     """Default downloader for the time-limited output.audio.url."""
 
     def get(url: str) -> bytes:
-        httpx = _require_httpx()
-        resp = httpx.get(url, timeout=TIMEOUT_S, follow_redirects=True)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"audio download failed: {resp.status_code}")
-        return resp.content
+        return _bounded_audio_download(url)
 
     return get
 

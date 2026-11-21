@@ -10,10 +10,11 @@
 - v0.2：B 站口径钉死为「口径 B——需要登录的才划到 unsafe」；工具面扩为四组；其余想法改走 Python+Skill；remotes 与 androiduse 列二期。
 - v0.3：默认全注册；ASR 支持等待/异步提交/完成后 steer 回会话；multimedia-utils 增加 `dashscope_qwenomni_analysis`（Qwen-Omni 音视频分析，模型/端点/密钥可配）。
 - v0.4：取消「慎用」标注（清单行标签不可定制，用户裁定不做）；Omni 超 10MB 视频改为先压缩、仍超限则截到约 9.9MB 并告知模型，不抽帧。
+- v0.5（2026-11-20 安全修复批次）：`bilibili_unsafe`/`android-utils` 改默认关（schema + 代码兜底，`group_bilibili_unsafe_enabled` 确认在 `_SETTING_KEYS` 读取链内）；输出路径（bili filename / ffmpeg output / 截屏 path / adb pull local）钳制 scratch realpath 且拒绝覆盖；multimedia 本地 `source` 限 scratch/plugin-data realpath + 媒体 MIME/扩展名 + 大小硬校验，data URI ≤10MB；B 站流下载 URL HTTPS + host 白名单且不跟随重定向；confirm 文案声明「模型自设参数，宿主不代审批」；credential 0600 措辞改诚实。
 
 ## 1. 一句话定位
 
-一个单体插件包（`aerialdreams-toolsets`），同一 `register(ctx)` 入口注册多个独立 toolset：`bilibili`、`bilibili_unsafe`、`multimedia-utils`、`desktop-utils`、`android-utils`（二期 `remotes`）。**所有组默认注册**，每组在 `hermes tools` 清单里独立开关；工具是写死的，变数多的能力交给 Skill + Python。
+一个单体插件包（`aerialdreams-toolsets`），同一 `register(ctx)` 入口注册多个独立 toolset：`bilibili`、`bilibili_unsafe`、`multimedia-utils`、`desktop-utils`、`android-utils`（二期 `remotes`）。`bilibili`/`multimedia-utils`/`desktop-utils` 默认注册，`bilibili_unsafe` 与 `android-utils` 默认关闭（2026-11-20 安全修复批次改判，见 §6），每组在 `hermes tools` 清单里独立开关；工具是写死的，变数多的能力交给 Skill + Python。
 
 ## 2. 可行性与机制边界（实测锚点）
 
@@ -47,7 +48,7 @@
 | D6 | 其他想法 | image/pdf/docx/xlsx/yt-dlp/qr/系统监控等一律走 Python + Skill，不进工具面 |
 | D7 | bili 实现归属 | 整体搬运自 bili-tools（函数级移动，不重写 handler），旧插件 disable → `_attic/` 退场 |
 | D8 | 部署位 | `$HERMES_HOME/plugins/aerialdreams-toolsets/`（顶层，非 custom-plugins/） |
-| D9 | 注册与闸门 | 全部组默认注册；settings 可逐组关闭；不做「慎用」标注（见 §2 边界 3） |
+| D9 | 注册与闸门 | 低风险组默认注册；`bilibili_unsafe`/`android-utils` 默认关（settings 显式打开）；不做「慎用」标注（见 §2 边界 3） |
 | D10 | 依赖策略 | v1 目标 stdlib-only；ffmpeg/adb/fastboot/ssh 全部子进程调用系统已装程序；ASR/Omni 用 stdlib urllib 打百炼 |
 | D11 | ASR 异步 | 同步/异步自动选路；`wait_seconds` 可等（默认 300，上限 1800）；超时返回 task_id；后台完成后 `agent.steer()` 把结果送回原会话 |
 | D12 | Omni 分析 | 新增 `dashscope_qwenomni_analysis`：音视频 + 自定义 prompt 交给可配置的 Qwen-Omni 模型，返回完整分析文本 |
@@ -58,7 +59,7 @@
 ```
 aerialdreams-toolsets/
 ├── plugin.yaml          # name/version/description/kind: standalone
-│                        # provides_tools: 全集（含默认注册的 unsafe 工具，照常声明）
+│                        # provides_tools: 全集（含默认关闭的 unsafe 工具，照常声明）
 │                        # config_schema: 各组开关 + ASR/Omni/路径设置
 ├── __init__.py          # register(ctx)：读 settings → 按组注册 TOOL_DEFS
 ├── groups/
@@ -117,9 +118,9 @@ aerialdreams-toolsets/
 
 | 工具 | 说明 |
 |---|---|
-| `ffmpeg` | `action=probe/convert/trim/mux/extract_audio/extract_frames/thumbnail/burn_subtitle/gif`；输入输出统一绝对路径；默认输出到 scratch，`filename` 可覆盖 |
-| `dashscope_asr` | `action=transcribe/status/result`；短音频走 `qwen3-asr-flash`（同步，本地 base64 / URL），长音频走 `qwen3-asr-flash-filetrans`（异步）；`wait_seconds`（默认 300，上限 1800）内轮询，超时返回 task_id 并后台继续；完成时 `agent.steer()` 把结果送回原会话 |
-| `dashscope_qwenomni_analysis` | 音视频交给可配置的 Qwen-Omni 模型分析：`source`（本地路径/URL）、`prompt`（自定义，必填）、`model`（默认取 settings）；本地 base64 <10MB 直接传；超限先用 ffmpeg 压缩（降码率/分辨率）再试，仍超 10MB 则截取到约 9.9MB 的位置并把「已截断、后续未分析」告知模型；返回完整分析文本 + usage |
+| `ffmpeg` | `action=probe/convert/trim/mux/extract_audio/extract_frames/thumbnail/burn_subtitle/gif`；输入统一绝对路径（媒体扩展名 + 2GB 大小硬校验）；输出钳制在 scratch realpath 范围内且默认拒绝覆盖，`output`/`filename` 只能落在 scratch 内 |
+| `dashscope_asr` | `action=transcribe/status/result`；短音频走 `qwen3-asr-flash`（同步，本地 base64 / URL），长音频走 `qwen3-asr-flash-filetrans`（异步）；本地 `source` 限 scratch/plugin-data realpath 范围 + 媒体扩展名/MIME + 100MB 硬校验；`wait_seconds`（默认 300，上限 1800）内轮询，超时返回 task_id 并后台继续；完成时 `agent.steer()` 把结果送回原会话 |
+| `dashscope_qwenomni_analysis` | 音视频交给可配置的 Qwen-Omni 模型分析：`source`（scratch/plugin-data 内本地路径、http(s) URL 或 ≤10MB data URI）、`prompt`（自定义，必填）、`model`（默认取 settings）；本地 base64 <10MB 直接传；超限先用 ffmpeg 压缩（降码率/分辨率）再试，仍超 10MB 则截取到约 9.9MB 的位置并把「已截断、后续未分析」告知模型；返回完整分析文本 + usage |
 
 ### 5.4 `desktop-utils`（Windows）
 
@@ -150,10 +151,10 @@ aerialdreams-toolsets/
 | toolset | 默认 | 闸门 |
 |---|---|---|
 | `bilibili` | 注册 | settings 可关 |
-| `bilibili_unsafe` | 注册 | settings 可关 |
+| `bilibili_unsafe` | **默认关**（settings 显式开） | 开关真正进 `_SETTING_KEYS` 读取链 |
 | `multimedia-utils` | 注册 | settings 可关；ffmpeg 缺失时工具自报错，组不关 |
 | `desktop-utils` | 注册 | settings 可关；显式调用才动作 |
-| `android-utils` | 注册 | settings 可关；fb `flash` 仍需 `confirm=true` |
+| `android-utils` | **默认关**（settings 显式开） | confirm 是模型自设参数、宿主不代审批，组默认关才是真闸门；fb `flash` 仍需 `confirm=true` |
 | `remotes` | 注册（二期上线后） | settings 可关 |
 
 上下文成本：全注册约 32 个工具（bilibili 13 + unsafe 12 + multimedia 3 + desktop 2 + android 2）。如工具面过大，可在 config `tools.tool_search.defer` 里把低频工具延迟加载（用户的配置动作，插件不代劳）。

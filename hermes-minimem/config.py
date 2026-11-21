@@ -235,30 +235,6 @@ def _from_config_yaml(key: str) -> Any:
     return _read_entry(_load_config(), key)
 
 
-def _dotenv_lookup(name: str) -> Optional[str]:
-    """Minimal ``.env`` reader used when the Hermes config module is unavailable."""
-    path = os.path.join(_hermes_home() or "", ".env")
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                if key.startswith("export "):
-                    key = key[len("export "):].strip()
-                if key != name:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                return value
-    except OSError:
-        return None
-    return None
-
-
 def _env_value(name: str) -> str:
     try:
         from hermes_cli.config import get_env_value

@@ -74,7 +74,17 @@ class DashScopeNativeProfile(ProviderProfile):
 
     def fetch_models(self, *, api_key: Optional[str] = None,
                      base_url: Optional[str] = None, timeout: float = 8.0):
+        if base_url is not None:
+            base_url = str(base_url).strip()
+            if base_url.lower().startswith(SCHEME):
+                parse_dashscope_uri(base_url)
         # No catalog probe: native workspace gateway model listing is O3.
+        # Keep the public hook bounded even when a future SDK implementation uses it.
+        try:
+            timeout_value = max(0.1, float(timeout))
+        except (TypeError, ValueError):
+            timeout_value = 8.0
+        del api_key, base_url, timeout_value
         return None
 
 

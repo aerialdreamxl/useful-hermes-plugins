@@ -2,8 +2,9 @@
 
 One package, five toolsets: bilibili (anonymous), bilibili_unsafe (account),
 multimedia-utils (ffmpeg/ASR/Omni), desktop-utils (clipboard/screenshot),
-android-utils (adb/fastboot). All groups register by default; settings can
-disable a group individually.
+android-utils (adb/fastboot). bilibili / multimedia / desktop register by
+default; bilibili_unsafe and android are opt-in (default off) and settings
+can still turn any group off.
 """
 
 from __future__ import annotations
@@ -39,6 +40,9 @@ _SECTION = (
     "- `desktop-utils`: clipboard read/write, screenshot (full/region/window).\n"
     "- `android-utils`: adb (devices/shell/push/pull/logcat/screenshot/install/props/am/pm), fastboot (flash/oem require confirm=true).\n"
 )
+
+# 高风险组默认关：schema 的 default 只进面板，没写过 settings 时靠这里兜底。
+_GROUP_DEFAULTS = {"bilibili_unsafe": False, "android": False}
 
 
 def _config_fallback(key: str):
@@ -79,7 +83,9 @@ def register(ctx) -> None:
     config.set_settings(values)
 
     for name in _GROUPS:
-        if not config.group_enabled(name):
+        default = _GROUP_DEFAULTS.get(name, True)
+        enabled = bool(config.cfg("group_%s_enabled" % name, default))
+        if not enabled:
             logger.info("aerialdreams-toolsets: group %s disabled by settings", name)
             continue
         try:

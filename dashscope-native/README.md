@@ -66,8 +66,7 @@ Token Plan × 原生 chat 上游未文档化，不做（O1）。web 无 TP 变�
 **定价与简介**（v0.5.2）：目录刷新时对缺定价/简介的条目，从官方文档页
 `help.aliyun.com/zh/model-studio/<id点换横线>` 扒取——简介取页面 meta description（截 80 字），
 定价只读**第一个地域块（北京）**的"图片生成"行（含 1K/2K、标准/思考档位），国际价绝不混入。
-带日期快照 id 自动回退到无日期基础页。扒不到就留空，不编造；已扒到的条目在后续刷新中保留不重扒。
-受 `discover_models` 同一开关管辖。
+`t2i.discover_models` 开启时，文档 enrich 单轮最多处理 24 条，整体最多约 45 秒；超出预算的条目保持空字段并在下一次刷新再尝试。
 
 **参考图/图像编辑**（v0.5.3，PROMPT.md §6.5）：给 `image_generate` 传 `image_url`
 或 `reference_image_urls` 即进入编辑。能力按**当前所选模型**（系统级 `image_gen.model`）

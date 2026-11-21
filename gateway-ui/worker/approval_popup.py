@@ -4,8 +4,9 @@
 worker 进程内 Qt 组件：读宿主 approval_req.json（pending 全量快照），每条请求一窗，
 屏幕右侧中部飞入（UAC 高仿形态，自绘盾牌，非系统 UAC）；底部四按钮固定一字排开
 「永远放行 / 会话放行 / 单次放行 / 拒绝」，choice ∉ allowed_choices 置灰。点击 →
-写 approval_resp.json（worker 单写者，按 req 快照修剪陈旧条目）→ 宿主 present 取回
-注入 decision。消费 approval_withdrawn.jsonl 收窗（宿主已判/撤销）。
+经本地 IPC（approval_ipc.py）送达宿主（五重校验，见 CONTRACT §11.2），审批决定
+不落共享文件 → 宿主 present 取回注入 decision。消费 approval_withdrawn.jsonl 收窗
+（宿主已判/撤销）。
 
 纪律：
 - 弹窗不可拖拽、Esc/弃焦无效（审批面不许被藏起来，超时归宿主判）；
@@ -22,6 +23,8 @@ import json
 import os
 import time
 from pathlib import Path
+
+from approval_ipc import ApprovalResponseClient
 
 from PySide6.QtCore import (Qt, QPoint, QPointF, QRect, QTimer,
                             QPropertyAnimation, QEasingCurve)
@@ -447,27 +450,19 @@ class ApprovalPopupManager:
         self._write_resp(rid, digest, choice)
 
     def _write_resp(self, rid: str, digest: str, choice: str):
-        p = self.bus / "approval_resp.json"
-        entries = []
+        # 审批决定不落共享目录：同用户进程可伪造/重放 approval_resp.json。
+        # endpoint 可公开，token 只由宿主经 stdin 握手注入 worker 内存。
+        endpoint = str(self.meta.get("approval_endpoint") or "")
+        token = str(self.meta.get("approval_handshake") or "")
+        spawn_token = str(self.meta.get("spawn_token") or "")
+        payload = {"request_id": rid, "digest": digest, "choice": choice,
+                   "token": token, "spawn_token": spawn_token}
         try:
-            old = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-            for e in (old.get("entries") or []):
-                # 修剪：host 已消费（离开 req 快照）的旧条目不再保留
-                if isinstance(e, dict) and str(e.get("request_id")) in self._req_ids:
-                    entries.append(e)
+            result = ApprovalResponseClient.send(endpoint, payload)
+            self.last_resp = {"request_id": rid, "choice": choice,
+                              "ok": bool(result.get("ok"))}
         except Exception:
-            entries = []
-        entries.append({"request_id": rid, "digest": digest, "choice": choice,
-                        "clicked_ts": round(time.time(), 3)})
-        data = {"entries": entries}
-        try:
-            tmp = p.with_name(f"approval_resp.json.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-                           encoding="utf-8")
-            os.replace(tmp, p)
-            self.last_resp = data
-        except Exception:
-            pass
+            self.last_resp = {"request_id": rid, "choice": choice, "ok": False}
 
     # ------------------------------------------------------------ 样例 ----
     def show_sample(self):

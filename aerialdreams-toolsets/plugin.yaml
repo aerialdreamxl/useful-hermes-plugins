@@ -47,7 +47,7 @@ config_schema:
     type: bool
     label: 注册 bilibili_unsafe 组
     description: 需要登录的 B 站工具（扫码登录/高清/赞币藏/私信/评论弹幕写入/收藏夹/历史/AI字幕/关注）
-    default: true
+    default: false
   group_multimedia_enabled:
     type: bool
     label: 注册 multimedia-utils 组
@@ -62,7 +62,7 @@ config_schema:
     type: bool
     label: 注册 android-utils 组
     description: adb / fastboot
-    default: true
+    default: false
   multimedia_api_key_env:
     type: str
     label: DashScope API Key 环境变量名
